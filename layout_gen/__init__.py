@@ -34,6 +34,7 @@ from layout_gen.transistor  import (
     TransistorGeom,
 )
 from layout_gen.visualize   import write_svg
+from layout_gen.cells       import draw_inverter, draw_nand2, draw_nor2  # standard cell primitives
 
 __all__ = [
     # PDK
@@ -46,6 +47,10 @@ __all__ = [
     "transistor_geom",
     "finger_count",
     "TransistorGeom",
+    # Standard cells
+    "draw_inverter",
+    "draw_nand2",
+    "draw_nor2",
     # Visualisation
     "write_svg",
 ]
