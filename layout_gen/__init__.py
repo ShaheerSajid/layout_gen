@@ -33,6 +33,7 @@ from layout_gen.transistor  import (
     finger_count,
     TransistorGeom,
 )
+from layout_gen.visualize   import write_svg
 
 __all__ = [
     # PDK
@@ -45,4 +46,6 @@ __all__ = [
     "transistor_geom",
     "finger_count",
     "TransistorGeom",
+    # Visualisation
+    "write_svg",
 ]

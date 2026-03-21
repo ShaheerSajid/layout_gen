@@ -30,6 +30,30 @@ layers:
   via4:   {layer: 71,  datatype: 44}
   met5:   {layer: 72,  datatype: 20}
 
+# ── Layer display colours (SVG fill hex, opacity 0–1) ────────────────────────
+#
+# Used by layout_gen.visualize.write_svg().  Every layer in the layers section
+# should have a matching entry here; unknown layers fall back to #888888.
+colors:
+  nwell:  {fill: "#ffd0e0", opacity: 0.35}   # light pink
+  diff:   {fill: "#00c000", opacity: 0.50}   # green
+  tap:    {fill: "#007000", opacity: 0.50}   # dark green
+  poly:   {fill: "#ff4040", opacity: 0.65}   # red
+  nsdm:   {fill: "#ffe060", opacity: 0.30}   # yellow
+  psdm:   {fill: "#6060ff", opacity: 0.30}   # blue
+  licon1: {fill: "#404040", opacity: 0.85}   # dark grey  (contacts)
+  li1:    {fill: "#00c8ff", opacity: 0.55}   # cyan       (local interconnect)
+  mcon:   {fill: "#404040", opacity: 0.85}   # dark grey  (met1 via)
+  met1:   {fill: "#4040ff", opacity: 0.50}   # blue
+  via1:   {fill: "#303030", opacity: 0.85}
+  met2:   {fill: "#c000c0", opacity: 0.50}   # purple
+  via2:   {fill: "#303030", opacity: 0.85}
+  met3:   {fill: "#c08000", opacity: 0.50}   # orange
+  via3:   {fill: "#303030", opacity: 0.85}
+  met4:   {fill: "#00a0a0", opacity: 0.50}   # teal
+  via4:   {fill: "#303030", opacity: 0.85}
+  met5:   {fill: "#a0a000", opacity: 0.50}   # olive
+
 # ── Design rules ──────────────────────────────────────────────────────────────
 rules:
   poly:
