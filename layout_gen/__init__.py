@@ -20,12 +20,14 @@ Phase 2 — DRC repair / ML synthesis
 Typical use::
 
     from layout_gen import draw_transistor, load_pdk, run_drc
+    from layout_gen.synth import load_template, Synthesizer
 
-    rules      = load_pdk()
-    comp       = draw_transistor(0.52, 0.15, "nmos", rules)
-    comp.write_gds("out/nmos_0p52.gds")
-    violations = run_drc("out/nmos_0p52.gds", rules, tool="klayout")
-    print(f"{len(violations)} violations")
+    rules    = load_pdk()
+    template = load_template("inverter")
+    result   = Synthesizer(rules).synthesize(
+        template, params={"w_N": 0.52, "w_P": 0.42, "l": 0.15}
+    )
+    result.component.write_gds("inv_synth.gds")
 """
 from layout_gen.pdk         import load_pdk, PDKRules, PDK_YAML, RULES
 from layout_gen.transistor  import (
@@ -37,6 +39,7 @@ from layout_gen.transistor  import (
 from layout_gen.visualize   import write_svg
 from layout_gen.cells       import draw_inverter, draw_nand2, draw_nor2, draw_bit_cell
 from layout_gen.drc         import run_drc, DRCViolation, available_tools
+from layout_gen.synth       import load_template, Synthesizer, SynthResult
 
 __all__ = [
     # PDK
@@ -61,4 +64,8 @@ __all__ = [
     "run_drc",
     "DRCViolation",
     "available_tools",
+    # ML synthesizer
+    "load_template",
+    "Synthesizer",
+    "SynthResult",
 ]
