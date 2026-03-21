@@ -77,9 +77,12 @@ def draw_bit_cell(
     Returns
     -------
     gf.Component
-        Ports — WL_A (poly, PG_L gate), WL_B (poly, PG_R gate),
-                BL (li1), BL_ (li1), Q (li1), Q_ (li1),
-                VDD (met1), GND (met1).
+        Ports — WL  (met1, orientation 180° West — row decoder side),
+                BL  (li1,  orientation  90° North — bitline column up),
+                BL_ (li1,  orientation  90° North — bitline column up),
+                Q / Q_ (li1, orientation 90° North — internal, debug),
+                VDD (met1, orientation  90° North — top power rail),
+                GND (met1, orientation 270° South — bottom power rail).
     """
     import gdsfactory as gf
     _activate_pdk()
@@ -295,12 +298,15 @@ def draw_bit_cell(
     bl_x_mid  = x_pg_l + (pg_d_x0 + pg_d_x1) / 2
     bl__x_mid = x_pg_r + (pg_d_x0 + pg_d_x1) / 2
 
-    c.add_port("WL",  center=((wl_x0 + wl_x1) / 2, (wl_y0 + wl_y1) / 2),
-               width=wl_x1 - wl_x0, orientation=90,  layer=lyr_m1)
+    # WL: horizontal met1 wordline bus — exits West toward the row decoder
+    c.add_port("WL",  center=(wl_x0, (wl_y0 + wl_y1) / 2),
+               width=wl_y1 - wl_y0, orientation=180, layer=lyr_m1)
+    # BL/BL_: vertical li1 bitlines — exit North through the array column
+    bl_w = pg_geom.sd_length_um   # S/D li1 X-width (perpendicular to North exit)
     c.add_port("BL",  center=(bl_x_mid,  nd_ymid),
-               width=nd_y1 - nd_y0,  orientation=0,   layer=lyr_li1)
+               width=bl_w, orientation=90,  layer=lyr_li1)
     c.add_port("BL_", center=(bl__x_mid, nd_ymid),
-               width=nd_y1 - nd_y0,  orientation=0,   layer=lyr_li1)
+               width=bl_w, orientation=90,  layer=lyr_li1)
     c.add_port("Q",   center=(q_x,   nd_ymid),
                width=spacing,        orientation=90,  layer=lyr_li1)
     c.add_port("Q_",  center=(q__x,  nd_ymid),
