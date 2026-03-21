@@ -91,6 +91,10 @@ from layout_gen.synth.ml import (
     MLAgent,
     ModelNotTrainedError,
     MarginPredictor,
+    DRCFixPredictor,
+    ViolationEncoder,
+    generate_fix_dataset,
+    FixDataset,
 )
 
 __all__ = [
@@ -133,4 +137,9 @@ __all__ = [
     "MLAgent",
     "ModelNotTrainedError",
     "MarginPredictor",
+    # DRC fix policy
+    "DRCFixPredictor",
+    "ViolationEncoder",
+    "generate_fix_dataset",
+    "FixDataset",
 ]

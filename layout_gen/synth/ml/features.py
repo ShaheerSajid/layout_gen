@@ -15,9 +15,19 @@ MARGIN_NAMES : list[str]
 
 Functions
 ---------
-cell_features(w_N, w_P, l, rules) -> np.ndarray  shape (22,)
-drc_margins(w_N, w_P, l, rules)   -> np.ndarray  shape (10,)
-margin_vector(...)                 -> alias for drc_margins
+cell_features(w_N, w_P, l, rules, *, gap_y, finger_N, finger_P) -> np.ndarray  shape (23,)
+drc_margins(w_N, w_P, l, rules, *, gap_y, finger_N, finger_P)   -> np.ndarray  shape (10,)
+margin_vector(...)                                                -> alias for drc_margins
+
+The three optional keyword arguments extend the optimisation space:
+
+gap_y : float | None
+    Y spacing between NMOS poly top and PMOS poly bottom (µm).
+    Defaults to ``_inter_cell_gap(rules)`` (PDK minimum).
+finger_N, finger_P : float | None
+    Number of gate fingers for NMOS / PMOS (continuous relaxation —
+    rounded to the nearest integer before geometry is computed).
+    Defaults to the finger count auto-derived by ``transistor_geom``.
 
 DRC margins are *signed distances* from each rule threshold.
 Positive  = constraint satisfied (slack from the boundary).
@@ -25,24 +35,26 @@ Negative  = constraint violated (extent of violation).
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from layout_gen.pdk        import PDKRules
-from layout_gen.transistor import transistor_geom
+from layout_gen.transistor import transistor_geom, TransistorGeom
 from layout_gen.cells.standard import _inter_cell_gap
 
 # ── Column name lists ─────────────────────────────────────────────────────────
 
 FEATURE_NAMES: list[str] = [
-    # Explicit params (3)
+    # Explicit optimisation params (6)
     "w_N", "w_P", "l",
-    # Computed geometry (12)
-    "n_fingers_N", "n_fingers_P",
+    "gap_y", "finger_N", "finger_P",
+    # Computed geometry (8)
     "sd_length",
     "w_finger_N", "w_finger_P",
     "total_x_N", "total_x_P",
     "total_y_N", "total_y_P",
-    "inter_cell_gap",
+    "inter_cell_gap_min",   # PDK minimum gap (constant for a given PDK)
     # PDK rules baked in as features for multi-tech generalisation (9)
     "poly_width_min",
     "diff_width_min",
@@ -53,7 +65,7 @@ FEATURE_NAMES: list[str] = [
     "li1_width_min",
     "nwell_enc_pdiff",
     "nwell_width_min",
-]  # 22 total
+]  # 23 total
 
 MARGIN_NAMES: list[str] = [
     "poly.1",       # gate length vs poly_width_min
@@ -69,13 +81,42 @@ MARGIN_NAMES: list[str] = [
 ]  # 10 total
 
 
+# ── Geometry helper ───────────────────────────────────────────────────────────
+
+def _geom_override_fingers(
+    geom:     TransistorGeom,
+    n_fingers: int,
+    rules:    PDKRules,
+) -> TransistorGeom:
+    """Return a copy of *geom* with the finger count overridden.
+
+    Recomputes ``w_finger_um``, ``total_x_um``, ``total_y_um``, and
+    ``n_contacts_y`` from the new finger count.
+    """
+    n   = max(1, n_fingers)
+    w_f = geom.w_um / n
+    endcap = rules.poly["endcap_over_diff_um"]
+    return replace(
+        geom,
+        n_fingers    = n,
+        w_finger_um  = w_f,
+        total_x_um   = (n + 1) * geom.sd_length_um + n * geom.l_um,
+        total_y_um   = w_f + 2 * endcap,
+        n_contacts_y = rules.sd_contact_columns(w_f),
+    )
+
+
 # ── Feature extraction ────────────────────────────────────────────────────────
 
 def cell_features(
-    w_N:   float,
-    w_P:   float,
-    l:     float,
-    rules: PDKRules,
+    w_N:      float,
+    w_P:      float,
+    l:        float,
+    rules:    PDKRules,
+    *,
+    gap_y:    float | None = None,
+    finger_N: float | None = None,
+    finger_P: float | None = None,
 ) -> np.ndarray:
     """Build a feature vector from sizing params and PDK rules.
 
@@ -87,32 +128,45 @@ def cell_features(
         Gate length for both devices (µm).
     rules :
         PDK rules.
+    gap_y :
+        Y spacing between NMOS poly top and PMOS poly bottom (µm).
+        Defaults to ``_inter_cell_gap(rules)`` (PDK minimum).
+    finger_N, finger_P :
+        Number of gate fingers (continuous relaxation; rounded to nearest
+        integer).  Defaults to the auto-derived finger count.
 
     Returns
     -------
-    np.ndarray, shape (22,)
+    np.ndarray, shape (23,)
         See :data:`FEATURE_NAMES` for column order.
     """
-    ng  = transistor_geom(w_N, l, "nmos", rules)
-    pg  = transistor_geom(w_P, l, "pmos", rules)
-    gap = _inter_cell_gap(rules)
+    ng_base = transistor_geom(w_N, l, "nmos", rules)
+    pg_base = transistor_geom(w_P, l, "pmos", rules)
 
-    p   = rules.poly
-    d   = rules.diff
-    c   = rules.contacts
-    li  = rules.li1
-    nw  = rules.nwell
+    ng = (_geom_override_fingers(ng_base, int(round(finger_N)), rules)
+          if finger_N is not None else ng_base)
+    pg = (_geom_override_fingers(pg_base, int(round(finger_P)), rules)
+          if finger_P is not None else pg_base)
+
+    _gap_y   = gap_y if gap_y is not None else _inter_cell_gap(rules)
+    _gap_min = _inter_cell_gap(rules)
+
+    p  = rules.poly
+    d  = rules.diff
+    c  = rules.contacts
+    li = rules.li1
+    nw = rules.nwell
 
     return np.array([
-        # params
+        # explicit optimisation params
         w_N, w_P, l,
-        # geometry
-        float(ng.n_fingers), float(pg.n_fingers),
+        _gap_y, float(ng.n_fingers), float(pg.n_fingers),
+        # computed geometry
         ng.sd_length_um,
         ng.w_finger_um, pg.w_finger_um,
         ng.total_x_um,  pg.total_x_um,
         ng.total_y_um,  pg.total_y_um,
-        gap,
+        _gap_min,
         # PDK rule constants
         p["width_min_um"],
         d["width_min_um"],
@@ -129,10 +183,14 @@ def cell_features(
 # ── DRC margin computation ────────────────────────────────────────────────────
 
 def drc_margins(
-    w_N:   float,
-    w_P:   float,
-    l:     float,
-    rules: PDKRules,
+    w_N:      float,
+    w_P:      float,
+    l:        float,
+    rules:    PDKRules,
+    *,
+    gap_y:    float | None = None,
+    finger_N: float | None = None,
+    finger_P: float | None = None,
 ) -> np.ndarray:
     """Compute analytical DRC margins for a CMOS inverter cell.
 
@@ -148,15 +206,28 @@ def drc_margins(
         Gate length (µm).
     rules :
         PDK rules.
+    gap_y :
+        Y spacing between NMOS poly top and PMOS poly bottom (µm).
+        Defaults to ``_inter_cell_gap(rules)`` (PDK minimum).
+    finger_N, finger_P :
+        Number of gate fingers (continuous relaxation; rounded to nearest
+        integer).  Defaults to the auto-derived finger count.
 
     Returns
     -------
     np.ndarray, shape (10,)
         See :data:`MARGIN_NAMES` for column order.
     """
-    ng  = transistor_geom(w_N, l, "nmos", rules)
-    pg  = transistor_geom(w_P, l, "pmos", rules)
-    gap = _inter_cell_gap(rules)
+    ng_base = transistor_geom(w_N, l, "nmos", rules)
+    pg_base = transistor_geom(w_P, l, "pmos", rules)
+
+    ng = (_geom_override_fingers(ng_base, int(round(finger_N)), rules)
+          if finger_N is not None else ng_base)
+    pg = (_geom_override_fingers(pg_base, int(round(finger_P)), rules)
+          if finger_P is not None else pg_base)
+
+    gap_min = _inter_cell_gap(rules)
+    _gap_y  = gap_y if gap_y is not None else gap_min
 
     p   = rules.poly
     d   = rules.diff
@@ -196,8 +267,9 @@ def drc_margins(
     m_licon7_N = sd_N / 2 - c_size / 2 - stp
     m_licon7_P = sd_P / 2 - c_size / 2 - stp
 
-    # diff.2 — NMOS and PMOS diffs must not overlap (inter_cell_gap >= 0)
-    m_diff2 = gap
+    # diff.2 — gap between NMOS and PMOS diff rows must meet PDK minimum.
+    #   margin = gap_y - gap_min  (positive when gap_y >= minimum required)
+    m_diff2 = _gap_y - gap_min
 
     # nwell.1 — nwell must enclose PMOS diff by nw_enc on all sides in X;
     #   the resulting nwell X width = total_x_P + 2*nw_enc must be >= nw_wmin.
