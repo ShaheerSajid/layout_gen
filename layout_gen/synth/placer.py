@@ -247,12 +247,13 @@ class Placer:
                 placed_offsets[f"{pname}_x"] = pd.x
                 placed_offsets[f"{pname}_y"] = pd.y
 
-            x = _resolve_x(spec, placed, geom, self.rules)
+            full_named = {**named, **placed_offsets}
+            x = _resolve_x(spec, placed, geom, self.rules, geoms, full_named)
             y = eval_expr(
                 spec.y_offset_expr,
                 self.rules,
                 geoms,
-                named={**named, **placed_offsets},
+                named=full_named,
             )
 
             placed[dev_name] = PlacedDevice(
@@ -285,8 +286,24 @@ def _resolve_x(
     placed: dict[str, PlacedDevice],
     geom:   TransistorGeom,
     rules:  PDKRules,
+    geoms:  dict[str, TransistorGeom] | None = None,
+    named:  dict[str, float]          | None = None,
 ) -> float:
-    """Resolve the X origin for a device from its floorplan ``x_spec``."""
+    """Resolve the X origin for a device from its floorplan ``x_spec``.
+
+    Supports four forms:
+
+    * ``None`` / ``"left"`` — place at X = 0.
+    * Number — use directly.
+    * ``"right_of: DEV"`` or ``"right_of(DEV)"`` — right edge of *DEV* plus
+      ``diff.spacing_min_um``.
+    * ``"between(DEV_A, DEV_B)"`` — centre the device in the gap between
+      *DEV_A* right edge and *DEV_B* left edge.
+    * Any other string — evaluated as a constraint expression via
+      ``eval_expr`` (same namespace as ``y_offset_expr``), giving access to
+      ``rules.*``, device geom attributes, and placed offsets
+      (``PD_L_x``, ``PD_R_x``, …).
+    """
     x = spec.x_spec
     if x is None or x == "left":
         return 0.0
@@ -313,7 +330,13 @@ def _resolve_x(
             gap = pb.x - (pa.x + pa.geom.total_x_um)
             return pa.x + pa.geom.total_x_um + (gap - geom.total_x_um) / 2
 
-    # Fallback: treat as 0
+    # Fallback: arbitrary constraint expression (same namespace as y_offset_expr)
+    if geoms is not None:
+        try:
+            return eval_expr(xs, rules, geoms, named=named)
+        except ValueError:
+            pass
+
     import warnings
     warnings.warn(
         f"Cannot resolve x_spec {xs!r}; defaulting to 0.0", stacklevel=4

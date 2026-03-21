@@ -33,23 +33,38 @@ floorplan:
     PU_L: {region: top, in_nwell: true, x: left,
            y_offset: "PD_L.total_y + inter_cell_gap"}
   INV_R:                                  # PD_R + PU_R form right inverter
-    PD_R: {region: bottom, x: "right_of: PD_L", y_offset: 0}
-    PU_R: {region: top, in_nwell: true, x: "right_of: PD_L",
-           y_offset: "PD_R.total_y + inter_cell_gap"}
+    # X = right edge of INV_L + Q bridge gap + PG_L width + cross_gap
+    # cross_gap enforces nwell spacing between the two inverter nwells
+    PD_R:
+      region:   bottom
+      y_offset: 0
+      x: "PD_L.total_x + rules.diff.spacing_min_um + PG_L.total_x + cross_gap"
+    PU_R:
+      region:   top
+      in_nwell: true
+      y_offset: "PD_R.total_y + inter_cell_gap"
+      x: "PD_L.total_x + rules.diff.spacing_min_um + PG_L.total_x + cross_gap"
   PG_L:
     region:   bottom_only                 # NMOS only, no PMOS pair
-    x:        between(PD_L, PD_R)
-    note:     Q node bridges PG_L.S to INV_L.D (PD_L drain)
+    x:        "PD_L.total_x + rules.diff.spacing_min_um"
+    note:     Q bridge = INV_L drain → PG_L source (min diff spacing)
   PG_R:
     region:   bottom_only
-    x:        "right_of: PD_R"
+    x: "PD_R_x + PD_R.total_x + rules.diff.spacing_min_um"
     note:     Q_ node bridges PG_R.S to INV_R.D (PD_R drain)
 
   inter_cell_gap:
     min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
 
+  # cross_gap = minimum X gap between INV_L right edge and INV_R left edge.
+  # Driven by nwell spacing: each inverter nwell extends nw_enc beyond the PMOS
+  # diff, so the two nwells need nwell_spacing - 2*nw_enc clear between them.
+  # Also must fit at least one li1 routing track (routing_gap).
+  cross_gap:
+    min: "max(2*rules.li1.spacing_min_um + rules.li1.width_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um, rules.nwell.spacing_min_um - 2*rules.nwell.enclosure_of_pdiff_um)"
+
   nwell_gap:
-    min: rules.nwell.spacing_min_um       # enforces INV_L.nwell ↔ INV_R.nwell gap
+    min: rules.nwell.spacing_min_um       # informational — used by cross_gap above
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 routing:
