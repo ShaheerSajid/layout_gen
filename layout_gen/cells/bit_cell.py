@@ -6,7 +6,7 @@ Topology
 Cross-coupled inverters (INV_L, INV_R) with two access pass-gate NMOS:
 
     BL──[PG_L: WL gate]──Q──[PD_L+PU_L (INV_L)]──Q_
-                                                      ╲ cross (Phase-2)
+                                                      ╲ cross-coupled
     BL_─[PG_R: WL gate]──Q_─[PD_R+PU_R (INV_R)]──Q ╱
 
 Default sizing (optimizer-recommended for sky130A, W in µm, L=0.15):
@@ -30,14 +30,19 @@ S/D li1 exists, widen to a 0.27 µm pad (0.05 µm poly enclosure each side),
 and drop a licon1 polycontact + mcon there.  A met1 bus then connects both PG
 gate polycontacts across the full cell width.
 
-Phase-2 TODO
-------------
-Cross-coupling (Q → INV_R gate, Q_ → INV_L gate) has the same fundamental
-geometry constraint: any li1 track reaching the INV gate poly in the
-inter-cell gap conflicts with the adjacent OUT drain bridge li1 (same x-column,
-different net, < 0.17 µm spacing).  Needs met1 routing via a polycontact stub
-placed above the PMOS body (y > pmos_y + pg.total_y_um), mirroring the WL
-approach used here.
+Phase-2 cross-coupling (implemented)
+-------------------------------------
+Cross-coupling faces the same geometry constraint AND must cross the VDD met1
+rail.  Solution: route via met2 (above met1).
+
+Layer stack per coupling path:
+  Q/Q_ li1 bridge → mcon → met1 → via1 → met2 (L-shaped route) → via1
+  → met1 → mcon → li1 → licon1 → INV gate poly stub above PMOS body
+
+The gate poly stub is placed above cell_ytop (PMOS top), at minimum distance
+from the VDD rail to satisfy met1 spacing rules.  The met2 L-shape routes
+at one level for Q→INV_R and one level higher for Q_→INV_L to avoid
+overlap where the two paths cross in the horizontal X span.
 """
 from __future__ import annotations
 
@@ -126,6 +131,8 @@ def draw_bit_cell(
     lyr_m1      = rules.layer("met1")
     lyr_contact = rules.layer("licon1")
     lyr_mcon    = rules.layer("mcon")
+    lyr_via1    = rules.layer("via1")
+    lyr_m2      = rules.layer("met2")
 
     # NMOS diff Y bounds (local, same for inv and pg since same l)
     nd_y0, nd_y1 = _diff_y(inv_geom, rules)
@@ -193,10 +200,94 @@ def draw_bit_cell(
     wl_y1 = stub_cy + ch + enc_m1
     _rect(c, wl_x0, wl_x1, wl_y0, wl_y1, lyr_m1)
 
-    # ── Ports ─────────────────────────────────────────────────────────────────
+    # ── Phase-2: Cross-coupling via met2 ──────────────────────────────────────
+    # Q → INV_R gate  (PD_R.G + PU_R.G = storage node Q connects to right inv gate)
+    # Q_ → INV_L gate (PD_L.G + PU_L.G = storage node Q_ connects to left inv gate)
+    #
+    # Layer stack: Q/Q_ li1 → mcon → met1 → via1 → met2 (L-route) → via1
+    #              → met1 → mcon → li1 → licon1 → INV gate poly stub above PMOS
+    #
+    # The gate poly stub cannot be placed alongside the PMOS S/D li1 (same X
+    # column, l < licon1 contact size → no room for li1 spacing).  Instead it
+    # is placed above cell_ytop where no S/D li1 exists.  A via1+met2 stack
+    # jumps over the VDD met1 rail connecting Q at NMOS level to the gate stub.
+
+    # Geometry constants for gate stubs
+    enc_poly  = rules.contacts.get("poly_enclosure_um", 0.05)
+    enc_m1    = rules.mcon.get("enclosure_in_met1_um", 0.03)
+    enc_m2    = enc_m1          # same rule for met2 enclosure of via1 in sky130A
+    met1_sp   = rules.met1.get("spacing_min_um", 0.14)
+    met2_w    = rules.met1.get("width_min_um",   0.14)   # met2 same as met1 in sky130A
+    met2_sp   = rules.met1.get("spacing_min_um", 0.14)
+    pad_half_inv = (c_size + 2 * enc_poly) / 2            # 0.135 µm half-width of poly pad
+
+    # Gate stub centre Y: licon1/mcon/via1 all at gsc_y.
+    # Constraint: gate stub met1 bottom >= VDD rail top + met1_spacing
+    #   met1 bottom = gsc_y - ch - enc_m1
+    #   VDD rail top = cell_ytop + rail_h
+    # → gsc_y >= cell_ytop + rail_h + met1_sp + ch + enc_m1
+    gsc_y = cell_ytop + rail_h + met1_sp + ch + enc_m1
+    # = cell_ytop + 0.17 + 0.14 + 0.085 + 0.03 = cell_ytop + 0.425
+
+    # INV gate centre X (same for INV_L and INV_R, offset by x_inv_r for INV_R)
+    ig_x0, ig_x1 = _gate_x(0, inv_geom)
+    inv_gcx  = (ig_x0 + ig_x1) / 2          # INV_L gate centre (global, INV_L at x=0)
+    inv_r_gcx = x_inv_r + inv_gcx            # INV_R gate centre (global)
+
+    # ── Gate poly stubs + full via stack for both INV_L and INV_R ─────────────
+    for gcx in (inv_gcx, inv_r_gcx):
+        # Widen gate poly above PMOS body to accept a polycontact
+        _rect(c, gcx - pad_half_inv, gcx + pad_half_inv,
+                 cell_ytop, gsc_y + ch + enc_poly, lyr_g)
+        # Licon1 (polycontact: poly → li1)
+        _rect(c, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_contact)
+        # Li1 landing (li1 enclosure of licon1 ≥ 0)
+        _rect(c, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_li1)
+        # Mcon (li1 → met1)
+        _rect(c, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_mcon)
+        # Met1 landing enclosing mcon (met1.enc = 0.03 µm each side)
+        _rect(c, gcx - ch - enc_m1, gcx + ch + enc_m1,
+                 gsc_y - ch - enc_m1, gsc_y + ch + enc_m1, lyr_m1)
+        # Via1 (met1 → met2)
+        _rect(c, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_via1)
+        # Met2 landing enclosing via1
+        _rect(c, gcx - ch - enc_m2, gcx + ch + enc_m2,
+                 gsc_y - ch - enc_m2, gsc_y + ch + enc_m2, lyr_m2)
+
+    # ── Compute Q/Q_ bridge centres (used for port placement too) ─────────────
     q_x     = (inv_drain_x1   + pg_l_j0_x0) / 2
     q__x    = (inv_r_drain_x1 + pg_r_j0_x0) / 2
     nd_ymid = (nd_y0 + nd_y1) / 2
+
+    # ── Via stacks at Q and Q_ li1 nodes → met2 ───────────────────────────────
+    for nx in (q_x, q__x):
+        # Mcon (existing Q/Q_ li1 → met1)
+        _rect(c, nx - ch, nx + ch, nd_ymid - ch, nd_ymid + ch, lyr_mcon)
+        # Met1 landing
+        _rect(c, nx - ch - enc_m1, nx + ch + enc_m1,
+                 nd_ymid - ch - enc_m1, nd_ymid + ch + enc_m1, lyr_m1)
+        # Via1 (met1 → met2)
+        _rect(c, nx - ch, nx + ch, nd_ymid - ch, nd_ymid + ch, lyr_via1)
+        # Met2 landing
+        _rect(c, nx - ch - enc_m2, nx + ch + enc_m2,
+                 nd_ymid - ch - enc_m2, nd_ymid + ch + enc_m2, lyr_m2)
+
+    # ── Q → INV_R gate: L-shaped met2 route ──────────────────────────────────
+    # Vertical at X = q_x from nd_ymid up to gsc_y
+    _rect(c, q_x - met2_w / 2, q_x + met2_w / 2, nd_ymid, gsc_y, lyr_m2)
+    # Horizontal at Y = gsc_y from q_x to inv_r_gcx
+    _rect(c, q_x, inv_r_gcx, gsc_y - met2_w / 2, gsc_y + met2_w / 2, lyr_m2)
+
+    # ── Q_ → INV_L gate: U-shaped met2 route (one track higher than Q route) ──
+    qb_route_y = gsc_y + met2_w + met2_sp   # horizontal level for Q_ route
+    # Vertical at X = q__x from nd_ymid up to qb_route_y
+    _rect(c, q__x - met2_w / 2, q__x + met2_w / 2, nd_ymid, qb_route_y, lyr_m2)
+    # Horizontal at Y = qb_route_y from inv_gcx to q__x
+    _rect(c, inv_gcx, q__x, qb_route_y - met2_w / 2, qb_route_y + met2_w / 2, lyr_m2)
+    # Vertical at X = inv_gcx from gsc_y up to qb_route_y (connects to INV_L gate stub)
+    _rect(c, inv_gcx - met2_w / 2, inv_gcx + met2_w / 2, gsc_y, qb_route_y, lyr_m2)
+
+    # ── Ports ─────────────────────────────────────────────────────────────────
     cx      = cell_x1 / 2
 
     # BL and BL_: rightmost S/D (drain) of each PG transistor
