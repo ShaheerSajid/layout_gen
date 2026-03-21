@@ -1,0 +1,112 @@
+# layout_gen cell topology template — 6T SRAM bit cell
+#
+# Four inverter transistors (cross-coupled) + two access pass-gates.
+# Routing section describes the connections — the ML synthesizer finds
+# DRC-clean paths, including the cross-coupling that requires met1 detours
+# at sky130A L=0.15 µm (poly gate too narrow for in-channel polycontact).
+
+name: sram_6t_bit_cell
+version: "1.0"
+description: >
+  6-transistor SRAM bit cell.
+  Cross-coupled CMOS inverter pair (INV_L, INV_R) with two NMOS access
+  transistors (PG_L, PG_R) controlled by a common WL wordline.
+
+# ── Device instances ──────────────────────────────────────────────────────────
+devices:
+  PD_L:   {template: planar_mosfet, type: nmos, terminals: {G: Q_,  D: Q,  S: GND}}
+  PU_L:   {template: planar_mosfet, type: pmos, terminals: {G: Q_,  D: Q,  S: VDD}}
+  PD_R:   {template: planar_mosfet, type: nmos, terminals: {G: Q,   D: Q_, S: GND}}
+  PU_R:   {template: planar_mosfet, type: pmos, terminals: {G: Q,   D: Q_, S: VDD}}
+  PG_L:   {template: planar_mosfet, type: nmos, terminals: {G: WL,  D: BL, S: Q }}
+  PG_R:   {template: planar_mosfet, type: nmos, terminals: {G: WL,  D: BL_,S: Q_}}
+
+# ── Nets ──────────────────────────────────────────────────────────────────────
+nets: [Q, Q_, WL, BL, BL_, VDD, GND]
+
+# ── Floorplan constraints ─────────────────────────────────────────────────────
+# Symbolic — ML resolves exact Y from PDK rules.
+floorplan:
+  INV_L:                                  # PD_L + PU_L form left inverter
+    PD_L: {region: bottom, x: left}
+    PU_L: {region: top, in_nwell: true, x: left}
+  INV_R:                                  # PD_R + PU_R form right inverter
+    PD_R: {region: bottom, x: right_of: INV_L}
+    PU_R: {region: top, in_nwell: true, x: right_of: INV_L}
+  PG_L:
+    region:   bottom_only                 # NMOS only, no PMOS pair
+    x:        between(INV_L, INV_R)
+    note:     Q node bridges PG_L.S to INV_L.D (PD_L drain)
+  PG_R:
+    region:   bottom_only
+    x:        right_of(INV_R)
+    note:     Q_ node bridges PG_R.S to INV_R.D (PD_R drain)
+
+  nwell_gap:
+    min: rules.nwell.spacing_min_um       # enforces INV_L.nwell ↔ INV_R.nwell gap
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+routing:
+  # Q storage node: INV_L drain → PG_L source
+  - net:   Q
+    style: li1_bridge
+    path:  [PD_L.D, PG_L.S]
+    layer: li1
+
+  # Q_ storage node: INV_R drain → PG_R source
+  - net:   Q_
+    style: li1_bridge
+    path:  [PD_R.D, PG_R.S]
+    layer: li1
+
+  # Cross-coupling Q → INV_R gate (PD_R.G + PU_R.G)
+  # NOTE: poly gate is too narrow for in-channel polycontact at L=0.15 µm.
+  # Solution: polycontact stub above PMOS body + met1 routing.
+  - net:   Q
+    style: cross_couple_gate
+    path:  [Q_node_li1, PD_R.G, PU_R.G]
+    layer: met1
+    via_stack: [li1, licon1_on_poly, li1, mcon, met1]
+    note:  >
+      Polycontact placed above PD_R/PU_R PMOS body (y > pmos.total_y)
+      where no S/D li1 exists.  Met1 routes from Q li1 → mcon → met1
+      → mcon → li1 → licon1 → poly gate.
+
+  # Cross-coupling Q_ → INV_L gate (PD_L.G + PU_L.G)
+  - net:   Q_
+    style: cross_couple_gate
+    path:  [Q__node_li1, PD_L.G, PU_L.G]
+    layer: met1
+    via_stack: [li1, licon1_on_poly, li1, mcon, met1]
+
+  # WL: both PG gates tied via polycontact stubs + met1 bus
+  - net:   WL
+    style: poly_stub_met1_bus
+    path:  [PG_L.G, PG_R.G]
+    layer: met1
+    via_stack: [poly, licon1_on_poly, li1, mcon, met1]
+    note:  >
+      Poly stubs above PG transistor body, polycontact (licon1) + mcon,
+      met1 horizontal bus spanning PG_L to PG_R.  Implemented in Phase 1.
+
+  # Shared GND rail
+  - net:   GND
+    style: horizontal_power_rail
+    layer: met1
+    edge:  bottom
+
+  # Shared VDD rail
+  - net:   VDD
+    style: horizontal_power_rail
+    layer: met1
+    edge:  top
+
+# ── Output ports ──────────────────────────────────────────────────────────────
+ports:
+  WL:  {layer: met1, location: wl_bus_center}
+  BL:  {layer: li1,  location: PG_L.D_center}
+  BL_: {layer: li1,  location: PG_R.D_center}
+  Q:   {layer: li1,  location: Q_bridge_center}
+  Q_:  {layer: li1,  location: Q__bridge_center}
+  GND: {layer: met1, location: bottom_rail_center}
+  VDD: {layer: met1, location: top_rail_center}

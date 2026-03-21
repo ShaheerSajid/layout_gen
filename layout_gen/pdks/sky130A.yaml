@@ -74,6 +74,10 @@ rules:
     space_to_poly_um:      0.05   # licon.7 — contact must clear poly edge by this
     poly_enclosure_um:     0.05   # licon.10 — poly enclosure of polycontact licon1
 
+  met1:
+    width_min_um:   0.14   # met1.1
+    spacing_min_um: 0.14   # met1.2
+
   mcon:                            # li1 → met1 via rules
     size_um:               0.17   # mcon.1
     spacing_um:            0.19   # mcon.2

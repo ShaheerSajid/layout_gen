@@ -1,0 +1,84 @@
+# layout_gen cell topology template — CMOS inverter
+#
+# Describes WHAT and HOW to connect — not WHERE (the ML synthesizer decides that).
+# Tech-node agnostic: every number comes from pdk.yaml at runtime.
+
+name: cmos_inverter
+version: "1.0"
+description: Single-stage CMOS inverter (1 NMOS + 1 PMOS, shared gate)
+
+# ── Device instances ──────────────────────────────────────────────────────────
+devices:
+  N:
+    template:  planar_mosfet
+    type:      nmos
+    terminals: {G: IN, D: OUT, S: GND, B: GND}
+  P:
+    template:  planar_mosfet
+    type:      pmos
+    terminals: {G: IN, D: OUT, S: VDD, B: VDD}
+
+# ── Nets ──────────────────────────────────────────────────────────────────────
+nets: [IN, OUT, VDD, GND]
+
+# ── Floorplan constraints ─────────────────────────────────────────────────────
+floorplan:
+  N:
+    region:   bottom          # NMOS in substrate
+    y_offset: 0
+  P:
+    region:   top             # PMOS in N-well
+    in_nwell: true
+    y_offset: N.total_y + inter_cell_gap   # gap satisfies rules.diff.spacing_min
+
+  inter_cell_gap:
+    min: rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+routing:
+  # Shared gate: single poly finger running vertically through inter-cell gap
+  - net:   IN
+    style: shared_gate_poly
+    layer: poly
+    path:  [N.G, P.G]
+    note:  >
+      Poly bridge spans from N.total_y to P.y_offset (inter_cell_gap region).
+      Width = rules.poly.width_min_um.  Same column x as gate finger.
+
+  # OUT: drain bridge from NMOS drain to PMOS drain
+  - net:   OUT
+    style: drain_bridge
+    layer: li1
+    path:  [N.D, P.D]
+    note:  >
+      Vertical li1 rectangle from N.diff_y1 to P.diff_y0 (in global Y).
+      Width = sd_length.  Connects NMOS drain li1 to PMOS drain li1.
+
+  # GND power rail
+  - net:   GND
+    style: horizontal_power_rail
+    layer: met1
+    edge:  bottom
+    width: rules.met1.width_min_um   # minimum; typically wider in practice
+
+  # VDD power rail
+  - net:   VDD
+    style: horizontal_power_rail
+    layer: met1
+    edge:  top
+    width: rules.met1.width_min_um
+
+# ── Output ports ──────────────────────────────────────────────────────────────
+ports:
+  IN:
+    layer:    poly
+    location: gate_left_edge_mid_y
+  OUT:
+    layer:    li1
+    location: drain_bridge_right_edge_mid_y
+  GND:
+    layer:    met1
+    location: bottom_rail_center
+  VDD:
+    layer:    met1
+    location: top_rail_center

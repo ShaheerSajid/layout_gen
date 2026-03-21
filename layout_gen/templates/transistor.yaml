@@ -1,0 +1,84 @@
+# layout_gen topology template — planar MOSFET
+#
+# This template describes the spatial and connectivity topology of a single
+# planar gate-all-around / bulk MOSFET independently of any specific tech node.
+# All numeric constraints are expressed symbolically as PDK rule references
+# (rules.* keys).  The ML synthesizer resolves them at runtime from the
+# loaded PDK YAML.
+#
+# To support a new tech node: supply a new pdk.yaml — no template change needed.
+# To support a new transistor architecture (FinFET, GAAFET): create a new template.
+
+name: planar_mosfet
+version: "1.0"
+description: >
+  Generic planar bulk MOSFET (NMOS or PMOS).
+  One or more parallel gate fingers sharing source/drain rails.
+
+# ── Layer roles ───────────────────────────────────────────────────────────────
+# Maps logical role → PDK layer name (resolved via pdk.layers).
+# The ML synthesizer places polygons on these layers.
+layers:
+  gate:      poly      # vertical gate finger(s)
+  active:    diff      # source/drain diffusion
+  contact:   licon1    # local contact (diff/poly to li1)
+  local_int: li1       # local interconnect routing
+  implant_n: nsdm      # N+ select for NMOS
+  implant_p: psdm      # P+ select for PMOS
+  well:      nwell     # N-well (PMOS only, device.nwell=true)
+
+# ── Geometric constraints ──────────────────────────────────────────────────────
+# Expressed as rule references — evaluated at synthesis time.
+# Format:  <constraint_type>: <expression using rules.* keys>
+constraints:
+  # Gate poly runs vertically (Y direction = channel width direction)
+  gate_direction:         vertical
+
+  # Poly must extend past active (endcap) on both sides in Y
+  gate_extends_active_y:  rules.poly.endcap_over_diff_um
+
+  # Active must extend past poly in X (source/drain extension)
+  active_extends_gate_x:  rules.diff.extension_past_poly_um
+
+  # Contacts sit inside active, away from gate edge
+  contact_in_active:      true
+  contact_clear_gate_x:   rules.contacts.space_to_poly_um
+
+  # Li1 covers each contact column (0 enclosure allowed)
+  li1_covers_contact:     rules.contacts.enclosure_in_li1_um
+
+  # Implant encloses active
+  implant_encloses_active: rules.implant.enclosure_of_diff_um
+
+  # Nwell encloses PMOS active (only when device.nwell=true)
+  nwell_encloses_active:  rules.nwell.enclosure_of_pdiff_um
+
+# ── Port definitions ──────────────────────────────────────────────────────────
+ports:
+  G:
+    layer: gate
+    location: top_center    # top edge of gate poly, centered in X
+    description: Gate input
+  S:
+    layer: local_int
+    location: left_sd       # leftmost source/drain li1 rail
+    description: Source
+  D:
+    layer: local_int
+    location: right_sd      # rightmost source/drain li1 rail
+    description: Drain
+
+# ── Finger tiling ─────────────────────────────────────────────────────────────
+# When W > device.w_finger_max_um the synthesizer tiles fingers in X.
+# Each additional finger adds one gate column and shares S/D rails.
+finger_tiling:
+  direction: X
+  max_width_per_finger: rules.devices.{type}.w_finger_max_um
+  shared_sd: true           # adjacent fingers share a source/drain rail
+
+# ── Synthesis hints ───────────────────────────────────────────────────────────
+# Optional guidance for the ML synthesizer; not hard constraints.
+hints:
+  - place contacts centered in each S/D rail
+  - align gate poly center with S/D rail center in Y
+  - keep total_x = (n_fingers+1)*sd_length + n_fingers*L

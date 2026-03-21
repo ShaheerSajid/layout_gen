@@ -75,6 +75,7 @@ class PDKRules:
     diff:     dict
     contacts: dict
     li1:      dict
+    met1:     dict
     implant:  dict
     nwell:    dict
     mcon:     dict
@@ -148,6 +149,7 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
         diff     = rules.get("diff",    {}),
         contacts = rules.get("contacts", {}),
         li1      = rules.get("li1",     {}),
+        met1     = rules.get("met1",    {}),
         implant  = rules.get("implant", {}),
         nwell    = rules.get("nwell",   {}),
         mcon     = rules.get("mcon",    {}),
