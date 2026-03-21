@@ -156,14 +156,23 @@ def _shared_gate_poly(
     gap = max(y_top - y_bot, rules.poly.get("width_min_um", 0.15))
     gate_mid_y = (y_bot + y_top) / 2
 
-    return [PortCandidate(
-        net=spec.net,
-        location_key="gate_left_edge_mid_y",
-        x=gx0, y=gate_mid_y,
-        layer="poly",
-        width=gap,
-        orientation=180,
-    )]
+    # Emit both a net-specific key (e.g. "A_gate_left_edge_mid_y") and the
+    # generic key ("gate_left_edge_mid_y") so that single-gate cells (inverter)
+    # still resolve with the old location string and multi-gate cells (NAND2)
+    # can address each gate individually.
+    net_key = f"{spec.net}_gate_left_edge_mid_y"
+    return [
+        PortCandidate(
+            net=spec.net, location_key=net_key,
+            x=gx0, y=gate_mid_y,
+            layer="poly", width=gap, orientation=180,
+        ),
+        PortCandidate(
+            net=spec.net, location_key="gate_left_edge_mid_y",
+            x=gx0, y=gate_mid_y,
+            layer="poly", width=gap, orientation=180,
+        ),
+    ]
 
 
 @_style("drain_bridge")

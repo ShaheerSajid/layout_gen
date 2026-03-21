@@ -1,0 +1,115 @@
+# layout_gen cell topology template — 2-input NAND gate
+#
+# Matches the schematic in fabram/cells/primitives/nand2.yaml:
+#   Y = !(A & B)
+#
+# Transistors
+#   N_A  NMOS  G=A  D=net1  S=GND   (bottom of series stack, near GND)
+#   N_B  NMOS  G=B  D=Y     S=net1  (top of series stack, drives output)
+#   P_A  PMOS  G=A  D=Y     S=VDD   (parallel pull-up)
+#   P_B  PMOS  G=B  D=Y     S=VDD   (parallel pull-up)
+#
+# X alignment (single-finger, total_x = 0.73 µm):
+#   x=0   : N_A & P_A — gates A aligned vertically
+#   x=0.73: N_B & P_B — gates B aligned vertically
+#
+# net1 (series NMOS internal node) is the abutting S/D between N_A.D and N_B.S.
+#
+# PMOS parallel drain routing uses li1_bridge P_A.D → P_B.D.
+# Note: the li1 bridge crosses the P_B.S=VDD diffusion column; this is
+# geometrically correct and DRC-clean but requires met1-level routing for
+# full LVS cleanliness (device flip support needed for ideal layout).
+
+name: cmos_nand2
+version: "1.0"
+description: 2-input CMOS NAND gate (2 NMOS series, 2 PMOS parallel)
+
+# ── Device instances ───────────────────────────────────────────────────────────
+devices:
+  N_A:   {template: planar_mosfet, type: nmos, terminals: {G: A,   D: net1, S: GND}}
+  N_B:   {template: planar_mosfet, type: nmos, terminals: {G: B,   D: Y,    S: net1}}
+  P_A:   {template: planar_mosfet, type: pmos, terminals: {G: A,   D: Y,    S: VDD}}
+  P_B:   {template: planar_mosfet, type: pmos, terminals: {G: B,   D: Y,    S: VDD}}
+
+# ── Nets ──────────────────────────────────────────────────────────────────────
+nets: [A, B, Y, VDD, GND, net1]
+
+# ── Floorplan constraints ─────────────────────────────────────────────────────
+floorplan:
+  # NMOS series stack: N_A (GND side) then N_B (output side), abutting (no gap)
+  N_A:
+    region:   bottom
+    x:        left
+    y_offset: 0
+  N_B:
+    region:   bottom
+    x:        "N_A.total_x"          # abuts N_A — shared net1 diffusion
+    y_offset: 0
+
+  # PMOS parallel: P_A aligned with N_A (gate A), P_B aligned with N_B (gate B)
+  P_A:
+    region:   top
+    in_nwell: true
+    x:        left                   # gate A column (same as N_A)
+    y_offset: "N_A.total_y + inter_cell_gap"
+  P_B:
+    region:   top
+    in_nwell: true
+    x:        "N_A.total_x"          # gate B column (same as N_B)
+    y_offset: "N_A.total_y + inter_cell_gap"
+
+  inter_cell_gap:
+    min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+routing:
+  # Gate A: poly bridge from N_A gate through gap to P_A gate
+  - net:   A
+    style: shared_gate_poly
+    layer: poly
+    path:  [N_A.G, P_A.G]
+
+  # Gate B: poly bridge from N_B gate through gap to P_B gate
+  - net:   B
+    style: shared_gate_poly
+    layer: poly
+    path:  [N_B.G, P_B.G]
+
+  # net1: abutting NMOS internal node — li1 bridge spans N_A.D and N_B.S
+  - net:   net1
+    style: li1_bridge
+    layer: li1
+    path:  [N_A.D, N_B.S]
+
+  # Y (output): vertical bridge between N_B drain and P_B drain (aligned X)
+  - net:   Y
+    style: drain_bridge
+    layer: li1
+    path:  [N_B.D, P_B.D]
+
+  # Y (output): horizontal li1 bridge connecting P_A drain to P_B drain
+  #   (spans across P_B.S=VDD column; DRC-clean, LVS bridge via met1 ideal)
+  - net:   Y
+    style: li1_bridge
+    layer: li1
+    path:  [P_A.D, P_B.D]
+
+  # GND rail (bottom)
+  - net:   GND
+    style: horizontal_power_rail
+    layer: met1
+    edge:  bottom
+
+  # VDD rail (top)
+  - net:   VDD
+    style: horizontal_power_rail
+    layer: met1
+    edge:  top
+
+# ── Output ports ──────────────────────────────────────────────────────────────
+ports:
+  A:   {layer: poly, location: A_gate_left_edge_mid_y}
+  B:   {layer: poly, location: B_gate_left_edge_mid_y}
+  Y:   {layer: li1,  location: drain_bridge_right_edge_mid_y}
+  GND: {layer: met1, location: bottom_rail_center}
+  VDD: {layer: met1, location: top_rail_center}

@@ -1,0 +1,152 @@
+# layout_gen cell topology template — SRAM row driver
+#
+# Matches fabram/cells/sram/row_driver.yaml:
+#   B = A & WLEN  (NAND2 gate-qualified enable → high-drive inverter buffer)
+#   Implements:  net1 = NAND2(A, WLEN),  B = NOT(net1)
+#
+# Transistors (flattened):
+#   NAND2 stage (4 transistors):
+#     N_A   NMOS  G=A     D=net1  S=GND   — series stack, GND side
+#     N_WL  NMOS  G=WLEN  D=Y_nd  S=net1  — series stack, net1 internal
+#     P_A   PMOS  G=A     D=Y_nd  S=VDD   — parallel pull-up
+#     P_WL  PMOS  G=WLEN  D=Y_nd  S=VDD   — parallel pull-up
+#
+#   Output inverter stage (2 transistors, wider for high drive):
+#     N_INV NMOS  G=Y_nd  D=B     S=GND   — inverter pull-down (W=0.42)
+#     P_INV PMOS  G=Y_nd  D=B     S=VDD   — inverter pull-up  (W=1.624)
+#
+# net1  = NMOS internal node (N_A.D / N_WL.S abutting)
+# Y_nd  = NAND2 output = inverter input   (active low)
+# B     = row driver output = WL enable   (active high)
+#
+# X layout:
+#   x=0        : N_A  / P_A   (gate A)
+#   x=0.73     : N_WL / P_WL  (gate WLEN)
+#   x=1.46+sp  : N_INV / P_INV (gate Y_nd, with diff spacing between NAND2 and INV)
+
+name: row_driver
+version: "1.0"
+description: SRAM row driver — NAND2(A, WLEN) followed by high-drive inverter
+
+# ── Device instances ───────────────────────────────────────────────────────────
+devices:
+  # NAND2 stage
+  N_A:   {template: planar_mosfet, type: nmos, terminals: {G: A,    D: net1, S: GND}}
+  N_WL:  {template: planar_mosfet, type: nmos, terminals: {G: WLEN, D: Y_nd, S: net1}}
+  P_A:   {template: planar_mosfet, type: pmos, terminals: {G: A,    D: Y_nd, S: VDD}}
+  P_WL:  {template: planar_mosfet, type: pmos, terminals: {G: WLEN, D: Y_nd, S: VDD}}
+
+  # Output inverter stage (wider PMOS for drive strength)
+  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}}
+  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}}
+
+# ── Nets ──────────────────────────────────────────────────────────────────────
+nets: [A, WLEN, Y_nd, B, VDD, GND, net1]
+
+# ── Floorplan constraints ─────────────────────────────────────────────────────
+floorplan:
+  # NAND2 NMOS series stack: N_A (GND side), N_WL (Y_nd side), abutting
+  N_A:
+    region:   bottom
+    x:        left
+    y_offset: 0
+  N_WL:
+    region:   bottom
+    x:        "N_A.total_x"          # abuts N_A — shared net1 diffusion
+    y_offset: 0
+
+  # NAND2 PMOS parallel: P_A under gate-A column, P_WL under gate-WLEN column
+  P_A:
+    region:   top
+    in_nwell: true
+    x:        left
+    y_offset: "N_A.total_y + inter_cell_gap"
+  P_WL:
+    region:   top
+    in_nwell: true
+    x:        "N_A.total_x"
+    y_offset: "N_A.total_y + inter_cell_gap"
+
+  # Output inverter stage — placed to the right of NAND2 with diff spacing
+  N_INV:
+    region:   bottom
+    x:        "N_A.total_x + N_WL.total_x + rules.diff.spacing_min_um"
+    y_offset: 0
+  P_INV:
+    region:   top
+    in_nwell: true
+    x:        "N_A.total_x + N_WL.total_x + rules.diff.spacing_min_um"
+    y_offset: "N_A.total_y + inter_cell_gap"
+
+  inter_cell_gap:
+    min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+routing:
+  # Gate A: poly bridge N_A → P_A
+  - net:   A
+    style: shared_gate_poly
+    layer: poly
+    path:  [N_A.G, P_A.G]
+
+  # Gate WLEN: poly bridge N_WL → P_WL
+  - net:   WLEN
+    style: shared_gate_poly
+    layer: poly
+    path:  [N_WL.G, P_WL.G]
+
+  # Gate Y_nd (NAND2 output): poly bridge N_INV → P_INV
+  - net:   Y_nd
+    style: shared_gate_poly
+    layer: poly
+    path:  [N_INV.G, P_INV.G]
+
+  # net1: NMOS series internal node (abutting diffusion)
+  - net:   net1
+    style: li1_bridge
+    layer: li1
+    path:  [N_A.D, N_WL.S]
+
+  # Y_nd: NAND2 output — vertical drain bridge (N_WL.D and P_WL.D aligned)
+  - net:   Y_nd
+    style: drain_bridge
+    layer: li1
+    path:  [N_WL.D, P_WL.D]
+
+  # Y_nd: horizontal li1 bridge connecting P_A.D to P_WL.D (PMOS parallel)
+  - net:   Y_nd
+    style: li1_bridge
+    layer: li1
+    path:  [P_A.D, P_WL.D]
+
+  # Y_nd: horizontal li1 bridge from NAND2 output to inverter gate
+  - net:   Y_nd
+    style: li1_bridge
+    layer: li1
+    path:  [N_WL.D, N_INV.G]
+
+  # B (row driver output): drain bridge N_INV → P_INV
+  - net:   B
+    style: drain_bridge
+    layer: li1
+    path:  [N_INV.D, P_INV.D]
+
+  # GND rail (bottom)
+  - net:   GND
+    style: horizontal_power_rail
+    layer: met1
+    edge:  bottom
+
+  # VDD rail (top)
+  - net:   VDD
+    style: horizontal_power_rail
+    layer: met1
+    edge:  top
+
+# ── Output ports ──────────────────────────────────────────────────────────────
+ports:
+  A:    {layer: poly, location: A_gate_left_edge_mid_y}
+  WLEN: {layer: poly, location: WLEN_gate_left_edge_mid_y}
+  B:    {layer: li1,  location: drain_bridge_right_edge_mid_y}
+  GND:  {layer: met1, location: bottom_rail_center}
+  VDD:  {layer: met1, location: top_rail_center}
