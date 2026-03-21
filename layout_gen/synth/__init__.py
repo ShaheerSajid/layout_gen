@@ -80,6 +80,13 @@ from layout_gen.synth.synthesizer import (
     MLModel,
     PortResolutionError,
 )
+from layout_gen.synth.euler import (
+    euler_order,
+    common_euler_order,
+    build_diffusion_graph,
+    has_euler_path,
+    euler_path,
+)
 from layout_gen.synth.ml import (
     MLAgent,
     ModelNotTrainedError,
@@ -116,6 +123,12 @@ __all__ = [
     "SynthResult",
     "MLModel",
     "PortResolutionError",
+    # Euler path ordering
+    "euler_order",
+    "common_euler_order",
+    "build_diffusion_graph",
+    "has_euler_path",
+    "euler_path",
     # ML agent
     "MLAgent",
     "ModelNotTrainedError",
