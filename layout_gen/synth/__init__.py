@@ -80,6 +80,11 @@ from layout_gen.synth.synthesizer import (
     MLModel,
     PortResolutionError,
 )
+from layout_gen.synth.ml import (
+    MLAgent,
+    ModelNotTrainedError,
+    MarginPredictor,
+)
 
 __all__ = [
     # Template loading
@@ -111,4 +116,8 @@ __all__ = [
     "SynthResult",
     "MLModel",
     "PortResolutionError",
+    # ML agent
+    "MLAgent",
+    "ModelNotTrainedError",
+    "MarginPredictor",
 ]

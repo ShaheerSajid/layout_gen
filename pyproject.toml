@@ -15,8 +15,10 @@ dependencies = [
 [project.optional-dependencies]
 # DRC runner (Phase 1 validation)
 drc = ["klayout>=0.28"]
-# Phase 2 repair agent
-ml  = ["torch>=2.0", "torch-geometric", "scikit-learn"]
+# ML margin predictor + parameter optimiser
+ml  = ["scikit-learn>=1.3", "scipy>=1.11"]
+# Full ML stack with optional GPU training
+ml-full = ["scikit-learn>=1.3", "scipy>=1.11", "pandas"]
 
 [tool.setuptools.packages.find]
 where = ["."]

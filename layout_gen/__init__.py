@@ -39,7 +39,7 @@ from layout_gen.transistor  import (
 from layout_gen.visualize   import write_svg
 from layout_gen.cells       import draw_inverter, draw_nand2, draw_nor2, draw_bit_cell
 from layout_gen.drc         import run_drc, DRCViolation, available_tools
-from layout_gen.synth       import load_template, Synthesizer, SynthResult
+from layout_gen.synth       import load_template, Synthesizer, SynthResult, MLAgent, ModelNotTrainedError
 
 __all__ = [
     # PDK
@@ -68,4 +68,6 @@ __all__ = [
     "load_template",
     "Synthesizer",
     "SynthResult",
+    "MLAgent",
+    "ModelNotTrainedError",
 ]
