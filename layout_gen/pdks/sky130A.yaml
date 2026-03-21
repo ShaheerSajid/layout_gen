@@ -1,0 +1,90 @@
+# layout_gen PDK descriptor — SkyWater 130 nm (sky130A)
+#
+# All dimensions in micrometres (µm) unless noted.
+# Layer numbers sourced from sky130A PDK tech file and process design rules.
+# Verify against your installed PDK before taping out.
+
+name: sky130A
+description: SkyWater 130nm open-source PDK
+
+# ── Layer map: logical name → (GDS layer, GDS datatype) ──────────────────────
+#
+# Logical names are used throughout layout_gen code; never hardcode numbers.
+layers:
+  nwell:  {layer: 64,  datatype: 20}
+  diff:   {layer: 65,  datatype: 20}   # active diffusion (NMOS and PMOS)
+  tap:    {layer: 65,  datatype: 44}   # well/substrate tap (same layer, diff purpose)
+  poly:   {layer: 66,  datatype: 20}   # gate poly
+  nsdm:   {layer: 93,  datatype: 44}   # N+ select / implant
+  psdm:   {layer: 94,  datatype: 20}   # P+ select / implant
+  licon1: {layer: 66,  datatype: 44}   # contact to local interconnect (li1)
+  li1:    {layer: 67,  datatype: 20}   # local interconnect metal
+  mcon:   {layer: 67,  datatype: 44}   # via from li1 to met1
+  met1:   {layer: 68,  datatype: 20}
+  via1:   {layer: 68,  datatype: 44}
+  met2:   {layer: 69,  datatype: 20}
+  via2:   {layer: 69,  datatype: 44}
+  met3:   {layer: 70,  datatype: 20}
+  via3:   {layer: 70,  datatype: 44}
+  met4:   {layer: 71,  datatype: 20}
+  via4:   {layer: 71,  datatype: 44}
+  met5:   {layer: 72,  datatype: 20}
+
+# ── Design rules ──────────────────────────────────────────────────────────────
+rules:
+  poly:
+    width_min_um:        0.15   # poly.1
+    spacing_min_um:      0.21   # poly.2
+    endcap_over_diff_um: 0.13   # poly.4 — poly must extend this far past diff edge
+
+  diff:
+    width_min_um:            0.15   # diff.1
+    spacing_min_um:          0.27   # diff.2
+    extension_past_poly_um:  0.06   # diff.3 — diff must extend past poly in width dir
+
+  contacts:                         # licon1 rules
+    size_um:               0.17   # licon.1 — square contact cut
+    spacing_um:            0.17   # licon.2 — contact-to-contact spacing
+    enclosure_in_diff_um:  0.04   # licon.5a — diff must enclose contact on each side
+    enclosure_in_li1_um:   0.00   # licon.3 — li1 enclosure of contact (min)
+    space_to_poly_um:      0.05   # licon.7 — contact must clear poly edge by this
+
+  li1:
+    width_min_um:   0.17   # li1.1
+    spacing_min_um: 0.17   # li1.2
+
+  implant:
+    enclosure_of_diff_um: 0.125   # nsdm.3 / psdm.3 — implant encloses active region
+
+  nwell:
+    width_min_um:          0.84   # nwell.1
+    spacing_min_um:        1.27   # nwell.2
+    enclosure_of_pdiff_um: 0.18   # nwell.5 — nwell must enclose PMOS diff
+
+# ── Per-device rules ──────────────────────────────────────────────────────────
+#
+# diff_layer  : which layer key to use for the active diffusion rectangle
+# gate_layer  : which layer key to use for poly gate fingers
+# implant_layer : which layer key to use for the S/D implant select
+# bulk_layer  : which layer key to use for the body tap implant select
+# nwell       : true if device sits in an N-well (i.e. PMOS)
+# w_finger_max_um : maximum drawn width per gate finger before adding another finger
+# sd_length_min_um: minimum source/drain contact region length (X direction)
+devices:
+  nmos:
+    diff_layer:       diff
+    gate_layer:       poly
+    implant_layer:    nsdm
+    bulk_layer:       psdm
+    nwell:            false
+    w_finger_max_um:  2.0
+    sd_length_min_um: 0.29
+
+  pmos:
+    diff_layer:       diff
+    gate_layer:       poly
+    implant_layer:    psdm
+    bulk_layer:       nsdm
+    nwell:            true
+    w_finger_max_um:  2.0
+    sd_length_min_um: 0.29

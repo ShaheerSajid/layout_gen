@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "layout_gen"
@@ -9,15 +9,14 @@ description = "Parametric SRAM cell layout generation with DRC-aware repair"
 requires-python = ">=3.10"
 dependencies = [
     "gdsfactory>=7.0",
-    "klayout>=0.28",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
-ml = [
-    "torch>=2.0",
-    "torch-geometric",
-    "scikit-learn",
-]
+# DRC runner (Phase 1 validation)
+drc = ["klayout>=0.28"]
+# Phase 2 repair agent
+ml  = ["torch>=2.0", "torch-geometric", "scikit-learn"]
 
 [tool.setuptools.packages.find]
 where = ["."]
