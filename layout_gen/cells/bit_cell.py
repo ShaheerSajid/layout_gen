@@ -5,26 +5,39 @@ Topology
 --------
 Cross-coupled inverters (INV_L, INV_R) with two access pass-gate NMOS:
 
-    BL──[PG_L: WL gate]──Q──[PD_L+PU_L (INV_L)]──Q
-                              (Q_ in, Q out)         ╲ cross (TODO: polycontact)
-    BL_─[PG_R: WL gate]──Q_─[PD_R+PU_R (INV_R)]──Q_╱
+    BL──[PG_L: WL gate]──Q──[PD_L+PU_L (INV_L)]──Q_
+                                                      ╲ cross (Phase-2)
+    BL_─[PG_R: WL gate]──Q_─[PD_R+PU_R (INV_R)]──Q ╱
 
 Default sizing (optimizer-recommended for sky130A, W in µm, L=0.15):
   W_PD = 0.80  (pull-down NMOS cross-coupled)
   W_PU = 0.42  (pull-up  PMOS cross-coupled)
   W_PG = 0.60  (access   NMOS pass transistors)
 
-Phase-1 connections made
-------------------------
-- Q  node: INV_L drain li1 ↔ PG_L left S/D li1 (bridge)
-- Q_ node: INV_R drain li1 ↔ PG_R left S/D li1 (bridge)
-- Within each draw_inverter sub-cell NMOS drain ↔ PMOS drain (li1 bridge)
+Phase-1 connections (implemented)
+----------------------------------
+- Q  node: INV_L drain li1 ↔ PG_L source li1 (li1 bridge)
+- Q_ node: INV_R drain li1 ↔ PG_R source li1 (li1 bridge)
+- WL:  PG_L gate and PG_R gate tied via polycontact stubs → mcon → met1 bus
 
-Phase-2 TODO (requires polycontact infrastructure)
----------------------------------------------------
-- Cross-coupling: Q  li1 → PD_R / PU_R gate poly via polycontact
-- Cross-coupling: Q_ li1 → PD_L / PU_L gate poly via polycontact
-- WL: horizontal poly connecting PG_L gate and PG_R gate
+WL routing detail
+-----------------
+L=0.15 µm gate poly is narrower than the 0.17 µm licon1 contact.  The
+source/drain li1 leaves only 0.15 µm clear between them — not enough for
+contact (0.17 µm) plus 0.17 µm li1 spacing on both sides.  Solution: extend
+the PG gate poly upward past the transistor body (above total_y_um), where no
+S/D li1 exists, widen to a 0.27 µm pad (0.05 µm poly enclosure each side),
+and drop a licon1 polycontact + mcon there.  A met1 bus then connects both PG
+gate polycontacts across the full cell width.
+
+Phase-2 TODO
+------------
+Cross-coupling (Q → INV_R gate, Q_ → INV_L gate) has the same fundamental
+geometry constraint: any li1 track reaching the INV gate poly in the
+inter-cell gap conflicts with the adjacent OUT drain bridge li1 (same x-column,
+different net, < 0.17 µm spacing).  Needs met1 routing via a polycontact stub
+placed above the PMOS body (y > pmos_y + pg.total_y_um), mirroring the WL
+approach used here.
 """
 from __future__ import annotations
 
@@ -108,9 +121,11 @@ def draw_bit_cell(
     pg_r_ref.movex(x_pg_r)
 
     # ── Layers ────────────────────────────────────────────────────────────────
-    lyr_g   = rules.layer("poly")
-    lyr_li1 = rules.layer("li1")
-    lyr_m1  = rules.layer("met1")
+    lyr_g       = rules.layer("poly")
+    lyr_li1     = rules.layer("li1")
+    lyr_m1      = rules.layer("met1")
+    lyr_contact = rules.layer("licon1")
+    lyr_mcon    = rules.layer("mcon")
 
     # NMOS diff Y bounds (local, same for inv and pg since same l)
     nd_y0, nd_y1 = _diff_y(inv_geom, rules)
@@ -143,33 +158,64 @@ def draw_bit_cell(
     _rect(c, 0, cell_x1, -rail_h, 0, lyr_m1)                       # GND
     _rect(c, 0, cell_x1, cell_ytop, cell_ytop + rail_h, lyr_m1)    # VDD
 
-    # ── Ports ─────────────────────────────────────────────────────────────────
-    # Q port: at the bridge between INV_L and PG_L
-    q_x  = (inv_drain_x1 + pg_l_j0_x0) / 2
-    q__x = (inv_r_drain_x1 + pg_r_j0_x0) / 2
-    nd_ymid = (nd_y0 + nd_y1) / 2
-    cx = cell_x1 / 2
+    # ── WL polycontact stubs + met1 bus ───────────────────────────────────────
+    # The PG gate poly (l=0.15 µm) is too narrow to fit a 0.17 µm licon1 with
+    # 0.17 µm li1 spacing to source AND drain.  Instead we extend the gate poly
+    # vertically above the PG transistor body (above pg_ty = pg_geom.total_y_um)
+    # where no S/D li1 exists, widen to a 0.27 µm pad, and drop a polycontact.
+    pg_ty       = pg_geom.total_y_um               # PG body top (0.86 µm)
+    c_size      = rules.contacts["size_um"]         # licon1/mcon size: 0.17 µm
+    enc_poly    = rules.contacts.get("poly_enclosure_um", 0.05)   # poly→licon1
+    enc_m1      = rules.mcon.get("enclosure_in_met1_um", 0.03)
+    pad_half    = (c_size + 2 * enc_poly) / 2       # 0.135 µm
+    ch          = c_size / 2                         # 0.085 µm
 
-    # WL_A and WL_B: at the gate poly of PG_L and PG_R
     pg_gate_x0, pg_gate_x1 = _gate_x(0, pg_geom)
-    pg_l_gate_mid_x = x_pg_l + (pg_gate_x0 + pg_gate_x1) / 2
-    pg_r_gate_mid_x = x_pg_r + (pg_gate_x0 + pg_gate_x1) / 2
-    gate_mid_y      = pg_geom.total_y_um / 2
+    pg_gate_cx  = (pg_gate_x0 + pg_gate_x1) / 2    # 0.365 µm (local)
+    stub_cy     = pg_ty + pad_half                   # polycontact Y centre (0.995 µm)
 
-    c.add_port("WL_A", center=(pg_l_gate_mid_x, gate_mid_y),
-               width=pg_geom.total_y_um, orientation=90,  layer=lyr_g)
-    c.add_port("WL_B", center=(pg_r_gate_mid_x, gate_mid_y),
-               width=pg_geom.total_y_um, orientation=90,  layer=lyr_g)
-    c.add_port("BL",   center=(x_pg_l + (sd + l + sd * 1.5), nd_ymid),
-               width=nd_y1 - nd_y0, orientation=0,   layer=lyr_li1)
-    c.add_port("BL_",  center=(x_pg_r + (sd + l + sd * 1.5), nd_ymid),
-               width=nd_y1 - nd_y0, orientation=0,   layer=lyr_li1)
-    c.add_port("Q",    center=(q_x,   nd_ymid),
-               width=spacing,       orientation=90,  layer=lyr_li1)
-    c.add_port("Q_",   center=(q__x,  nd_ymid),
-               width=spacing,       orientation=90,  layer=lyr_li1)
-    c.add_port("GND",  center=(cx, -rail_h / 2),
-               width=cell_x1,       orientation=270, layer=lyr_m1)
-    c.add_port("VDD",  center=(cx, cell_ytop + rail_h / 2),
-               width=cell_x1,       orientation=90,  layer=lyr_m1)
+    for pg_ref_x in (x_pg_l, x_pg_r):
+        gcx = pg_ref_x + pg_gate_cx
+        # Widened poly pad extending above PG body (same gate net → just widens)
+        _rect(c, gcx - pad_half, gcx + pad_half,
+                 pg_ty, pg_ty + 2 * pad_half, lyr_g)
+        # Polycontact (licon1 on poly)
+        _rect(c, gcx - ch, gcx + ch, stub_cy - ch, stub_cy + ch, lyr_contact)
+        # Li1 landing covering the licon1 (enc = 0)
+        _rect(c, gcx - ch, gcx + ch, stub_cy - ch, stub_cy + ch, lyr_li1)
+        # mcon via (li1 → met1)
+        _rect(c, gcx - ch, gcx + ch, stub_cy - ch, stub_cy + ch, lyr_mcon)
+
+    # WL met1 bus spanning PG_L to PG_R (met1 encloses mcon by enc_m1)
+    wl_x0 = x_pg_l + pg_gate_cx - ch - enc_m1
+    wl_x1 = x_pg_r + pg_gate_cx + ch + enc_m1
+    wl_y0 = stub_cy - ch - enc_m1
+    wl_y1 = stub_cy + ch + enc_m1
+    _rect(c, wl_x0, wl_x1, wl_y0, wl_y1, lyr_m1)
+
+    # ── Ports ─────────────────────────────────────────────────────────────────
+    q_x     = (inv_drain_x1   + pg_l_j0_x0) / 2
+    q__x    = (inv_r_drain_x1 + pg_r_j0_x0) / 2
+    nd_ymid = (nd_y0 + nd_y1) / 2
+    cx      = cell_x1 / 2
+
+    # BL and BL_: rightmost S/D (drain) of each PG transistor
+    pg_d_x0, pg_d_x1 = _sd_x(1, pg_geom)    # j=1 (drain/BL side, local)
+    bl_x_mid  = x_pg_l + (pg_d_x0 + pg_d_x1) / 2
+    bl__x_mid = x_pg_r + (pg_d_x0 + pg_d_x1) / 2
+
+    c.add_port("WL",  center=((wl_x0 + wl_x1) / 2, (wl_y0 + wl_y1) / 2),
+               width=wl_x1 - wl_x0, orientation=90,  layer=lyr_m1)
+    c.add_port("BL",  center=(bl_x_mid,  nd_ymid),
+               width=nd_y1 - nd_y0,  orientation=0,   layer=lyr_li1)
+    c.add_port("BL_", center=(bl__x_mid, nd_ymid),
+               width=nd_y1 - nd_y0,  orientation=0,   layer=lyr_li1)
+    c.add_port("Q",   center=(q_x,   nd_ymid),
+               width=spacing,        orientation=90,  layer=lyr_li1)
+    c.add_port("Q_",  center=(q__x,  nd_ymid),
+               width=spacing,        orientation=90,  layer=lyr_li1)
+    c.add_port("GND", center=(cx, -rail_h / 2),
+               width=cell_x1,        orientation=270, layer=lyr_m1)
+    c.add_port("VDD", center=(cx, cell_ytop + rail_h / 2),
+               width=cell_x1,        orientation=90,  layer=lyr_m1)
     return c

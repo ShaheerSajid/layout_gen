@@ -77,6 +77,7 @@ class PDKRules:
     li1:      dict
     implant:  dict
     nwell:    dict
+    mcon:     dict
     devices:  dict
 
     def layer(self, name: str) -> tuple[int, int]:
@@ -149,6 +150,7 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
         li1      = rules.get("li1",     {}),
         implant  = rules.get("implant", {}),
         nwell    = rules.get("nwell",   {}),
+        mcon     = rules.get("mcon",    {}),
         devices  = data.get("devices",  {}),
     )
 

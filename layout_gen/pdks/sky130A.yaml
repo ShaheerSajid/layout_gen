@@ -72,6 +72,13 @@ rules:
     enclosure_in_diff_um:  0.04   # licon.5a — diff must enclose contact on each side
     enclosure_in_li1_um:   0.00   # licon.3 — li1 enclosure of contact (min)
     space_to_poly_um:      0.05   # licon.7 — contact must clear poly edge by this
+    poly_enclosure_um:     0.05   # licon.10 — poly enclosure of polycontact licon1
+
+  mcon:                            # li1 → met1 via rules
+    size_um:               0.17   # mcon.1
+    spacing_um:            0.19   # mcon.2
+    enclosure_in_li1_um:   0.00   # mcon.3 — li1 must enclose mcon (min on 2 sides)
+    enclosure_in_met1_um:  0.03   # mcon.5 — met1 must enclose mcon on each side
 
   li1:
     width_min_um:   0.17   # li1.1

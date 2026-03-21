@@ -132,6 +132,7 @@ def draw_inverter(
     w_p:   float,
     l:     float,
     rules: PDKRules = RULES,
+    gap:   float | None = None,
 ) -> "gf.Component":
     """
     CMOS inverter: 1 NMOS + 1 PMOS.
@@ -144,6 +145,11 @@ def draw_inverter(
         Gate length for both devices (µm).
     rules :
         PDK rules.
+    gap :
+        Y gap between NMOS poly top and PMOS poly bottom (µm).
+        Defaults to the minimum gap from PDK rules.  Pass a larger value
+        (e.g. 0.90) when the caller needs extra space in the inter-cell region
+        for routing tracks or polycontacts.
 
     Returns
     -------
@@ -156,7 +162,8 @@ def draw_inverter(
     ng = transistor_geom(w_n, l, "nmos", rules)
     pg = transistor_geom(w_p, l, "pmos", rules)
 
-    gap     = _inter_cell_gap(rules)
+    if gap is None:
+        gap = _inter_cell_gap(rules)
     pmos_y  = ng.total_y_um + gap   # Y offset of PMOS bottom edge
 
     nmos_c  = draw_transistor(w_n, l, "nmos", rules)
