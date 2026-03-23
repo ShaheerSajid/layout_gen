@@ -340,3 +340,83 @@ class TestStackedPlacement:
         assert port_names == expected, (
             f"Port mismatch. Got: {sorted(port_names)} Expected: {sorted(expected)}"
         )
+
+
+# ── Cross-row routing tests ──────────────────────────────────────────────────
+
+class TestCrossRowRouting:
+    """Verify cross-row-pair routing for DIDO column peripheral."""
+
+    @pytest.fixture(scope="class")
+    def synth_result(self):
+        rules = load_pdk()
+        tmpl  = load_template("dido")
+        synth = Synthesizer(rules)
+        return synth.synthesize(tmpl, {"w": 0.42, "l": 0.15}), rules
+
+    @pytest.fixture(scope="class")
+    def layout_state(self, synth_result):
+        from layout_gen.synth.geo.state import LayoutState
+        result, rules = synth_result
+        return LayoutState.from_component(result.component, rules)
+
+    def test_met1_geometry_exists(self, layout_state):
+        """Cross-row routing should produce met1 rectangles."""
+        met1 = layout_state.on_layer("met1")
+        # At least power rails + cross-row routes + bitline buses
+        assert len(met1) >= 10, f"Only {len(met1)} met1 rects (expected ≥10)"
+
+    def test_mcon_via_stacks(self, layout_state):
+        """Cross-row routes should create mcon via stacks (li1→met1)."""
+        mcon = layout_state.on_layer("mcon")
+        assert len(mcon) >= 10, f"Only {len(mcon)} mcon rects (expected ≥10)"
+
+    def test_licon_poly_contacts(self, layout_state):
+        """Gate targets should have licon1 poly contacts."""
+        licon = layout_state.on_layer("licon1")
+        # Original transistor contacts + poly contact stubs for gate targets
+        assert len(licon) >= 50, f"Only {len(licon)} licon1 rects"
+
+    def test_net6_vertical_span(self, layout_state):
+        """net6 met1 route should span from row 0 (y≈0.3) to row 5 (y≈8.3)."""
+        met1 = layout_state.on_layer("met1")
+        # Find a met1 rectangle that spans most of the net6 range
+        spanning = [r for r in met1 if r.y0 < 1.5 and r.y1 > 7.0]
+        assert len(spanning) >= 1, (
+            "No met1 rect spans net6 range (row 0 → rows 4/5)"
+        )
+
+    def test_net4_vertical_span(self, layout_state):
+        """net4 met1 route should span from row 1 (y≈2.1) to row 7 (y≈10.2)."""
+        met1 = layout_state.on_layer("met1")
+        spanning = [r for r in met1 if r.y0 < 3.0 and r.y1 > 8.5]
+        assert len(spanning) >= 1, (
+            "No met1 rect spans net4 range (row 1 → rows 6/7)"
+        )
+
+    def test_net2_vertical_span(self, layout_state):
+        """net2 met1 route should span from row 3 (y≈5.6) to row 9 (y≈12.1)."""
+        met1 = layout_state.on_layer("met1")
+        spanning = [r for r in met1 if r.y0 < 6.5 and r.y1 > 10.5]
+        assert len(spanning) >= 1, (
+            "No met1 rect spans net2 range (row 3 → rows 8/9)"
+        )
+
+    def test_bl_bus_vertical(self, layout_state):
+        """BL vertical bus should span rows 4-8 on met1."""
+        met1 = layout_state.on_layer("met1")
+        bl_bus = [r for r in met1 if r.y0 < 8.0 and r.y1 > 10.5 and r.height > 2.0]
+        assert len(bl_bus) >= 1, "No met1 BL vertical bus found"
+
+    def test_bl_bar_bus_vertical(self, layout_state):
+        """BL_ vertical bus should span rows 4-9 on met1."""
+        met1 = layout_state.on_layer("met1")
+        bl_bar = [r for r in met1 if r.y0 < 8.0 and r.y1 > 9.0 and r.height > 1.0]
+        assert len(bl_bar) >= 1, "No met1 BL_ vertical bus found"
+
+    def test_routing_directive_count(self):
+        """DIDO template should now have 30 routing directives."""
+        tmpl = load_template("dido")
+        assert len(tmpl.routing) == 30, (
+            f"Expected 30 routing directives, got {len(tmpl.routing)}"
+        )

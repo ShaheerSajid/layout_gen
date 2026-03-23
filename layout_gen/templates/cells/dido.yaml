@@ -200,6 +200,48 @@ routing:
     layer: li1
     path:  [P_NA.D, P_NB.D]
 
+  # ── Cross-row-pair connections (met1 L-routes) ──
+  # net3: Row 1 select inverter output → Row 2 NAND2 input
+  - net:   net3
+    style: cross_row_connect
+    layer: met1
+    path:  [N_SI.D, N_NA.G, P_NA.G]
+
+  # net1: Row 2 NAND2 output → Row 3 NOT gate input
+  - net:   net1
+    style: cross_row_connect
+    layer: met1
+    path:  [N_NB.D, N_NT.G, P_NT.G]
+
+  # net6: Row 0 PCHG driver output → Row 4/5 precharge gates
+  - net:   net6
+    style: cross_row_connect
+    layer: met1
+    path:  [N_PD.D, P_PC0.G, P_PC1.G, P_PC2.G]
+
+  # net4: Row 1 select buffer output → Row 6/7 read pass gates
+  - net:   net4
+    style: cross_row_connect
+    layer: met1
+    path:  [N_SB.D, P_RP0.G, P_RP1.G]
+
+  # net2: Row 3 NOT output → Row 8/9 write pass gates
+  - net:   net2
+    style: cross_row_connect
+    layer: met1
+    path:  [N_NT.D, N_WP0.G, N_WP1.G]
+
+  # ── Bitline vertical buses (met1, connecting S/D across rows) ──
+  - net:   BL
+    style: vertical_bus
+    layer: met1
+    path:  [P_PC1.D, P_PC2.D, P_RP1.S, N_WP0.D]
+
+  - net:   BL_
+    style: vertical_bus
+    layer: met1
+    path:  [P_PC0.D, P_PC1.S, P_RP0.D, N_WP1.S]
+
   # ── I/O terminal ports ──
   - net:   BL
     style: expose_terminal
