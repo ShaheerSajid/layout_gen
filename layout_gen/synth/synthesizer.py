@@ -38,9 +38,12 @@ from typing import Callable, Any
 
 from layout_gen.pdk        import PDKRules
 from layout_gen.transistor import draw_transistor
-from layout_gen.synth.loader      import CellTemplate, PortSpec
+from layout_gen.synth.loader      import CellTemplate
 from layout_gen.synth.placer      import Placer, PlacedDevice
 from layout_gen.synth.router      import Router, PortCandidate
+from layout_gen.synth.netlist     import build_net_graph
+from layout_gen.synth.auto_router import AutoRouter
+from layout_gen.synth.port_resolver import resolve_ports, generate_expose_specs
 from layout_gen.synth.geo.agent   import GeoFixAgent
 from layout_gen.synth.geo.loop    import GeoFixLoop
 
@@ -52,11 +55,6 @@ MLModel = Callable[
     [CellTemplate, PDKRules, list, dict],   # template, rules, violations, params
     dict,                                   # → adjusted params
 ]
-
-
-class PortResolutionError(ValueError):
-    """Raised when a port's location keyword cannot be matched to any
-    routing candidate emitted by the style handlers."""
 
 
 @dataclass
@@ -178,11 +176,20 @@ class Synthesizer:
                 _merge_nwells_stacked(comp, placed, self.rules)
 
             # ── Routing ────────────────────────────────────────────────────
-            router     = Router(self.rules)
-            candidates = router.route(comp, template.routing, placed)
+            router = Router(self.rules)
 
-            # ── Ports ─────────────────────────────────────────────────────
-            _add_ports(comp, template, candidates, self.rules)
+            net_graph     = build_net_graph(template)
+            auto_router   = AutoRouter(self.rules)
+            routing_specs = auto_router.plan(net_graph, placed, template)
+            # Add expose_terminal specs for ports with explicit terminals
+            routing_specs.extend(
+                generate_expose_specs(template, net_graph, placed)
+            )
+            candidates = router.route(comp, routing_specs, placed)
+            resolve_ports(
+                comp, template, net_graph,
+                placed, candidates, self.rules,
+            )
 
             # ── DRC (optional) ─────────────────────────────────────────────
             if self.drc_runner is None:
@@ -348,41 +355,6 @@ def _merge_nwells_stacked(
         y1 = max(b[3] for b in cluster)
         comp.add_polygon(
             [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
-            layer=lyr,
-        )
-
-
-# ── Port resolution ────────────────────────────────────────────────────────────
-
-def _add_ports(
-    comp:       Any,  # gf.Component
-    template:   CellTemplate,
-    candidates: list[PortCandidate],
-    rules:      PDKRules,
-) -> None:
-    """Add output ports to *comp* by matching location keywords to candidates."""
-    candidate_map: dict[str, PortCandidate] = {c.location_key: c for c in candidates}
-
-    for net_name, pspec in template.ports.items():
-        cand = candidate_map.get(pspec.location)
-        if cand is None:
-            warnings.warn(
-                f"No routing candidate matched port {net_name!r} with "
-                f"location {pspec.location!r}.  Available keys: "
-                f"{list(candidate_map)}.  Port skipped.",
-                stacklevel=4,
-            )
-            continue
-        try:
-            lyr = rules.layer(pspec.layer)
-        except (KeyError, TypeError):
-            lyr = (1, 0)  # fallback layer tuple
-
-        comp.add_port(
-            net_name,
-            center=(cand.x, cand.y),
-            width=cand.width,
-            orientation=cand.orientation,
             layer=lyr,
         )
 

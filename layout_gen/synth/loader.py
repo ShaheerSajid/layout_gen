@@ -4,6 +4,11 @@ layout_gen.synth.loader — topology template YAML → Python dataclasses.
 Parses a cell topology template into strongly-typed objects.  No numeric
 evaluation happens here; every symbolic string stays a string so the
 constraint evaluator and placer can process it later.
+
+The template format is declarative: the user specifies devices,
+connectivity (nets with types), placement (row pairs or standard pairs),
+and ports (compass side).  Routing is inferred automatically by the
+auto-router from the connectivity graph.
 """
 from __future__ import annotations
 
@@ -20,11 +25,19 @@ _TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 
 @dataclass
-class PortSpec:
-    """Output port declaration from a cell topology template."""
+class NetSpec:
+    """Net declaration from a topology template."""
     name:     str
-    layer:    str   # logical layer name: "poly", "li1", "met1"
-    location: str   # location keyword, e.g. "gate_left_edge_mid_y"
+    net_type: str        # "power" | "signal" | "internal"
+    rail:     str = ""   # "top" | "bottom" (power nets only)
+
+
+@dataclass
+class PortSpec:
+    """Port declaration from a topology template (compass-side)."""
+    name:     str
+    side:     str              # "north" | "south" | "east" | "west"
+    terminal: str = ""         # optional "Dev.Term" for disambiguation
 
 
 @dataclass
@@ -35,7 +48,7 @@ class DeviceSpec:
     device_type:  str              # "nmos" | "pmos"
     terminals:    dict[str, str]   # {terminal: net}, e.g. {"G": "IN", "D": "OUT"}
     fingers:      int  = 0         # 0 = auto (ceil(w / w_finger_max_um)); >0 = explicit
-    # ── Floorplan fields (populated from floorplan section) ──────────────────
+    # ── Placement fields (populated from placement section) ────────────────
     region:       str  = "bottom"  # "bottom", "top", "bottom_only"
     in_nwell:     bool = False
     y_offset_expr: Any = 0         # int/float 0 or a symbolic string
@@ -47,13 +60,17 @@ class DeviceSpec:
 
 @dataclass
 class RoutingSpec:
-    """One routing connection specification."""
+    """One routing connection specification (auto-router output).
+
+    This is an internal type produced by the auto-router and consumed by
+    the Router's style handlers.  Users never write these in YAML.
+    """
     net:   str
     style: str           # "shared_gate_poly", "drain_bridge", "horizontal_power_rail", …
-    layer: str
-    path:  list[str]     # terminal refs: ["N.G", "P.G"]
+    layer: str  = ""
+    path:  list[str] = field(default_factory=list)   # terminal refs: ["N.G", "P.G"]
     edge:  str  = ""     # for horizontal_power_rail: "bottom" | "top"
-    extra: dict = field(default_factory=dict)  # via_stack, note, width, …
+    extra: dict = field(default_factory=dict)  # via_level, track_x, bus_x, …
 
 
 @dataclass
@@ -70,17 +87,15 @@ class RowPairSpec:
 
 @dataclass
 class CellTemplate:
-    """Parsed cell topology template (device + floorplan + routing + ports)."""
+    """Parsed cell topology template."""
     name:               str
-    version:            str
     description:        str
     devices:            dict[str, DeviceSpec]
-    nets:               list[str]
-    routing:            list[RoutingSpec]
+    nets:               dict[str, NetSpec]
     ports:              dict[str, PortSpec]
     named_constraints:  dict[str, Any]   # {name: {min: expr} or expr}
     source_path:        Path | None = None
-    layout_mode:        str = "standard"                          # "standard" or "stacked"
+    layout_mode:        str = "standard"   # "standard" or "stacked"
     row_pairs:          list[RowPairSpec] = field(default_factory=list)
 
 
@@ -102,30 +117,8 @@ def load_template(name_or_path: str | Path) -> CellTemplate:
     """
     path = _resolve_path(name_or_path)
     raw  = yaml.safe_load(path.read_text(encoding="utf-8"))
-
     devices = _parse_devices(raw)
-    fp = raw.get("floorplan", {})
-    layout_mode = fp.get("layout_mode", "standard")
-
-    _apply_floorplan(fp, devices)
-
-    row_pairs: list[RowPairSpec] = []
-    if layout_mode == "stacked":
-        row_pairs = _parse_row_pairs(fp, devices)
-
-    return CellTemplate(
-        name               = raw.get("name", path.stem),
-        version            = str(raw.get("version", "1.0")),
-        description        = str(raw.get("description", "")),
-        devices            = devices,
-        nets               = list(raw.get("nets", [])),
-        routing            = _parse_routing(raw.get("routing", [])),
-        ports              = _parse_ports(raw.get("ports", {})),
-        named_constraints  = _parse_named_constraints(fp, devices),
-        source_path        = path,
-        layout_mode        = layout_mode,
-        row_pairs          = row_pairs,
-    )
+    return _load_template(raw, devices, path)
 
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
@@ -160,100 +153,128 @@ def _parse_devices(raw: dict) -> dict[str, DeviceSpec]:
     return devices
 
 
-def _apply_floorplan(fp: dict, devices: dict[str, DeviceSpec]) -> None:
-    """Populate floorplan fields on DeviceSpec objects from the floorplan section."""
-    if fp.get("layout_mode") == "stacked":
-        # Stacked mode: device placement comes from row_pairs, not per-device entries.
-        return
-    for key, val in fp.items():
-        if key in devices and isinstance(val, dict):
-            _apply_device_fp(devices[key], val)
-        elif isinstance(val, dict):
-            # Nested group (e.g. INV_L: {PD_L: {...}, PU_L: {...}})
-            for subkey, subval in val.items():
-                if subkey in devices and isinstance(subval, dict):
-                    _apply_device_fp(devices[subkey], subval)
+def _load_template(
+    raw:     dict,
+    devices: dict[str, DeviceSpec],
+    path:    Path,
+) -> CellTemplate:
+    """Parse a declarative topology template."""
+    placement = raw.get("placement", {})
+    layout_mode = placement.get("mode", "standard")
 
+    # ── Nets ──────────────────────────────────────────────────────────────
+    nets: dict[str, NetSpec] = {}
+    raw_nets = raw.get("nets", {})
+    if isinstance(raw_nets, dict):
+        for name, spec in raw_nets.items():
+            if isinstance(spec, dict):
+                nets[name] = NetSpec(
+                    name=name,
+                    net_type=spec.get("type", "signal"),
+                    rail=spec.get("rail", ""),
+                )
+            else:
+                nets[name] = NetSpec(name=name, net_type="signal")
+    elif isinstance(raw_nets, list):
+        for name in raw_nets:
+            if name in ("VDD", "VSS", "GND"):
+                rail = "top" if name == "VDD" else "bottom"
+                nets[name] = NetSpec(name=name, net_type="power", rail=rail)
+            else:
+                nets[name] = NetSpec(name=name, net_type="signal")
 
-def _apply_device_fp(spec: DeviceSpec, fp: dict) -> None:
-    spec.region       = fp.get("region", "bottom")
-    spec.in_nwell     = bool(fp.get("in_nwell", False))
-    spec.y_offset_expr = fp.get("y_offset", 0)
-    spec.x_spec        = fp.get("x", None)
+    # Auto-add nets from device terminals that aren't declared
+    for dev in devices.values():
+        for term, net_name in dev.terminals.items():
+            if term == "B":
+                continue
+            if net_name not in nets:
+                nets[net_name] = NetSpec(name=net_name, net_type="internal")
 
+    # ── Ports ─────────────────────────────────────────────────────────────
+    ports: dict[str, PortSpec] = {}
+    for name, spec in raw.get("ports", {}).items():
+        if isinstance(spec, dict):
+            ports[name] = PortSpec(
+                name=name,
+                side=spec.get("side", "east"),
+                terminal=spec.get("terminal", ""),
+            )
 
-def _parse_routing(raw_list: list) -> list[RoutingSpec]:
-    out = []
-    for r in raw_list:
-        known = {"net", "style", "layer", "path", "edge"}
-        out.append(RoutingSpec(
-            net   = r.get("net", ""),
-            style = r.get("style", ""),
-            layer = r.get("layer", ""),
-            path  = list(r.get("path", [])),
-            edge  = r.get("edge", ""),
-            extra = {k: v for k, v in r.items() if k not in known},
-        ))
-    return out
+    # ── Placement → row_pairs or standard pairs ──────────────────────────
+    row_pairs: list[RowPairSpec] = []
+    named_constraints: dict[str, Any] = {}
 
+    if layout_mode == "stacked":
+        raw_pairs = placement.get("row_pairs", [])
+        for i, rp in enumerate(raw_pairs):
+            nmos = list(rp.get("nmos", []))
+            pmos = list(rp.get("pmos", []))
+            sd_flip = rp.get("sd_flip", {})
 
-def _parse_ports(raw: dict) -> dict[str, PortSpec]:
-    out: dict[str, PortSpec] = {}
-    for name, spec in raw.items():
-        out[name] = PortSpec(
-            name     = name,
-            layer    = spec.get("layer", ""),
-            location = spec.get("location", ""),
-        )
-    return out
+            pair = RowPairSpec(
+                id=int(rp.get("id", i)),
+                nmos_devices=nmos,
+                pmos_devices=pmos,
+            )
+            row_pairs.append(pair)
 
+            for name in nmos:
+                if name in devices:
+                    devices[name].row_pair = pair.id
+                    devices[name].region = "bottom"
+                    devices[name].sd_flip = bool(sd_flip.get(name, False))
+            for name in pmos:
+                if name in devices:
+                    devices[name].row_pair = pair.id
+                    devices[name].region = "top"
+                    devices[name].in_nwell = True
+                    devices[name].sd_flip = bool(sd_flip.get(name, False))
+    else:
+        # Standard mode: pairs section
+        raw_pairs = placement.get("pairs", [])
+        if raw_pairs:
+            pair = raw_pairs[0]
+            nmos_names = list(pair.get("nmos", []))
+            pmos_names = list(pair.get("pmos", []))
 
-def _parse_row_pairs(
-    fp: dict, devices: dict[str, DeviceSpec],
-) -> list[RowPairSpec]:
-    """Parse ``row_pairs`` list from the floorplan section (stacked mode)."""
-    raw_pairs = fp.get("row_pairs", [])
-    pairs: list[RowPairSpec] = []
-    for i, rp in enumerate(raw_pairs):
-        nmos = list(rp.get("nmos", []))
-        pmos = list(rp.get("pmos", []))
-        sd_flip = rp.get("sd_flip", {})
+            # Auto-derive floorplan for standard single-pair layouts
+            for idx, name in enumerate(nmos_names):
+                if name in devices:
+                    devices[name].region = "bottom"
+                    if idx == 0:
+                        devices[name].x_spec = "left"
+                    else:
+                        prev = nmos_names[idx - 1]
+                        devices[name].x_spec = f"{prev}.total_x"
+                    devices[name].y_offset_expr = 0
+            for idx, name in enumerate(pmos_names):
+                if name in devices:
+                    devices[name].region = "top"
+                    devices[name].in_nwell = True
+                    if idx == 0:
+                        devices[name].x_spec = "left"
+                    else:
+                        prev = pmos_names[idx - 1]
+                        devices[name].x_spec = f"{prev}.total_x"
+                    first_nmos = nmos_names[0] if nmos_names else name
+                    devices[name].y_offset_expr = (
+                        f"{first_nmos}.total_y + inter_cell_gap"
+                    )
 
-        pair = RowPairSpec(
-            id=int(rp.get("id", i)),
-            nmos_devices=nmos,
-            pmos_devices=pmos,
-        )
-        pairs.append(pair)
+    # ── Constraints ───────────────────────────────────────────────────────
+    raw_constraints = placement.get("constraints", {})
+    for key, val in raw_constraints.items():
+        named_constraints[key] = val
 
-        # Propagate placement info onto each DeviceSpec
-        for name in nmos:
-            if name in devices:
-                devices[name].row_pair = pair.id
-                devices[name].region = "bottom"
-                devices[name].sd_flip = bool(sd_flip.get(name, False))
-        for name in pmos:
-            if name in devices:
-                devices[name].row_pair = pair.id
-                devices[name].region = "top"
-                devices[name].in_nwell = True
-                devices[name].sd_flip = bool(sd_flip.get(name, False))
-
-    return pairs
-
-
-# Floorplan keys that are structural directives, not named constraints.
-_STRUCTURAL_FP_KEYS = frozenset({"layout_mode", "row_pairs"})
-
-
-def _parse_named_constraints(fp: dict, devices: dict[str, DeviceSpec]) -> dict[str, Any]:
-    """Extract named constraint entries (non-device, non-group entries)."""
-    out: dict[str, Any] = {}
-    for key, val in fp.items():
-        if key in devices or key in _STRUCTURAL_FP_KEYS:
-            continue
-        # Check if it's a pure device-group (all sub-keys are device names)
-        if isinstance(val, dict) and all(k in devices for k in val if k not in ("note",)):
-            continue
-        out[key] = val
-    return out
+    return CellTemplate(
+        name               = raw.get("name", path.stem),
+        description        = str(raw.get("description", "")),
+        devices            = devices,
+        nets               = nets,
+        ports              = ports,
+        named_constraints  = named_constraints,
+        source_path        = path,
+        layout_mode        = layout_mode,
+        row_pairs          = row_pairs,
+    )

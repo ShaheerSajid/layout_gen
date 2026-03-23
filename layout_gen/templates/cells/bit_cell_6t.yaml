@@ -1,19 +1,19 @@
 # layout_gen cell topology template — 6T SRAM bit cell
 #
-# Four inverter transistors (cross-coupled) + two access pass-gates.
-# The synthesizer uses this template to produce a DRC-clean layout:
-#   - poly_stub_met1_bus   → WL wordline (polycontact above PG body + met1 bus)
-#   - cross_couple_gate    → Q/Q_ → opposite inverter gate via met2 L/U route
-#   - expose_terminal      → BL/BL_ ports (PG drain, no internal routing needed)
+# Cross-coupled CMOS inverter pair (INV_L, INV_R) with two NMOS access
+# transistors (PG_L, PG_R) controlled by a common WL wordline.
+#
+# Placement: INV_L (PD_L/PU_L) | PG_L | cross_gap | PD_R/PU_R | PG_R
+# The auto-router handles gate bridges, Q/Q_ storage node li1 bridges,
+# drain bridges, and power rails.  Cross-coupling routes and WL bus
+# require specialized style handlers (cross_couple_gate, poly_stub_met1_bus).
 
 name: sram_6t_bit_cell
-version: "1.1"
 description: >
   6-transistor SRAM bit cell.
   Cross-coupled CMOS inverter pair (INV_L, INV_R) with two NMOS access
   transistors (PG_L, PG_R) controlled by a common WL wordline.
 
-# ── Device instances ──────────────────────────────────────────────────────────
 devices:
   PD_L:   {template: planar_mosfet, type: nmos, terminals: {G: Q_,  D: Q,  S: GND}}
   PU_L:   {template: planar_mosfet, type: pmos, terminals: {G: Q_,  D: Q,  S: VDD}}
@@ -22,134 +22,31 @@ devices:
   PG_L:   {template: planar_mosfet, type: nmos, terminals: {G: WL,  D: BL, S: Q }}
   PG_R:   {template: planar_mosfet, type: nmos, terminals: {G: WL,  D: BL_,S: Q_}}
 
-# ── Nets ──────────────────────────────────────────────────────────────────────
-nets: [Q, Q_, WL, BL, BL_, VDD, GND]
+nets:
+  VDD:  {type: power, rail: top}
+  GND:  {type: power, rail: bottom}
+  Q:    {type: internal}
+  Q_:   {type: internal}
+  WL:   {type: signal}
+  BL:   {type: signal}
+  BL_:  {type: signal}
 
-# ── Floorplan constraints ─────────────────────────────────────────────────────
-# Symbolic — ML resolves exact Y from PDK rules.
-floorplan:
-  INV_L:                                  # PD_L + PU_L form left inverter
-    PD_L: {region: bottom, x: left, y_offset: 0}
-    PU_L: {region: top, in_nwell: true, x: left,
-           y_offset: "PD_L.total_y + inter_cell_gap"}
-  INV_R:                                  # PD_R + PU_R form right inverter
-    # X = right edge of INV_L + Q bridge gap + PG_L width + cross_gap
-    # cross_gap enforces nwell spacing between the two inverter nwells
-    PD_R:
-      region:   bottom
-      y_offset: 0
-      x: "PD_L.total_x + rules.diff.spacing_min_um + PG_L.total_x + cross_gap"
-    PU_R:
-      region:   top
-      in_nwell: true
-      y_offset: "PD_R.total_y + inter_cell_gap"
-      x: "PD_L.total_x + rules.diff.spacing_min_um + PG_L.total_x + cross_gap"
-  PG_L:
-    region:   bottom_only                 # NMOS only, no PMOS pair
-    x:        "PD_L.total_x + rules.diff.spacing_min_um"
-    note:     Q bridge = INV_L drain → PG_L source (min diff spacing)
-  PG_R:
-    region:   bottom_only
-    x: "PD_R_x + PD_R.total_x + rules.diff.spacing_min_um"
-    note:     Q_ node bridges PG_R.S to INV_R.D (PD_R drain)
+placement:
+  mode: standard
+  pairs:
+    - nmos: [PD_L, PG_L, PD_R, PG_R]
+      pmos: [PU_L, PU_R]
+  constraints:
+    inter_cell_gap:
+      min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
+    cross_gap:
+      min: "max(2*rules.li1.spacing_min_um + rules.li1.width_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um, rules.nwell.spacing_min_um - 2*rules.nwell.enclosure_of_pdiff_um)"
 
-  inter_cell_gap:
-    min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
-
-  # cross_gap = minimum X gap between INV_L right edge and INV_R left edge.
-  # Driven by nwell spacing: each inverter nwell extends nw_enc beyond the PMOS
-  # diff, so the two nwells need nwell_spacing - 2*nw_enc clear between them.
-  # Also must fit at least one li1 routing track (routing_gap).
-  cross_gap:
-    min: "max(2*rules.li1.spacing_min_um + rules.li1.width_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um, rules.nwell.spacing_min_um - 2*rules.nwell.enclosure_of_pdiff_um)"
-
-  nwell_gap:
-    min: rules.nwell.spacing_min_um       # informational — used by cross_gap above
-
-# ── Routing ───────────────────────────────────────────────────────────────────
-routing:
-  # Q storage node: INV_L drain → PG_L source  (li1 horizontal bridge)
-  - net:   Q
-    style: li1_bridge
-    path:  [PD_L.D, PG_L.S]
-    layer: li1
-
-  # Q_ storage node: INV_R drain → PG_R source  (li1 horizontal bridge)
-  - net:   Q_
-    style: li1_bridge
-    path:  [PD_R.D, PG_R.S]
-    layer: li1
-
-  # Shared gate poly bridges (INV_L and INV_R gate poly continuity)
-  - net:   Q_
-    style: shared_gate_poly
-    path:  [PD_L.G, PU_L.G]
-    layer: poly
-
-  - net:   Q
-    style: shared_gate_poly
-    path:  [PD_R.G, PU_R.G]
-    layer: poly
-
-  # Cross-coupling Q → INV_R gate (PD_R.G + PU_R.G)
-  # track=0: met2 horizontal at gsc_y (lower track)
-  - net:   Q
-    style: cross_couple_gate
-    path:  [Q_node_li1, PD_R.G, PU_R.G]
-    layer: met2
-    track: 0
-    via_stack: [li1, mcon, met1, via1, met2]
-
-  # Cross-coupling Q_ → INV_L gate (PD_L.G + PU_L.G)
-  # track=1: met2 horizontal one track higher to avoid overlap with Q route
-  - net:   Q_
-    style: cross_couple_gate
-    path:  [Q__node_li1, PD_L.G, PU_L.G]
-    layer: met2
-    track: 1
-    via_stack: [li1, mcon, met1, via1, met2]
-
-  # WL: both PG gates tied via polycontact stubs + met1 bus
-  - net:   WL
-    style: poly_stub_met1_bus
-    path:  [PG_L.G, PG_R.G]
-    layer: met1
-    via_stack: [poly, licon1_on_poly, li1, mcon, met1]
-
-  # BL: PG_L drain exposed as port (bitline — no internal routing needed)
-  - net:   BL
-    style: expose_terminal
-    path:  [PG_L.D]
-    layer: li1
-    orientation: 90
-    location_key: PG_L_D_center
-
-  # BL_: PG_R drain exposed as port
-  - net:   BL_
-    style: expose_terminal
-    path:  [PG_R.D]
-    layer: li1
-    orientation: 90
-    location_key: PG_R_D_center
-
-  # Shared GND rail (met1, bottom)
-  - net:   GND
-    style: horizontal_power_rail
-    layer: met1
-    edge:  bottom
-
-  # Shared VDD rail (met1, top)
-  - net:   VDD
-    style: horizontal_power_rail
-    layer: met1
-    edge:  top
-
-# ── Output ports ──────────────────────────────────────────────────────────────
 ports:
-  WL:  {layer: met1, location: wl_bus_center}
-  BL:  {layer: li1,  location: PG_L_D_center}
-  BL_: {layer: li1,  location: PG_R_D_center}
-  Q:   {layer: li1,  location: Q_bridge_center}
-  Q_:  {layer: li1,  location: Q__bridge_center}
-  GND: {layer: met1, location: bottom_rail_center}
-  VDD: {layer: met1, location: top_rail_center}
+  WL:  {side: north, terminal: PG_L.G}
+  BL:  {side: north, terminal: PG_L.D}
+  BL_: {side: north, terminal: PG_R.D}
+  Q:   {side: west, terminal: PD_L.D}
+  Q_:  {side: east, terminal: PD_R.D}
+  GND: {side: south}
+  VDD: {side: north}

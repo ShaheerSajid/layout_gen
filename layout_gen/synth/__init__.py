@@ -50,8 +50,9 @@ from layout_gen.synth.loader      import (
     load_template,
     CellTemplate,
     DeviceSpec,
-    RoutingSpec,
+    NetSpec,
     PortSpec,
+    RoutingSpec,
 )
 from layout_gen.synth.constraints import (
     eval_expr,
@@ -74,11 +75,18 @@ from layout_gen.synth.router      import (
     PortCandidate,
     register_style,
 )
+from layout_gen.synth.netlist     import (
+    NetGraph,
+    NetInfo,
+    TerminalRef,
+    build_net_graph,
+)
+from layout_gen.synth.auto_router import AutoRouter
+from layout_gen.synth.port_resolver import resolve_ports, generate_expose_specs
 from layout_gen.synth.synthesizer import (
     Synthesizer,
     SynthResult,
     MLModel,
-    PortResolutionError,
 )
 from layout_gen.synth.euler import (
     euler_order,
@@ -102,8 +110,9 @@ __all__ = [
     "load_template",
     "CellTemplate",
     "DeviceSpec",
-    "RoutingSpec",
+    "NetSpec",
     "PortSpec",
+    "RoutingSpec",
     # Constraint evaluation
     "eval_expr",
     "resolve_named_constraints",
@@ -122,11 +131,20 @@ __all__ = [
     "Router",
     "PortCandidate",
     "register_style",
+    # Connectivity graph
+    "NetGraph",
+    "NetInfo",
+    "TerminalRef",
+    "build_net_graph",
+    # Auto-router
+    "AutoRouter",
+    # Port resolution
+    "resolve_ports",
+    "generate_expose_specs",
     # Synthesis
     "Synthesizer",
     "SynthResult",
     "MLModel",
-    "PortResolutionError",
     # Euler path ordering
     "euler_order",
     "common_euler_order",

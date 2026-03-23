@@ -648,6 +648,56 @@ def _expose_terminal(
 
 # ── Phase-3 routing styles: cross-row connections ─────────────────────────────
 
+# ── Shared via-stack helper ──────────────────────────────────────────────────
+
+def _via_stack_up(comp, rules, cx, cy, from_level, to_level):
+    """Draw via stack from *from_level* to *to_level* at (cx, cy).
+
+    Levels: 0=li1, 1=met1, 2=met2.  Draws all intermediate contacts/vias
+    and metal landings.
+
+    Returns the half-extent of the topmost landing (for wire sizing).
+    """
+    c_size    = rules.contacts["size_um"]
+    mcon_sz   = (rules.mcon or {}).get("size_um", c_size)
+    enc_m1_mc = rules.met1.get("enclosure_of_mcon_2adj_um", 0.06)
+    met1_w    = rules.met1.get("width_min_um", 0.14)
+    _via1     = rules.via1 if rules.via1 else {}
+    via1_sz   = _via1.get("size_um", 0.15)
+    enc_m1_v1 = _via1.get("enclosure_in_met1_2adj_um", 0.085)
+    _met2     = rules.met2 if rules.met2 else rules.met1
+    enc_m2_v1 = _met2.get("enclosure_of_via1_2adj_um", 0.085)
+
+    mch  = mcon_sz / 2
+    vh   = via1_sz / 2
+    m1_lh = max(mch + enc_m1_mc, met1_w / 2, vh + enc_m1_v1)
+    m2_lh = vh + enc_m2_v1
+
+    lyr_mcon = rules.layer("mcon")
+    lyr_m1   = rules.layer("met1")
+    lyr_via1 = rules.layer("via1")
+    lyr_m2   = rules.layer("met2")
+
+    top_half = 0.0
+
+    if from_level <= 0 and to_level >= 1:
+        # mcon (li1 → met1)
+        _rect(comp, cx - mch, cx + mch, cy - mch, cy + mch, lyr_mcon)
+        _rect(comp, cx - m1_lh, cx + m1_lh, cy - m1_lh, cy + m1_lh, lyr_m1)
+        top_half = m1_lh
+
+    if from_level <= 1 and to_level >= 2:
+        # Ensure met1 landing exists (needed when from_level=1)
+        if from_level == 1:
+            _rect(comp, cx - m1_lh, cx + m1_lh, cy - m1_lh, cy + m1_lh, lyr_m1)
+        # via1 (met1 → met2)
+        _rect(comp, cx - vh, cx + vh, cy - vh, cy + vh, lyr_via1)
+        _rect(comp, cx - m2_lh, cx + m2_lh, cy - m2_lh, cy + m2_lh, lyr_m2)
+        top_half = m2_lh
+
+    return top_half
+
+
 @_style("cross_row_connect")
 def _cross_row_connect(
     comp:   Any,
@@ -655,47 +705,66 @@ def _cross_row_connect(
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
 ) -> list[PortCandidate]:
-    """Connect a source terminal to gate(s) in other row pairs via met1 L-route.
+    """Connect a source terminal to gate(s) in other row pairs via L-route.
 
     The source (first element in path) is an S/D terminal whose li1 is already
     placed by ``drain_bridge`` or the transistor primitive.  Each target
     (remaining path elements, typically ``Dev.G``) gets a poly-contact stub
-    with a full licon1→li1→mcon→met1 via stack, and the met1 bus is routed
-    in an L-shape from source to all targets.
+    with a via stack, and a metal bus is routed in an L-shape from source to
+    all targets.
 
     Expected path: ``[source_dev.term, target_dev1.G, target_dev2.G, ...]``
 
     Extra fields
     ------------
     track_x : float
-        Optional X position for the vertical met1 segment.  When omitted
-        the route runs at the source terminal's center X, then horizontally
-        to each target.
+        X position for the vertical trunk.  Defaults to source X.
+    via_level : int
+        Metal level for the trunk.  1 = met1 (default, for short adjacent-row
+        connections).  2 = met2 (for long-distance connections that would
+        create met1 shorts).
     """
     if len(spec.path) < 2:
         return []
 
+    via_level = int(spec.extra.get("via_level", 1))
+
     # ── Geometry constants ─────────────────────────────────────────────────
-    c_size    = rules.contacts["size_um"]                     # 0.17
+    c_size    = rules.contacts["size_um"]
     enc_poly  = rules.contacts.get("poly_enclosure_um", 0.05)
     enc_li_2a = rules.contacts.get("enclosure_in_li1_2adj_um", 0.08)
     enc_m1_mc = rules.met1.get("enclosure_of_mcon_2adj_um", 0.06)
-    mcon_sz   = (rules.mcon or {}).get("size_um", c_size)     # 0.17
+    mcon_sz   = (rules.mcon or {}).get("size_um", c_size)
     li1_sp    = rules.li1.get("spacing_min_um", 0.17)
     met1_w    = rules.met1.get("width_min_um", 0.14)
+    _via1     = rules.via1 if rules.via1 else {}
+    via1_sz   = _via1.get("size_um", 0.15)
+    enc_m1_v1 = _via1.get("enclosure_in_met1_2adj_um", 0.085)
+    _met2     = rules.met2 if rules.met2 else rules.met1
+    met2_w    = _met2.get("width_min_um", 0.14)
+    enc_m2_v1 = _met2.get("enclosure_of_via1_2adj_um", 0.085)
 
-    ch        = c_size / 2                                    # 0.085
+    ch        = c_size / 2
     mch       = mcon_sz / 2
-    pad_half  = (c_size + 2 * enc_poly) / 2                  # 0.135
-    li1_lh    = ch + enc_li_2a                                # li1 landing half
-    m1_lh     = max(mch + enc_m1_mc, met1_w / 2)             # met1 landing half
-    m1_hw     = max(met1_w / 2, mch + enc_m1_mc)             # met1 wire half-width
+    vh        = via1_sz / 2
+    pad_half  = (c_size + 2 * enc_poly) / 2
+    li1_lh    = ch + enc_li_2a
+    m1_lh     = max(mch + enc_m1_mc, met1_w / 2)
 
-    lyr_g       = rules.layer("poly")
-    lyr_li1     = rules.layer("li1")
-    lyr_licon   = rules.layer("licon1")
-    lyr_mcon    = rules.layer("mcon")
-    lyr_m1      = rules.layer("met1")
+    # Trunk wire half-width depends on routing level.
+    # Via landing pads (wider, for enclosure) are drawn by _via_stack_up;
+    # the trunk wire itself only needs minimum metal width.
+    if via_level >= 2:
+        trunk_hw = met2_w / 2
+        lyr_trunk = rules.layer("met2")
+    else:
+        trunk_hw = met1_w / 2
+        lyr_trunk = rules.layer("met1")
+
+    lyr_g     = rules.layer("poly")
+    lyr_li1   = rules.layer("li1")
+    lyr_licon = rules.layer("licon1")
+    lyr_m1    = rules.layer("met1")
 
     # ── Resolve source terminal ────────────────────────────────────────────
     try:
@@ -705,15 +774,11 @@ def _cross_row_connect(
     src_cx = (t_src.x0 + t_src.x1) / 2
     src_cy = (t_src.y0 + t_src.y1) / 2
 
-    # Place mcon on source li1
-    _rect(comp, src_cx - mch, src_cx + mch,
-                src_cy - mch, src_cy + mch, lyr_mcon)
-    # Met1 landing at source
-    _rect(comp, src_cx - m1_lh, src_cx + m1_lh,
-                src_cy - m1_lh, src_cy + m1_lh, lyr_m1)
+    # Via stack at source: li1 → met1 (→ met2 if via_level=2)
+    _via_stack_up(comp, rules, src_cx, src_cy, 0, via_level)
 
     # ── Resolve target gates and build poly-contact stubs ──────────────────
-    target_locs: list[tuple[float, float]] = []  # (x, y) of each gate stub mcon
+    target_locs: list[tuple[float, float]] = []
 
     for ref in spec.path[1:]:
         parts = ref.split(".", 1)
@@ -725,19 +790,14 @@ def _cross_row_connect(
 
         term = parts[1]
         if term == "G":
-            # Gate target: build poly pad + licon1 + li1 + mcon stack
             gx0, gx1 = global_gate_x(dev, 0)
             gcx      = (gx0 + gx1) / 2
 
-            # Place stub at the poly edge closest to source
             if src_cy < dev.y + dev.geom.total_y_um / 2:
-                # Source is below target — stub at bottom of poly
                 stub_cy = global_poly_bottom(dev) - li1_sp - li1_lh
             else:
-                # Source is above target — stub at top of poly
                 stub_cy = global_poly_top(dev) + li1_sp + li1_lh
 
-            # Poly pad from device body to stub
             poly_body_top = global_poly_top(dev)
             poly_body_bot = global_poly_bottom(dev)
             if stub_cy > poly_body_top:
@@ -747,71 +807,55 @@ def _cross_row_connect(
                 _rect(comp, gcx - pad_half, gcx + pad_half,
                             stub_cy - ch - enc_poly, poly_body_bot, lyr_g)
 
-            # Licon1 (poly contact)
+            # Licon1 + li1 + mcon (+ via1 if met2)
             _rect(comp, gcx - ch, gcx + ch,
                         stub_cy - ch, stub_cy + ch, lyr_licon)
-            # Li1 landing
             _rect(comp, gcx - li1_lh, gcx + li1_lh,
                         stub_cy - li1_lh, stub_cy + li1_lh, lyr_li1)
-            # Mcon (li1 → met1)
-            _rect(comp, gcx - mch, gcx + mch,
-                        stub_cy - mch, stub_cy + mch, lyr_mcon)
-            # Met1 landing
-            _rect(comp, gcx - m1_lh, gcx + m1_lh,
-                        stub_cy - m1_lh, stub_cy + m1_lh, lyr_m1)
+            _via_stack_up(comp, rules, gcx, stub_cy, 0, via_level)
 
             target_locs.append((gcx, stub_cy))
-
         else:
-            # S/D target: place mcon directly on existing li1
             try:
                 t_tgt = resolve_terminal(ref, placed, rules)
             except (KeyError, ValueError):
                 continue
             tgt_cx = (t_tgt.x0 + t_tgt.x1) / 2
             tgt_cy = (t_tgt.y0 + t_tgt.y1) / 2
-
-            _rect(comp, tgt_cx - mch, tgt_cx + mch,
-                        tgt_cy - mch, tgt_cy + mch, lyr_mcon)
-            _rect(comp, tgt_cx - m1_lh, tgt_cx + m1_lh,
-                        tgt_cy - m1_lh, tgt_cy + m1_lh, lyr_m1)
-
+            _via_stack_up(comp, rules, tgt_cx, tgt_cy, 0, via_level)
             target_locs.append((tgt_cx, tgt_cy))
 
     if not target_locs:
         return []
 
-    # ── Met1 L-route from source to targets ────────────────────────────────
-    # Strategy: vertical met1 strip at track_x (default = src_cx),
-    # then horizontal jogs to each target.
+    # ── Trunk L-route on the routing metal ─────────────────────────────────
     track_x = float(spec.extra.get("track_x", src_cx))
 
-    # Collect all Y positions to determine vertical extent
     all_ys = [src_cy] + [y for _, y in target_locs]
     y_min  = min(all_ys)
     y_max  = max(all_ys)
 
-    # Vertical met1 trunk
+    # Vertical trunk
     if y_max > y_min:
-        _rect(comp, track_x - m1_hw, track_x + m1_hw,
-                    y_min - m1_hw, y_max + m1_hw, lyr_m1)
+        _rect(comp, track_x - trunk_hw, track_x + trunk_hw,
+                    y_min - trunk_hw, y_max + trunk_hw, lyr_trunk)
 
-    # Horizontal met1 jog from track_x to source (if source not on track)
+    # Horizontal jog from trunk to source
     if abs(src_cx - track_x) > 0.001:
-        jx0 = min(src_cx, track_x) - m1_hw
-        jx1 = max(src_cx, track_x) + m1_hw
+        jx0 = min(src_cx, track_x) - trunk_hw
+        jx1 = max(src_cx, track_x) + trunk_hw
         _rect(comp, jx0, jx1,
-                    src_cy - m1_hw, src_cy + m1_hw, lyr_m1)
+                    src_cy - trunk_hw, src_cy + trunk_hw, lyr_trunk)
 
-    # Horizontal met1 jog from track_x to each target
+    # Horizontal jog from trunk to each target
     for tgt_x, tgt_y in target_locs:
         if abs(tgt_x - track_x) > 0.001:
-            jx0 = min(tgt_x, track_x) - m1_hw
-            jx1 = max(tgt_x, track_x) + m1_hw
+            jx0 = min(tgt_x, track_x) - trunk_hw
+            jx1 = max(tgt_x, track_x) + trunk_hw
             _rect(comp, jx0, jx1,
-                        tgt_y - m1_hw, tgt_y + m1_hw, lyr_m1)
+                        tgt_y - trunk_hw, tgt_y + trunk_hw, lyr_trunk)
 
-    return []  # no new port — the net is internal
+    return []
 
 
 @_style("vertical_bus")
@@ -821,38 +865,45 @@ def _vertical_bus(
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
 ) -> list[PortCandidate]:
-    """Vertical met1 bus connecting S/D terminals across multiple row pairs.
+    """Vertical metal bus connecting S/D terminals across multiple row pairs.
 
-    Used for BL/BL_ bitlines that span the full cell height through
-    precharge, read, and write pass transistors.
+    Used for BL/BL_ bitlines that span the full cell height.
 
-    Expected path: ``[Dev1.term, Dev2.term, ...]`` — all S/D terminals
-    to be connected on this net.
-
-    The bus runs at the average X position of all terminals, with horizontal
-    li1→mcon→met1 taps at each terminal.
+    Expected path: ``[Dev1.term, Dev2.term, ...]``
 
     Extra fields
     ------------
     bus_x : float
-        Override X position for the bus (µm).  When omitted, uses the
-        average of all terminal center X positions.
+        Override X position for the bus.
+    via_level : int
+        Metal level for the bus trunk.  1 = met1 (default).  2 = met2.
     """
     if len(spec.path) < 2:
         return []
+
+    via_level = int(spec.extra.get("via_level", 1))
 
     # ── Geometry constants ─────────────────────────────────────────────────
     mcon_sz   = (rules.mcon or {}).get("size_um", 0.17)
     enc_m1_mc = rules.met1.get("enclosure_of_mcon_2adj_um", 0.06)
     met1_w    = rules.met1.get("width_min_um", 0.14)
+    _via1     = rules.via1 if rules.via1 else {}
+    via1_sz   = _via1.get("size_um", 0.15)
+    _met2     = rules.met2 if rules.met2 else rules.met1
+    met2_w    = _met2.get("width_min_um", 0.14)
+    enc_m2_v1 = _met2.get("enclosure_of_via1_2adj_um", 0.085)
+    vh        = via1_sz / 2
     mch       = mcon_sz / 2
-    m1_hw     = max(met1_w / 2, mch + enc_m1_mc)
 
-    lyr_mcon = rules.layer("mcon")
-    lyr_m1   = rules.layer("met1")
+    if via_level >= 2:
+        trunk_hw  = met2_w / 2
+        lyr_trunk = rules.layer("met2")
+    else:
+        trunk_hw  = met1_w / 2
+        lyr_trunk = rules.layer("met1")
 
     # ── Resolve all terminal positions ─────────────────────────────────────
-    taps: list[tuple[float, float]] = []  # (cx, cy) per terminal
+    taps: list[tuple[float, float]] = []
     for ref in spec.path:
         try:
             t = resolve_terminal(ref, placed, rules)
@@ -873,23 +924,19 @@ def _vertical_bus(
 
     # ── Via stacks and horizontal taps at each terminal ────────────────────
     for tap_x, tap_y in taps:
-        # Mcon on li1
-        _rect(comp, tap_x - mch, tap_x + mch,
-                    tap_y - mch, tap_y + mch, lyr_mcon)
-        # Met1 landing at terminal
-        _rect(comp, tap_x - m1_hw, tap_x + m1_hw,
-                    tap_y - m1_hw, tap_y + m1_hw, lyr_m1)
-        # Horizontal met1 jog from terminal to bus (if needed)
+        # Full via stack from li1 up to routing level
+        _via_stack_up(comp, rules, tap_x, tap_y, 0, via_level)
+        # Horizontal jog on routing metal from terminal to bus
         if abs(tap_x - bus_x) > 0.001:
-            jx0 = min(tap_x, bus_x) - m1_hw
-            jx1 = max(tap_x, bus_x) + m1_hw
+            jx0 = min(tap_x, bus_x) - trunk_hw
+            jx1 = max(tap_x, bus_x) + trunk_hw
             _rect(comp, jx0, jx1,
-                        tap_y - m1_hw, tap_y + m1_hw, lyr_m1)
+                        tap_y - trunk_hw, tap_y + trunk_hw, lyr_trunk)
 
-    # ── Vertical met1 trunk ────────────────────────────────────────────────
+    # ── Vertical trunk ────────────────────────────────────────────────────
     y_min = min(y for _, y in taps)
     y_max = max(y for _, y in taps)
-    _rect(comp, bus_x - m1_hw, bus_x + m1_hw,
-                y_min - m1_hw, y_max + m1_hw, lyr_m1)
+    _rect(comp, bus_x - trunk_hw, bus_x + trunk_hw,
+                y_min - trunk_hw, y_max + trunk_hw, lyr_trunk)
 
-    return []  # no new port — BL/BL_ ports come from expose_terminal
+    return []
