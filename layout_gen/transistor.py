@@ -328,11 +328,8 @@ def draw_transistor(
         li_enc  = rules.contacts.get("enclosure_in_li1_um", 0.0)
         half_sd = geom.sd_length_um / 2
 
-        # How much to pull back each li1 edge that faces a poly gate.
-        # Use full (li1_sp - L) instead of half so that abutting devices
-        # (shared diffusion) still maintain li1 spacing across the
-        # neighbor's gate, where only one side has pullback.
-        pullback = max(0.0, li1_sp - geom.l_um)
+        # How much to pull back each li1 edge that faces a poly gate
+        pullback = max(0.0, (li1_sp - geom.l_um) / 2)
         # Ensure li1 still encloses all contacts after pullback
         max_pullback = half_sd - c_size / 2 - li_enc
         pullback = min(pullback, max(0.0, max_pullback))
