@@ -31,7 +31,7 @@ Usage::
 from layout_gen.synth.geo.state      import LayoutState, Rect
 from layout_gen.synth.geo.actions    import (
     Action, StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes,
-    apply_action,
+    SnapToGrid, apply_action,
 )
 from layout_gen.synth.geo.violations import ViolationInfo, parse_violation
 from layout_gen.synth.geo.agent      import GeoFixAgent, RuleGeoAgent
@@ -39,7 +39,7 @@ from layout_gen.synth.geo.loop       import GeoFixLoop
 
 __all__ = [
     "LayoutState", "Rect",
-    "Action", "StretchEdge", "MoveShape", "AddRect", "RemoveShape", "MergeShapes",
+    "Action", "StretchEdge", "MoveShape", "AddRect", "RemoveShape", "MergeShapes", "SnapToGrid",
     "apply_action",
     "ViolationInfo", "parse_violation",
     "GeoFixAgent", "RuleGeoAgent",

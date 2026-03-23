@@ -105,11 +105,15 @@ def _normalize_layer(s: str) -> str:
 
 # Patterns in rule names/descriptions → category
 _CATEGORY_PATTERNS: list[tuple[str, str]] = [
+    (r"off.?grid|offgrid|grid",            "offgrid"),
     (r"spacing|space|spac\b|\.sp\b",       "spacing"),
     (r"width|wid\b|\.w\b|minimum width",   "width"),
     (r"enclos|ovlp|overlap.*encl",         "enclosure"),
     (r"area\b|min.*area",                  "area"),
     (r"overlap|short|bridg",               "overlap"),
+    (r"extend|extension|endcap",           "extension"),
+    (r"antenna",                           "antenna"),
+    (r"density|fill",                      "density"),
 ]
 
 def _detect_category(rule: str, desc: str) -> str:

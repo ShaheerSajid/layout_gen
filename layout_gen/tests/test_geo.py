@@ -18,7 +18,7 @@ import numpy as np
 from layout_gen.drc.base import DRCViolation
 from layout_gen.synth.geo.state import Rect, LayoutState
 from layout_gen.synth.geo.actions import (
-    StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes,
+    StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes, SnapToGrid,
     apply_action,
 )
 from layout_gen.synth.geo.violations import (
@@ -292,6 +292,29 @@ class TestActions:
         assert "Remove" in RemoveShape(0).describe()
         assert "Merge" in MergeShapes([0, 1]).describe()
 
+    def test_snap_to_grid_single(self):
+        """SnapToGrid snaps one rect's edges to 5 nm grid."""
+        s = LayoutState()
+        s.add("met1", 0.003, 0.007, 1.002, 1.008)  # off-grid edges
+        apply_action(s, SnapToGrid(rid=0, grid=0.005))
+        assert s[0].x0 == pytest.approx(0.005)
+        assert s[0].y0 == pytest.approx(0.005)
+        assert s[0].x1 == pytest.approx(1.000)
+        assert s[0].y1 == pytest.approx(1.010)
+
+    def test_snap_to_grid_all(self):
+        """SnapToGrid with rid=-1 snaps all rects."""
+        s = LayoutState()
+        s.add("met1", 0.003, 0.003, 1.003, 1.003)
+        s.add("met2", 2.007, 2.007, 3.007, 3.007)
+        apply_action(s, SnapToGrid(rid=-1, grid=0.005))
+        assert s[0].x0 == pytest.approx(0.005)
+        assert s[1].x0 == pytest.approx(2.005)
+
+    def test_snap_to_grid_describe(self):
+        assert "grid" in SnapToGrid(rid=0).describe().lower()
+        assert "all" in SnapToGrid(rid=-1).describe().lower()
+
 
 # ── Violation parsing tests ───────────────────────────────────────────────────
 
@@ -322,6 +345,13 @@ class TestViolationParsing:
 
     def test_detect_category_overlap(self):
         assert _detect_category("met1.3", "short circuit") == "overlap"
+
+    def test_detect_category_offgrid(self):
+        assert _detect_category("met1.7", "off-grid vertex") == "offgrid"
+        assert _detect_category("grid.1", "grid check") == "offgrid"
+
+    def test_detect_category_extension(self):
+        assert _detect_category("diff.3", "extension beyond gate") == "extension"
 
     def test_detect_category_unknown(self):
         assert _detect_category("foo.bar", "something else") == "unknown"
@@ -508,6 +538,36 @@ class TestRuleGeoAgent:
                           x=5, y=5)
         agent = RuleGeoAgent(search_radius=1.0)
         assert agent.propose_fix(s, v) == []
+
+    def test_fix_offgrid(self):
+        """Off-grid violation → agent proposes SnapToGrid."""
+        s = LayoutState()
+        s.add("met1", 0.003, 0, 1.003, 1)  # off-grid
+
+        v = ViolationInfo(
+            category="offgrid", layer="met1",
+            x=0.003, y=0.5,
+        )
+        agent = RuleGeoAgent(search_radius=3.0)
+        actions = agent.propose_fix(s, v)
+        assert len(actions) >= 1
+        assert all(isinstance(a, SnapToGrid) for a in actions)
+
+    def test_fix_extension(self):
+        """Extension category routes to enclosure fix logic."""
+        s = LayoutState()
+        s.add("diff", 0, 0, 1, 1)  # outer
+        s.add("poly", 0.2, -0.1, 0.8, 1.1)  # inner (gate crossing diff)
+
+        v = ViolationInfo(
+            category="extension", layer="diff", inner_layer="poly",
+            measured=0.2, required=0.3, deficit=0.1,
+            x=0.5, y=0.5,
+        )
+        agent = RuleGeoAgent(search_radius=3.0)
+        actions = agent.propose_fix(s, v)
+        # Should produce StretchEdge actions (enclosure fix)
+        assert len(actions) > 0
 
     def test_repulsion_vector_horizontal(self):
         """Repulsion pushes in direction of shortest separation."""

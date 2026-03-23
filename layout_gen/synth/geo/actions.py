@@ -104,8 +104,31 @@ class MergeShapes:
         return f"Merge rects {self.rids} into bounding box"
 
 
+@dataclass
+class SnapToGrid:
+    """Snap all edges of a rectangle to the manufacturing grid.
+
+    Off-grid coordinates cause DRC violations in production decks.
+    Standard CMOS grid is 0.005 µm (5 nm); sky130 uses 0.001 µm (1 nm).
+
+    Parameters
+    ----------
+    rid : int
+        Rectangle ID.  If -1, snaps ALL rectangles in the state.
+    grid : float
+        Grid pitch in µm (default 0.005).
+    """
+    rid:   int    = -1
+    grid:  float  = 0.005   # µm
+
+    def describe(self) -> str:
+        if self.rid == -1:
+            return f"Snap all rects to {self.grid*1000:.0f} nm grid"
+        return f"Snap rect {self.rid} to {self.grid*1000:.0f} nm grid"
+
+
 # Union of all action types (for type annotations)
-Action = Union[StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes]
+Action = Union[StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes, SnapToGrid]
 
 
 # ── Apply ────────────────────────────────────────────────────────────────────
@@ -154,6 +177,20 @@ def apply_action(state: LayoutState, action: Action) -> Rect | None:
         for r in rects:
             state.remove(r.rid)
         return state.add(layer, x0, y0, x1, y1)
+
+    elif isinstance(action, SnapToGrid):
+        g = action.grid
+        def _snap(v: float) -> float:
+            return round(round(v / g) * g, 6)
+
+        targets = [state[action.rid]] if action.rid >= 0 else list(state)
+        last = None
+        for r in targets:
+            state.update(r.rid,
+                         x0=_snap(r.x0), y0=_snap(r.y0),
+                         x1=_snap(r.x1), y1=_snap(r.y1))
+            last = state[r.rid]
+        return last
 
     else:
         raise TypeError(f"Unknown action type: {type(action)}")

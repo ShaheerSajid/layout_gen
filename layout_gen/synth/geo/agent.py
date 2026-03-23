@@ -38,7 +38,7 @@ from typing import Any
 
 from layout_gen.synth.geo.state      import LayoutState, Rect
 from layout_gen.synth.geo.actions    import (
-    Action, StretchEdge, MoveShape, AddRect, MergeShapes,
+    Action, StretchEdge, MoveShape, AddRect, MergeShapes, SnapToGrid,
 )
 from layout_gen.synth.geo.violations import ViolationInfo
 
@@ -105,12 +105,14 @@ class RuleGeoAgent(GeoFixAgent):
             return self._fix_spacing(state, violation)
         elif cat == "width":
             return self._fix_width(state, violation)
-        elif cat == "enclosure":
+        elif cat == "enclosure" or cat == "extension":
             return self._fix_enclosure(state, violation)
         elif cat == "area":
             return self._fix_area(state, violation)
         elif cat == "overlap":
             return self._fix_overlap(state, violation)
+        elif cat == "offgrid":
+            return self._fix_offgrid(state, violation)
         else:
             return self._fix_unknown(state, violation)
 
@@ -302,6 +304,18 @@ class RuleGeoAgent(GeoFixAgent):
                     dx, dy = self._repulsion_vector(mover, anchor, 0.01)
                     return [MoveShape(mover.rid, dx, dy)]
         return []
+
+    # ── Off-grid ────────────────────────────────────────────────────────────
+
+    def _fix_offgrid(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Off-grid violation: snap all shapes near the violation to grid."""
+        shapes = state.near(v.x, v.y, self.search_radius, layer=v.layer)
+        if not shapes:
+            shapes = state.near(v.x, v.y, self.search_radius)
+        if not shapes:
+            # Snap everything
+            return [SnapToGrid(rid=-1)]
+        return [SnapToGrid(rid=s.rid) for s in shapes]
 
     # ── Unknown ──────────────────────────────────────────────────────────────
 

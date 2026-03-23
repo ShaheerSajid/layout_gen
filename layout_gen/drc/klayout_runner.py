@@ -228,6 +228,12 @@ def _generate_drc_script(rules: PDKRules) -> str:
         f"li1.width({liw}.um).output('li1.1', 'Li1 width < {liw} um')",
         f"li1.space({lis}.um).output('li1.2', 'Li1 spacing < {lis} um')",
     ]
+    li_area = li.get('area_min_um2')
+    if li_area:
+        lines.append(
+            f"li1.with_area(0, {li_area}.um2)"
+            f".output('li1.6', 'Li1 min area < {li_area} um2')"
+        )
 
     # ── Met1 ──────────────────────────────────────────────────────────────────
     m1 = R.met1
@@ -239,6 +245,12 @@ def _generate_drc_script(rules: PDKRules) -> str:
             f"met1.width({m1w}.um).output('met1.1', 'Met1 width < {m1w} um')",
             f"met1.space({m1s}.um).output('met1.2', 'Met1 spacing < {m1s} um')",
         ]
+        m1_area = m1.get('area_min_um2')
+        if m1_area:
+            lines.append(
+                f"met1.with_area(0, {m1_area}.um2)"
+                f".output('met1.6', 'Met1 min area < {m1_area} um2')"
+            )
 
     # ── Mcon ──────────────────────────────────────────────────────────────────
     mc = R.mcon
@@ -281,6 +293,12 @@ def _generate_drc_script(rules: PDKRules) -> str:
             f"met2.width({m2w}.um).output('met2.1', 'Met2 width < {m2w} um')",
             f"met2.space({m2s}.um).output('met2.2', 'Met2 spacing < {m2s} um')",
         ]
+        m2_area = m2.get('area_min_um2')
+        if m2_area:
+            lines.append(
+                f"met2.with_area(0, {m2_area}.um2)"
+                f".output('met2.6', 'Met2 min area < {m2_area} um2')"
+            )
 
     # ── Via1 (met1 → met2) ────────────────────────────────────────────────────
     v1 = R.via1 if R.via1 else None
@@ -317,18 +335,35 @@ def _generate_drc_script(rules: PDKRules) -> str:
 
     # ── Implant ───────────────────────────────────────────────────────────────
     impl = R.implant
+    lines += ["", "# ── Implant ─────────────────────────────────────────────────────"]
     if "enclosure_of_diff_um" in impl:
         ienc = impl['enclosure_of_diff_um']
         lines += [
-            "",
-            "# ── Implant ─────────────────────────────────────────────────────",
             f"nsdm.enclosing(diff.and(nsdm), {ienc}.um)"
             f".output('nsdm.3', 'Nsdm must enclose NMOS diff by {ienc} um')",
             f"psdm.enclosing(diff.and(psdm), {ienc}.um)"
             f".output('psdm.3', 'Psdm must enclose PMOS diff by {ienc} um')",
         ]
+    if "spacing_min_um" in impl:
+        isp = impl['spacing_min_um']
+        lines += [
+            f"nsdm.space({isp}.um).output('nsdm.1', 'Nsdm spacing < {isp} um')",
+            f"psdm.space({isp}.um).output('psdm.1', 'Psdm spacing < {isp} um')",
+        ]
 
-    # ── Antenna ───────────────────────────────────────────────────────────────
+    # ── Diff extension ───────────────────────────────────────────────────────
+    dext = R.diff.get('extension_past_poly_um')
+    if dext:
+        lines += [
+            "",
+            "# ── Diff extension past gate ────────────────────────────────────",
+            f"# diff.3: diff must extend {dext} um past poly edge",
+            f"gate = poly.and(diff)",
+            f"diff.enclosing(gate, {dext}.um)"
+            f".output('diff.3', 'Diff must extend by {dext} um past poly')",
+        ]
+
+    # ── Cross-layer checks ───────────────────────────────────────────────────
     lines += [
         "",
         "# ── Cross-layer overlap checks ─────────────────────────────────",
