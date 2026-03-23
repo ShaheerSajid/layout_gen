@@ -1,60 +1,24 @@
-# layout_gen cell topology template — SRAM DIDO column peripheral
+# layout_gen cell topology template — SRAM DIDO column peripheral (stacked)
 #
-# Matches fabram/cells/sram/dido.yaml:
-#   Digital-In Digital-Out block combining precharge, column select,
-#   read pass, write-enable logic (NAND2+NOT), and write pass transistors.
+# Vertical multi-row layout for column-width-constrained placement.
+# Each row pair has ≤ 2 abutting transistors per tier (~1.17 µm wide),
+# fitting within a typical bit cell column pitch (~1.5 µm).
 #
-# Flattened transistors (21 total):
-#
-#   PCHG buffer inverter (X5/X6): PCHG → net5
-#     N_PB  NMOS  G=PCHG  D=net5  S=VSS
-#     P_PB  PMOS  G=PCHG  D=net5  S=VDD
-#
-#   PCHG driver inverter (X3/X4): net5 → net6
-#     N_PD  NMOS  G=net5  D=net6  S=VSS
-#     P_PD  PMOS  G=net5  D=net6  S=VDD
-#
-#   Precharge PMOS (X0/X1/X2, all gated by net6):
-#     P_PC0 PMOS  G=net6  D=BL_  S=VDD   — precharge BL_
-#     P_PC1 PMOS  G=net6  D=BL   S=BL_   — equaliser (P_PC0.D abuts P_PC1.S)
-#     P_PC2 PMOS  G=net6  D=BL   S=VDD   — precharge BL
-#
-#   Column select buffer (X9/X12): SEL → net4
-#     N_SB  NMOS  G=SEL   D=net4  S=VSS
-#     P_SB  PMOS  G=SEL   D=net4  S=VDD
-#
-#   Column select inverter (X13/X14): net4 → net3
-#     N_SI  NMOS  G=net4  D=net3  S=VSS
-#     P_SI  PMOS  G=net4  D=net3  S=VDD
-#
-#   Read pass PMOS (X7/X8, gated by net4):
-#     P_RP0 PMOS  G=net4  D=BL_  S=DR_   — read BL_ to DR_
-#     P_RP1 PMOS  G=net4  D=DR   S=BL    — read BL to DR
-#
-#   Write-enable NAND2 (flattened X15): net1 = !(net3 & WREN)
-#     N_NA  NMOS  G=net3  D=nd15  S=VSS  — series stack, VSS side
-#     N_NB  NMOS  G=WREN  D=net1  S=nd15 — series stack, output side
-#     P_NA  PMOS  G=net3  D=net1  S=VDD  — parallel pull-up
-#     P_NB  PMOS  G=WREN  D=net1  S=VDD  — parallel pull-up
-#
-#   Write data NOT (flattened X16): net2 = !net1
-#     N_NT  NMOS  G=net1  D=net2  S=VSS
-#     P_NT  PMOS  G=net1  D=net2  S=VDD
-#
-#   Write pass NMOS (X10/X11, gated by net2):
-#     N_WP0 NMOS  G=net2  D=BL   S=DW   — write data onto BL
-#     N_WP1 NMOS  G=net2  D=DW_  S=BL_  — write data complement onto BL_
-#
-# X layout (left to right):
-#   [N_PB/P_PB | N_PD/P_PD | P_PC0·P_PC1 P_PC2 | N_SB/P_SB | N_SI/P_SI |
-#    P_RP0 P_RP1 | N_NA·N_NB/P_NA P_NB | N_NT/P_NT | N_WP0 | N_WP1]
-#   · = abutting (shared diffusion), space = diff spacing
-#   PMOS-only sections (precharge, read-pass) sit above the NMOS gap.
-#   NMOS-only sections (write-pass) have empty top row.
+# Diffusion sharing (sd_flip):
+#   Row 0: N_PB(flip)+N_PD share VSS, P_PB(flip)+P_PD share VDD
+#   Row 1: N_SB(flip)+N_SI share VSS, P_SB(flip)+P_SI share VDD
+#   Row 2: N_NA+N_NB share nd15 (series stack), P_NA+P_NB(flip) share net1
+#   Row 3: N_NT + P_NT (single devices, gate bridge)
+#   Row 4: P_PC0+P_PC1 share BL_ (PMOS only)
+#   Row 5: P_PC2 alone (PMOS only)
+#   Row 6: P_RP0 alone (PMOS only, read BL_)
+#   Row 7: P_RP1 alone (PMOS only, read BL)
+#   Row 8: N_WP0 alone (NMOS only, write BL)
+#   Row 9: N_WP1 alone (NMOS only, write BL_)
 
 name: dido
-version: "1.0"
-description: SRAM column peripheral — precharge, column select, read/write pass
+version: "2.0"
+description: SRAM column peripheral — precharge, column select, read/write pass (stacked)
 
 # ── Device instances ─────────────────────────────────────────────────────────
 devices:
@@ -83,13 +47,13 @@ devices:
   P_RP0: {template: planar_mosfet, type: pmos, terminals: {G: net4, D: BL_,  S: DR_}}
   P_RP1: {template: planar_mosfet, type: pmos, terminals: {G: net4, D: DR,   S: BL}}
 
-  # NAND2 (flattened): net1 = !(net3 & WREN)
+  # Write-enable NAND2 (flattened X15): net1 = !(net3 & WREN)
   N_NA:  {template: planar_mosfet, type: nmos, terminals: {G: net3, D: nd15, S: VSS}}
   N_NB:  {template: planar_mosfet, type: nmos, terminals: {G: WREN, D: net1, S: nd15}}
   P_NA:  {template: planar_mosfet, type: pmos, terminals: {G: net3, D: net1, S: VDD}}
   P_NB:  {template: planar_mosfet, type: pmos, terminals: {G: WREN, D: net1, S: VDD}}
 
-  # NOT (flattened): net2 = !net1
+  # Write data NOT (flattened X16): net2 = !net1
   N_NT:  {template: planar_mosfet, type: nmos, terminals: {G: net1, D: net2, S: VSS}}
   P_NT:  {template: planar_mosfet, type: pmos, terminals: {G: net1, D: net2, S: VDD}}
 
@@ -103,121 +67,71 @@ nets: [VDD, VSS, PCHG, WREN, SEL, BL, BL_, DW, DW_, DR, DR_,
 
 # ── Floorplan constraints ───────────────────────────────────────────────────
 floorplan:
-  # ── Bottom row (NMOS) — left to right ──────────────────────────────────
-  N_PB:
-    region:   bottom
-    x:        left
-    y_offset: 0
-  N_PD:
-    region:   bottom
-    x:        right_of(N_PB)
-    y_offset: 0
-  # Skip precharge PMOS section width in the bottom row
-  N_SB:
-    region:   bottom
-    x:        "N_PD_x + N_PD.total_x + rules.diff.spacing_min_um + pchg_section_w + rules.diff.spacing_min_um"
-    y_offset: 0
-  N_SI:
-    region:   bottom
-    x:        right_of(N_SB)
-    y_offset: 0
-  # Skip read-pass PMOS section width in the bottom row
-  N_NA:
-    region:   bottom
-    x:        "N_SI_x + N_SI.total_x + rules.diff.spacing_min_um + read_section_w + rules.diff.spacing_min_um"
-    y_offset: 0
-  N_NB:
-    region:   bottom
-    x:        "N_NA_x + N_NA.total_x"
-    y_offset: 0
-  N_NT:
-    region:   bottom
-    x:        right_of(N_NB)
-    y_offset: 0
-  N_WP0:
-    region:   bottom
-    x:        right_of(N_NT)
-    y_offset: 0
-  N_WP1:
-    region:   bottom
-    x:        right_of(N_WP0)
-    y_offset: 0
+  layout_mode: stacked
 
-  # ── Top row (PMOS) — left to right ────────────────────────────────────
-  P_PB:
-    region:   top
-    in_nwell: true
-    x:        left
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_PD:
-    region:   top
-    in_nwell: true
-    x:        "N_PD_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_PC0:
-    region:   top
-    in_nwell: true
-    x:        right_of(P_PD)
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_PC1:
-    region:   top
-    in_nwell: true
-    x:        "P_PC0_x + P_PC0.total_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_PC2:
-    region:   top
-    in_nwell: true
-    x:        right_of(P_PC1)
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_SB:
-    region:   top
-    in_nwell: true
-    x:        "N_SB_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_SI:
-    region:   top
-    in_nwell: true
-    x:        "N_SI_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_RP0:
-    region:   top
-    in_nwell: true
-    x:        right_of(P_SI)
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_RP1:
-    region:   top
-    in_nwell: true
-    x:        right_of(P_RP0)
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_NA:
-    region:   top
-    in_nwell: true
-    x:        "N_NA_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_NB:
-    region:   top
-    in_nwell: true
-    x:        "N_NB_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
-  P_NT:
-    region:   top
-    in_nwell: true
-    x:        "N_NT_x"
-    y_offset: "N_PB.total_y + inter_cell_gap"
+  row_pairs:
+    # Row 0: PCHG buffer + driver inverters
+    - id: 0
+      nmos: [N_PB, N_PD]
+      pmos: [P_PB, P_PD]
+      sd_flip: {N_PB: true, P_PB: true}
+
+    # Row 1: Column select buffer + inverter
+    - id: 1
+      nmos: [N_SB, N_SI]
+      pmos: [P_SB, P_SI]
+      sd_flip: {N_SB: true, P_SB: true}
+
+    # Row 2: NAND2 gate
+    - id: 2
+      nmos: [N_NA, N_NB]
+      pmos: [P_NA, P_NB]
+      sd_flip: {P_NB: true}
+
+    # Row 3: NOT gate (buffer for write enable)
+    - id: 3
+      nmos: [N_NT]
+      pmos: [P_NT]
+
+    # Row 4: Precharge part 1 (PMOS only — P_PC0·P_PC1 share BL_)
+    - id: 4
+      nmos: []
+      pmos: [P_PC0, P_PC1]
+
+    # Row 5: Precharge part 2 (PMOS only)
+    - id: 5
+      nmos: []
+      pmos: [P_PC2]
+
+    # Row 6: Read pass BL_ (PMOS only)
+    - id: 6
+      nmos: []
+      pmos: [P_RP0]
+
+    # Row 7: Read pass BL (PMOS only)
+    - id: 7
+      nmos: []
+      pmos: [P_RP1]
+
+    # Row 8: Write pass BL (NMOS only)
+    - id: 8
+      nmos: [N_WP0]
+      pmos: []
+
+    # Row 9: Write pass BL_ (NMOS only)
+    - id: 9
+      nmos: [N_WP1]
+      pmos: []
 
   # ── Named constraints ─────────────────────────────────────────────────
   inter_cell_gap:
     min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
 
-  # Width of the 3-transistor precharge PMOS section (P_PC0 abuts P_PC1, then spacing, then P_PC2)
-  pchg_section_w: "P_PC0.total_x + P_PC1.total_x + rules.diff.spacing_min_um + P_PC2.total_x"
-
-  # Width of the 2-transistor read-pass PMOS section
-  read_section_w: "P_RP0.total_x + rules.diff.spacing_min_um + P_RP1.total_x"
+  inter_row_gap: "rules.diff.spacing_min_um"
 
 # ── Routing ─────────────────────────────────────────────────────────────────
 routing:
-  # ── Shared gate bridges (poly N↔P) ──
+  # ── Within-row-pair gate bridges (poly N↔P) ──
   - net:   PCHG
     style: shared_gate_poly
     layer: poly
@@ -247,7 +161,7 @@ routing:
     layer: poly
     path:  [N_NT.G, P_NT.G]
 
-  # ── Drain bridges (vertical li1 N↔P) ──
+  # ── Within-row-pair drain bridges (vertical li1 N↔P) ──
   - net:   net5
     style: drain_bridge
     layer: li1
@@ -286,26 +200,20 @@ routing:
     layer: li1
     path:  [P_NA.D, P_NB.D]
 
-  # net1: NAND2 output → NOT input
-  - net:   net1
-    style: li1_bridge
-    layer: li1
-    path:  [N_NB.D, N_NT.G]
-
   # ── I/O terminal ports ──
   - net:   BL
     style: expose_terminal
     layer: li1
-    path:  [P_PC2.D]
+    path:  [P_PC1.D]
     location_key: BL_port
-    orientation: 90
+    orientation: 0
 
   - net:   BL_
     style: expose_terminal
     layer: li1
     path:  [P_PC0.D]
     location_key: BL__port
-    orientation: 90
+    orientation: 180
 
   - net:   DR
     style: expose_terminal

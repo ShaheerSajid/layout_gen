@@ -40,6 +40,9 @@ class DeviceSpec:
     in_nwell:     bool = False
     y_offset_expr: Any = 0         # int/float 0 or a symbolic string
     x_spec:        Any = None      # None=left/0, or "right_of: X", "between(A,B)", etc.
+    # ── Stacked layout fields (populated from row_pairs section) ────────────
+    row_pair:     int  = -1        # index into CellTemplate.row_pairs (-1 = unassigned)
+    sd_flip:      bool = False     # swap S/D terminals for diffusion sharing abutment
 
 
 @dataclass
@@ -54,6 +57,18 @@ class RoutingSpec:
 
 
 @dataclass
+class RowPairSpec:
+    """One NMOS/PMOS row pair in a stacked layout.
+
+    Devices in ``nmos_devices`` and ``pmos_devices`` are placed left-to-right
+    with adjacent devices sharing diffusion (abutment).
+    """
+    id:            int
+    nmos_devices:  list[str] = field(default_factory=list)
+    pmos_devices:  list[str] = field(default_factory=list)
+
+
+@dataclass
 class CellTemplate:
     """Parsed cell topology template (device + floorplan + routing + ports)."""
     name:               str
@@ -65,6 +80,8 @@ class CellTemplate:
     ports:              dict[str, PortSpec]
     named_constraints:  dict[str, Any]   # {name: {min: expr} or expr}
     source_path:        Path | None = None
+    layout_mode:        str = "standard"                          # "standard" or "stacked"
+    row_pairs:          list[RowPairSpec] = field(default_factory=list)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -87,7 +104,14 @@ def load_template(name_or_path: str | Path) -> CellTemplate:
     raw  = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     devices = _parse_devices(raw)
-    _apply_floorplan(raw.get("floorplan", {}), devices)
+    fp = raw.get("floorplan", {})
+    layout_mode = fp.get("layout_mode", "standard")
+
+    _apply_floorplan(fp, devices)
+
+    row_pairs: list[RowPairSpec] = []
+    if layout_mode == "stacked":
+        row_pairs = _parse_row_pairs(fp, devices)
 
     return CellTemplate(
         name               = raw.get("name", path.stem),
@@ -97,10 +121,10 @@ def load_template(name_or_path: str | Path) -> CellTemplate:
         nets               = list(raw.get("nets", [])),
         routing            = _parse_routing(raw.get("routing", [])),
         ports              = _parse_ports(raw.get("ports", {})),
-        named_constraints  = _parse_named_constraints(
-            raw.get("floorplan", {}), devices
-        ),
+        named_constraints  = _parse_named_constraints(fp, devices),
         source_path        = path,
+        layout_mode        = layout_mode,
+        row_pairs          = row_pairs,
     )
 
 
@@ -138,6 +162,9 @@ def _parse_devices(raw: dict) -> dict[str, DeviceSpec]:
 
 def _apply_floorplan(fp: dict, devices: dict[str, DeviceSpec]) -> None:
     """Populate floorplan fields on DeviceSpec objects from the floorplan section."""
+    if fp.get("layout_mode") == "stacked":
+        # Stacked mode: device placement comes from row_pairs, not per-device entries.
+        return
     for key, val in fp.items():
         if key in devices and isinstance(val, dict):
             _apply_device_fp(devices[key], val)
@@ -181,11 +208,49 @@ def _parse_ports(raw: dict) -> dict[str, PortSpec]:
     return out
 
 
+def _parse_row_pairs(
+    fp: dict, devices: dict[str, DeviceSpec],
+) -> list[RowPairSpec]:
+    """Parse ``row_pairs`` list from the floorplan section (stacked mode)."""
+    raw_pairs = fp.get("row_pairs", [])
+    pairs: list[RowPairSpec] = []
+    for i, rp in enumerate(raw_pairs):
+        nmos = list(rp.get("nmos", []))
+        pmos = list(rp.get("pmos", []))
+        sd_flip = rp.get("sd_flip", {})
+
+        pair = RowPairSpec(
+            id=int(rp.get("id", i)),
+            nmos_devices=nmos,
+            pmos_devices=pmos,
+        )
+        pairs.append(pair)
+
+        # Propagate placement info onto each DeviceSpec
+        for name in nmos:
+            if name in devices:
+                devices[name].row_pair = pair.id
+                devices[name].region = "bottom"
+                devices[name].sd_flip = bool(sd_flip.get(name, False))
+        for name in pmos:
+            if name in devices:
+                devices[name].row_pair = pair.id
+                devices[name].region = "top"
+                devices[name].in_nwell = True
+                devices[name].sd_flip = bool(sd_flip.get(name, False))
+
+    return pairs
+
+
+# Floorplan keys that are structural directives, not named constraints.
+_STRUCTURAL_FP_KEYS = frozenset({"layout_mode", "row_pairs"})
+
+
 def _parse_named_constraints(fp: dict, devices: dict[str, DeviceSpec]) -> dict[str, Any]:
     """Extract named constraint entries (non-device, non-group entries)."""
     out: dict[str, Any] = {}
     for key, val in fp.items():
-        if key in devices:
+        if key in devices or key in _STRUCTURAL_FP_KEYS:
             continue
         # Check if it's a pure device-group (all sub-keys are device names)
         if isinstance(val, dict) and all(k in devices for k in val if k not in ("note",)):

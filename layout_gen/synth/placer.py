@@ -23,7 +23,7 @@ from typing import Any
 from layout_gen.pdk        import PDKRules
 from layout_gen.transistor import draw_transistor, transistor_geom, TransistorGeom
 from layout_gen.cells.standard import _gate_x, _sd_x, _diff_y
-from layout_gen.synth.loader      import CellTemplate, DeviceSpec
+from layout_gen.synth.loader      import CellTemplate, DeviceSpec, RowPairSpec
 from layout_gen.synth.constraints import eval_expr, resolve_named_constraints
 
 
@@ -106,29 +106,35 @@ def resolve_terminal(
     dev  = placed[dev_name]
     geom = dev.geom
 
-    if term == "G":
+    # S/D flip: when a device is flipped for diffusion sharing, swap the
+    # physical positions of S and D (left↔right).
+    phys_term = term
+    if dev.spec.sd_flip and term in ("S", "D"):
+        phys_term = "D" if term == "S" else "S"
+
+    if phys_term == "G":
         lx0, lx1 = _gate_x(0, geom)
         return TerminalGeom(
-            dev_name, "G",
+            dev_name, term,
             x0=lx0 + dev.x, x1=lx1 + dev.x,
             y0=dev.y,        y1=dev.y + geom.total_y_um,
             layer="poly",
         )
-    elif term == "D":
+    elif phys_term == "D":
         j = geom.n_fingers   # rightmost S/D = drain for finger 0
         lx0, lx1 = _sd_x(j, geom)
         ly0, ly1 = _diff_y(geom, rules)
         return TerminalGeom(
-            dev_name, "D",
+            dev_name, term,
             x0=lx0 + dev.x, x1=lx1 + dev.x,
             y0=ly0 + dev.y, y1=ly1 + dev.y,
             layer="li1",
         )
-    elif term == "S":
+    elif phys_term == "S":
         lx0, lx1 = _sd_x(0, geom)
         ly0, ly1 = _diff_y(geom, rules)
         return TerminalGeom(
-            dev_name, "S",
+            dev_name, term,
             x0=lx0 + dev.x, x1=lx1 + dev.x,
             y0=ly0 + dev.y, y1=ly1 + dev.y,
             layer="li1",
@@ -210,7 +216,9 @@ class Placer:
             template.named_constraints, self.rules, geoms
         )
 
-        # Pass 3: place devices in topological order (bottom → top)
+        # Pass 3: place devices
+        if template.layout_mode == "stacked":
+            return self._place_stacked(template, geoms, named)
         return self._place_devices(template, geoms, named)
 
     # ── Internal ──────────────────────────────────────────────────────────────
@@ -281,6 +289,82 @@ class Placer:
             placed[dev_name] = PlacedDevice(
                 name=dev_name, spec=spec, geom=geom, x=x, y=y
             )
+
+        return placed
+
+    def _place_stacked(
+        self,
+        template: CellTemplate,
+        geoms:    dict[str, TransistorGeom],
+        named:    dict[str, float],
+    ) -> dict[str, PlacedDevice]:
+        """Place devices in a vertically stacked multi-row layout.
+
+        Each :class:`RowPairSpec` produces an NMOS tier (bottom) and PMOS tier
+        (top), stacked vertically.  Devices within a tier are placed
+        left-to-right with shared-diffusion abutment.
+        """
+        placed: dict[str, PlacedDevice] = {}
+
+        # Compute the inter-cell gap (within a row pair, between N and P tiers)
+        endcap = self.rules.poly["endcap_over_diff_um"]
+        ext_y  = self.rules.diff["extension_past_poly_um"]
+        diff_sp = self.rules.diff["spacing_min_um"]
+        icg = named.get(
+            "inter_cell_gap",
+            diff_sp - 2 * endcap + 2 * ext_y,
+        )
+
+        # Gap between adjacent row pairs (default: diff spacing)
+        inter_row_gap = named.get("inter_row_gap", diff_sp)
+
+        current_y = 0.0
+
+        for rp_idx, rp in enumerate(template.row_pairs):
+            n_list = [(n, geoms[n]) for n in rp.nmos_devices if n in geoms]
+            p_list = [(n, geoms[n]) for n in rp.pmos_devices if n in geoms]
+
+            nmos_h = max((g.total_y_um for _, g in n_list), default=0.0)
+
+            # ── NMOS tier ────────────────────────────────────────────────
+            x = 0.0
+            for i, (name, geom) in enumerate(n_list):
+                if i > 0:
+                    # Abutment: overlap one shared S/D region
+                    x -= geom.sd_length_um
+                placed[name] = PlacedDevice(
+                    name=name, spec=template.devices[name], geom=geom,
+                    x=x, y=current_y,
+                )
+                x += geom.total_x_um
+
+            # ── PMOS tier ────────────────────────────────────────────────
+            if n_list:
+                pmos_y = current_y + nmos_h + icg
+            else:
+                pmos_y = current_y  # no NMOS → PMOS at row pair base
+
+            x = 0.0
+            for i, (name, geom) in enumerate(p_list):
+                if i > 0:
+                    x -= geom.sd_length_um
+                placed[name] = PlacedDevice(
+                    name=name, spec=template.devices[name], geom=geom,
+                    x=x, y=pmos_y,
+                )
+                x += geom.total_x_um
+
+            # ── Advance Y for next row pair ──────────────────────────────
+            pmos_h = max((g.total_y_um for _, g in p_list), default=0.0)
+            if n_list and p_list:
+                row_top = pmos_y + pmos_h
+            elif n_list:
+                row_top = current_y + nmos_h
+            else:
+                row_top = pmos_y + pmos_h
+
+            if rp_idx < len(template.row_pairs) - 1:
+                current_y = row_top + inter_row_gap
 
         return placed
 
