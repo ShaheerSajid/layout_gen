@@ -240,9 +240,12 @@ class LayoutState:
 
         for layer_key, polys in polys_by_layer.items():
             if isinstance(layer_key, int):
-                # Some gdsfactory versions use a single int index
-                # Try to get layer info
-                continue
+                # gdsfactory 7+: int index → resolve via kcl.get_info()
+                try:
+                    info = comp.kcl.get_info(layer_key)
+                    layer_key = (info.layer, info.datatype)
+                except Exception:
+                    continue
             lname = rev.get(layer_key, None)
             if lname is None:
                 continue
