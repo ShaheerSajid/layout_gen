@@ -208,7 +208,9 @@ class RuleGeoAgent(GeoFixAgent):
         if not inner_shapes:
             return []
 
-        inner = min(inner_shapes, key=lambda s: s.area)
+        # Pick inner shape closest to violation point (not smallest area)
+        inner = min(inner_shapes,
+                    key=lambda s: (s.cx - v.x)**2 + (s.cy - v.y)**2)
 
         # Find the outer shape
         outer_shapes = state.near(inner.cx, inner.cy, self.search_radius,

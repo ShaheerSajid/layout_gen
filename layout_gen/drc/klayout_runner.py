@@ -349,26 +349,35 @@ def _parse_lyrdb(path: Path) -> List[DRCViolation]:
     tree = ET.parse(path)
     root = tree.getroot()
 
-    # Build category → description map
+    # Build category → description map (strip quotes from names)
     cat_desc: dict[str, str] = {}
     for cat in root.findall(".//category"):
-        name = cat.findtext("name", "")
+        name = cat.findtext("name", "").strip().strip("'\"")
         desc = cat.findtext("description", "")
         cat_desc[name] = desc
 
     violations: List[DRCViolation] = []
     for item in root.findall(".//item"):
-        rule = item.findtext("category", "")
+        rule_raw = item.findtext("category", "")
+        rule = rule_raw.strip().strip("'\"")
         desc = cat_desc.get(rule, "")
         x, y = _centroid_from_item(item)
 
         value: float | None = None
-        val_el = item.find("values/value")
-        if val_el is not None and val_el.text:
+        for val_el in item.findall("values/value"):
+            text = (val_el.text or "").strip()
+            # Try plain numeric value first
             try:
-                value = float(val_el.text)
+                value = float(text)
+                break
             except ValueError:
                 pass
+            # Extract measured distance from edge-pair geometry
+            if text.lower().startswith("edge-pair:"):
+                measured = _edge_pair_distance(text)
+                if measured is not None:
+                    value = measured
+                    break
 
         violations.append(DRCViolation(
             rule=rule,
@@ -382,15 +391,22 @@ def _parse_lyrdb(path: Path) -> List[DRCViolation]:
 
 
 def _centroid_from_item(item: ET.Element) -> tuple[float, float]:
-    """Return (x_um, y_um) centroid for an RDB item's geometry."""
-    # Polygon:  (x1,y1;x2,y2;...)
+    """Return (x_um, y_um) centroid for an RDB item's geometry.
+
+    KLayout stores geometry in two formats depending on version/deck:
+
+    1. Dedicated child elements: ``<polygon>`` or ``<edge-pair>``
+    2. Inline in ``<values>/<value>`` as text like
+       ``edge-pair: (x1,y1;x2,y2)|(x3,y3;x4,y4)`` or
+       ``polygon: (x1,y1;x2,y2;...)``
+    """
+    # Format 1: dedicated child elements
     poly_el = item.find("polygon")
     if poly_el is not None and poly_el.text:
         pts = _parse_pts(poly_el.text)
         if pts:
             return _centroid(pts)
 
-    # Edge-pair: (x1,y1;x2,y2)/(x3,y3;x4,y4)
     ep_el = item.find("edge-pair")
     if ep_el is not None and ep_el.text:
         pts = []
@@ -399,7 +415,33 @@ def _centroid_from_item(item: ET.Element) -> tuple[float, float]:
         if pts:
             return _centroid(pts)
 
+    # Format 2: geometry embedded in <values>/<value> text
+    for val_el in item.findall("values/value"):
+        text = val_el.text or ""
+        pts = _parse_geometry_text(text)
+        if pts:
+            return _centroid(pts)
+
     return 0.0, 0.0
+
+
+def _parse_geometry_text(text: str) -> list[tuple[float, float]]:
+    """Parse geometry from a value string like 'edge-pair: (...)|(...)'
+    or 'polygon: (...)'.  Returns list of (x, y) points."""
+    # Strip type prefix
+    for prefix in ("edge-pair:", "edge_pair:", "polygon:", "box:", "edge:"):
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            break
+    else:
+        # No geometry prefix — not a geometry value
+        return []
+
+    pts: list[tuple[float, float]] = []
+    # Split on '|' (edge-pair separator) and '/' (alternate separator)
+    for seg in text.replace("/", "|").split("|"):
+        pts.extend(_parse_pts(seg))
+    return pts
 
 
 def _parse_pts(s: str) -> list[tuple[float, float]]:
@@ -427,3 +469,31 @@ def _parse_pts(s: str) -> list[tuple[float, float]]:
 def _centroid(pts: list[tuple[float, float]]) -> tuple[float, float]:
     n = len(pts)
     return sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n
+
+
+def _edge_pair_distance(text: str) -> float | None:
+    """Compute the min distance between two edges in an edge-pair string.
+
+    Format: ``edge-pair: (x1,y1;x2,y2)|(x3,y3;x4,y4)``
+
+    For spacing/width violations this is the measured value — the actual
+    distance that failed the DRC check.
+    """
+    body = text.split(":", 1)[-1].strip()
+    parts = body.replace("/", "|").split("|")
+    if len(parts) < 2:
+        return None
+
+    edge_a = _parse_pts(parts[0])
+    edge_b = _parse_pts(parts[1])
+    if not edge_a or not edge_b:
+        return None
+
+    # Min distance between any point on edge A and any point on edge B
+    min_d = float("inf")
+    for ax, ay in edge_a:
+        for bx, by in edge_b:
+            d = ((ax - bx)**2 + (ay - by)**2) ** 0.5
+            if d < min_d:
+                min_d = d
+    return round(min_d, 6) if min_d < float("inf") else None

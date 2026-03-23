@@ -81,7 +81,8 @@ _LAYER_ALIASES: dict[str, str] = {
     "m1": "met1", "m2": "met2", "m3": "met3", "m4": "met4", "m5": "met5",
     "metal1": "met1", "metal2": "met2",
     "li": "li1", "local_interconnect": "li1",
-    "ct": "licon1", "contact": "licon1",
+    "ct": "licon1", "contact": "licon1", "licon": "licon1",
+    "polycontact": "licon1", "polycon": "licon1",
     "via": "via1", "v1": "via1", "v2": "via2",
     "nsd": "nsdm", "psd": "psdm", "nplus": "nsdm", "pplus": "psdm",
     "active": "diff", "od": "diff", "diffusion": "diff",
@@ -122,15 +123,21 @@ def _detect_category(rule: str, desc: str) -> str:
 
 # ── Value extraction ─────────────────────────────────────────────────────────
 
-# Match patterns like "< 0.14 um", ": 0.38um", "= 0.17 µm"
+# Match patterns like "< 0.14 um", ": 0.38um", "= 0.17 µm", "by 0.05 um"
 _VALUE_RE = re.compile(
-    r'[:<>=]\s*(\d+\.?\d*)\s*(?:um|µm|micron)',
+    r'(?:[:<>=]|by)\s*(\d+\.?\d*)\s*(?:um|µm|micron)',
     re.IGNORECASE,
 )
 
 # Match "enclosure of X by Y um" or "enclose via1 by 0.085"
 _ENCLOSURE_LAYER_RE = re.compile(
-    r'enclos(?:ure|ing)?\s+(?:of\s+)?(\w+)',
+    r'enclos(?:ure|ing|e)?\s+(?:of\s+)?(\w+)',
+    re.IGNORECASE,
+)
+
+# Match "Poly must enclose X" → outer layer = "Poly"
+_ENCLOSURE_OUTER_RE = re.compile(
+    r'(\w+)\s+must\s+enclos',
     re.IGNORECASE,
 )
 
@@ -174,13 +181,25 @@ def parse_violation(v: DRCViolation) -> ViolationInfo:
     category = _detect_category(rule, desc)
     layer    = _extract_layer_from_rule(rule)
     inner    = _extract_inner_layer(desc) if category == "enclosure" else ""
+
+    # For enclosure: description "X must enclose Y" → outer=X, inner=Y
+    # Rule name often gives the inner layer (e.g. licon.10 = poly encloses licon)
+    if category == "enclosure" and desc:
+        m_outer = _ENCLOSURE_OUTER_RE.search(desc)
+        if m_outer:
+            outer = _normalize_layer(m_outer.group(1))
+            if outer != layer:
+                # Description overrides rule-name layer for outer
+                inner = inner or layer
+                layer = outer
     required = _extract_required(desc)
     measured = v.value if v.value is not None else 0.0
     deficit  = max(0.0, required - measured) if required > 0 else 0.0
 
-    # If no measured value from the DRC tool, estimate deficit as small nudge
-    if deficit == 0.0 and required > 0 and measured == 0.0:
-        deficit = 0.01  # 10 nm default nudge
+    # If DRC flagged a violation but deficit rounds to 0 (precision issue
+    # or no measured value), apply a minimum nudge
+    if deficit == 0.0 and required > 0:
+        deficit = 0.01  # 10 nm nudge
 
     return ViolationInfo(
         category=category,
