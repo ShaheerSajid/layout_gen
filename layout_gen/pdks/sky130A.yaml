@@ -70,13 +70,29 @@ rules:
     size_um:               0.17   # licon.1 — square contact cut
     spacing_um:            0.17   # licon.2 — contact-to-contact spacing
     enclosure_in_diff_um:  0.04   # licon.5a — diff must enclose contact on each side
-    enclosure_in_li1_um:   0.00   # licon.3 — li1 enclosure of contact (min)
+    enclosure_in_li1_um:   0.00   # licon.3 — li1 enclosure of contact (min, all sides)
+    enclosure_in_li1_2adj_um: 0.08  # li.5 — li1 enc of licon on 2 adjacent edges
     space_to_poly_um:      0.05   # licon.7 — contact must clear poly edge by this
     poly_enclosure_um:     0.05   # licon.10 — poly enclosure of polycontact licon1
 
   met1:
     width_min_um:   0.14   # met1.1
     spacing_min_um: 0.14   # met1.2
+    area_min_um2:   0.083  # m1.6 — minimum met1 area
+    enclosure_of_mcon_2adj_um: 0.06  # m1.5 — met1 enc of mcon on 2 adjacent edges
+
+  met2:
+    width_min_um:   0.14   # met2.1
+    spacing_min_um: 0.14   # met2.2
+    area_min_um2:   0.0676 # m2.6 — minimum met2 area
+    enclosure_of_via1_2adj_um: 0.085  # m2.5 — met2 enc of via1 on 2 adjacent edges
+
+  via1:                            # met1 → met2 via rules
+    size_um:               0.15   # via.1a — square via cut
+    spacing_um:            0.17   # via.2
+    enclosure_in_met1_um:  0.055  # via.4a — met1 enclosure of via1 (all sides)
+    enclosure_in_met1_2adj_um: 0.085  # via.5a — met1 enc of via1 on 2 adjacent edges
+    enclosure_in_met2_um:  0.055  # via.5a — met2 enclosure of via1 (all sides)
 
   mcon:                            # li1 → met1 via rules
     size_um:               0.17   # mcon.1
@@ -87,14 +103,25 @@ rules:
   li1:
     width_min_um:   0.17   # li1.1
     spacing_min_um: 0.17   # li1.2
+    area_min_um2:   0.0561 # li.6 — minimum li1 area
 
   implant:
     enclosure_of_diff_um: 0.125   # nsdm.3 / psdm.3 — implant encloses active region
+    spacing_min_um:       0.38    # nsdm.1 / psdm.1 — min implant spacing (periphery)
 
   nwell:
     width_min_um:          0.84   # nwell.1
     spacing_min_um:        1.27   # nwell.2
     enclosure_of_pdiff_um: 0.18   # nwell.5 — nwell must enclose PMOS diff
+
+# ── DRC decks ────────────────────────────────────────────────────────────────
+#
+# Point to the real PDK DRC runsets for production-quality validation.
+# Paths may be absolute or relative to this YAML file.
+# Set via environment: DRC_DECK_KLAYOUT / DRC_DECK_MAGIC override these.
+drc:
+  klayout: "${PDK_ROOT}/sky130A/libs.tech/klayout/drc/sky130A_mr.drc"
+  magic:   "${PDK_ROOT}/sky130A/libs.tech/magic/sky130A.tech"
 
 # ── Per-device rules ──────────────────────────────────────────────────────────
 #

@@ -41,6 +41,8 @@ from layout_gen.transistor import draw_transistor
 from layout_gen.synth.loader      import CellTemplate, PortSpec
 from layout_gen.synth.placer      import Placer, PlacedDevice
 from layout_gen.synth.router      import Router, PortCandidate
+from layout_gen.synth.geo.agent   import GeoFixAgent
+from layout_gen.synth.geo.loop    import GeoFixLoop
 
 
 # ── Public types ──────────────────────────────────────────────────────────────
@@ -109,14 +111,18 @@ class Synthesizer:
     def __init__(
         self,
         rules:      PDKRules,
-        drc_runner: Any | None      = None,
-        ml_model:   MLModel | None  = None,
-        max_iter:   int             = 10,
+        drc_runner: Any | None          = None,
+        ml_model:   MLModel | None      = None,
+        max_iter:   int                 = 10,
+        geo_agent:  GeoFixAgent | None  = None,
+        geo_max_iter: int               = 10,
     ):
-        self.rules      = rules
-        self.drc_runner = drc_runner
-        self.ml_model   = ml_model or _heuristic_ml_model
-        self.max_iter   = max_iter
+        self.rules        = rules
+        self.drc_runner   = drc_runner
+        self.ml_model     = ml_model or _heuristic_ml_model
+        self.max_iter     = max_iter
+        self.geo_agent    = geo_agent
+        self.geo_max_iter = geo_max_iter
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -160,10 +166,14 @@ class Synthesizer:
                     dev.geom.l_um,
                     dev.spec.device_type,
                     self.rules,
+                    n_fingers=dev.geom.n_fingers,
                 )
                 ref = comp.add_ref(tc)
                 ref.move((dev.x, dev.y))
                 dev.component = tc
+
+            # ── Merge implant regions (avoid nsdm.1/psdm.1 spacing violations) ──
+            _merge_implants(comp, placed, self.rules)
 
             # ── Routing ────────────────────────────────────────────────────
             router     = Router(self.rules)
@@ -191,9 +201,83 @@ class Synthesizer:
                 break
             current_params = new_params
 
+        # ── Geometric fix fallback (Phase 2) ─────────────────────────────
+        if violations and self.geo_agent is not None and self.drc_runner is not None:
+            geo_loop = GeoFixLoop(self.geo_agent, self.drc_runner, self.rules)
+            geo_result = geo_loop.run(comp, max_iter=self.geo_max_iter)
+            if geo_result.converged:
+                comp = geo_result.state.to_component(self.rules,
+                                                     name=_cell_name(template, 0))
+                return SynthResult(comp, placed, current_params,
+                                   [], iteration + geo_result.iterations, True)
+            violations = geo_result.violations
+
         # Return best result even if DRC is not clean
         return SynthResult(comp, placed, current_params,
                            violations, self.max_iter, False)
+
+
+# ── Implant merging ────────────────────────────────────────────────────────────
+
+def _merge_implants(
+    comp:   Any,
+    placed: dict[str, PlacedDevice],
+    rules:  PDKRules,
+) -> None:
+    """Draw merged implant rectangles that cover all same-type devices.
+
+    Individual transistor primitives already draw their own implant boxes,
+    but when two same-type devices are placed close together (closer than
+    ``implant.spacing_min_um``), their implant regions must merge to avoid
+    nsdm.1/psdm.1 spacing violations.
+
+    This function draws one bounding implant rectangle per device type that
+    covers all devices of that type.  The overlapping polygons naturally
+    merge in the GDS (KLayout DRC treats them as one region).
+    """
+    from layout_gen.cells.standard import _diff_y
+
+    impl_enc = rules.implant.get("enclosure_of_diff_um", 0.125)
+
+    # Group devices by implant layer
+    groups: dict[str, list[PlacedDevice]] = {}
+    for dev in placed.values():
+        dev_rules = rules.device(dev.spec.device_type)
+        impl_layer = dev_rules["implant_layer"]
+        groups.setdefault(impl_layer, []).append(dev)
+
+    for impl_layer_name, devs in groups.items():
+        if len(devs) < 2:
+            continue  # single device — no merging needed
+
+        lyr = rules.layer(impl_layer_name)
+
+        # Compute bounding box of all diff regions + implant enclosure
+        x0_min = float("inf")
+        x1_max = float("-inf")
+        y0_min = float("inf")
+        y1_max = float("-inf")
+
+        for dev in devs:
+            # Diff X: from dev.x to dev.x + total_x
+            dx0 = dev.x
+            dx1 = dev.x + dev.geom.total_x_um
+            # Diff Y
+            dy0, dy1 = _diff_y(dev.geom, rules)
+            dy0 += dev.y
+            dy1 += dev.y
+
+            x0_min = min(x0_min, dx0 - impl_enc)
+            x1_max = max(x1_max, dx1 + impl_enc)
+            y0_min = min(y0_min, dy0 - impl_enc)
+            y1_max = max(y1_max, dy1 + impl_enc)
+
+        # Draw merged implant covering all devices of this type
+        comp.add_polygon(
+            [(x0_min, y0_min), (x1_max, y0_min),
+             (x1_max, y1_max), (x0_min, y1_max)],
+            layer=lyr,
+        )
 
 
 # ── Port resolution ────────────────────────────────────────────────────────────

@@ -1,0 +1,355 @@
+"""
+layout_gen.synth.geo.agent — Geometric DRC fix agents.
+
+:class:`GeoFixAgent` is the abstract base.  :class:`RuleGeoAgent`
+(Phase 2) uses deterministic heuristics.  :class:`LearnedGeoAgent`
+(Phase 3, in ``learned_agent.py``) will use a trained policy network.
+
+Design principle
+----------------
+Every agent receives:
+
+1. The :class:`~.state.LayoutState` (mutable polygon set)
+2. A :class:`~.violations.ViolationInfo` to fix
+3. (optionally) PDK rules for dimensional constants
+
+And returns a list of :class:`~.actions.Action` objects.  The caller
+applies them and re-runs DRC.  The agent never calls DRC itself — the
+:class:`~.loop.GeoFixLoop` handles the outer loop.
+
+The rule-based agent works by pattern-matching the violation *category*:
+
+- **spacing** — find the two closest same-layer shapes near the violation,
+  move the smaller one away by ``deficit``.
+- **width** — find the narrow shape, stretch its short edge by ``deficit/2``
+  on each side.
+- **enclosure** — find the inner shape (via/contact), stretch the outer
+  shape's nearest edge by ``deficit``.
+- **area** — find the small shape, scale its shorter dimension up until
+  ``area >= required``.
+- **overlap** — find the two overlapping shapes, move the smaller one.
+
+These operations are universal across CMOS technologies.
+"""
+from __future__ import annotations
+
+import abc
+from typing import Any
+
+from layout_gen.synth.geo.state      import LayoutState, Rect
+from layout_gen.synth.geo.actions    import (
+    Action, StretchEdge, MoveShape, AddRect, MergeShapes,
+)
+from layout_gen.synth.geo.violations import ViolationInfo
+
+
+_EPS = 0.005  # 5 nm headroom beyond exact deficit
+
+
+class GeoFixAgent(abc.ABC):
+    """Abstract base for geometric DRC fix agents.
+
+    Subclasses implement :meth:`propose_fix` — given a layout state and a
+    parsed violation, return one or more actions that should fix it.
+    """
+
+    @abc.abstractmethod
+    def propose_fix(
+        self,
+        state:     LayoutState,
+        violation: ViolationInfo,
+    ) -> list[Action]:
+        """Propose geometric actions to fix *violation*.
+
+        Returns an empty list if no fix is known.
+        """
+
+    def fix_batch(
+        self,
+        state:      LayoutState,
+        violations: list[ViolationInfo],
+    ) -> list[Action]:
+        """Propose fixes for all violations (default: one at a time)."""
+        actions: list[Action] = []
+        for v in violations:
+            actions.extend(self.propose_fix(state, v))
+        return actions
+
+
+class RuleGeoAgent(GeoFixAgent):
+    """Phase 2: deterministic geometric fixer.
+
+    Reads the violation category and applies the obvious geometric
+    transformation — the same thing a human layout engineer would do
+    when they see a DRC error marker in KLayout.
+
+    Parameters
+    ----------
+    rules :
+        PDK rules (optional, for dimensional lookups).
+    search_radius :
+        How far from the violation centroid to search for shapes (µm).
+    """
+
+    def __init__(self, rules: Any = None, search_radius: float = 2.0):
+        self.rules = rules
+        self.search_radius = search_radius
+
+    def propose_fix(
+        self,
+        state:     LayoutState,
+        violation: ViolationInfo,
+    ) -> list[Action]:
+        cat = violation.category
+        if cat == "spacing":
+            return self._fix_spacing(state, violation)
+        elif cat == "width":
+            return self._fix_width(state, violation)
+        elif cat == "enclosure":
+            return self._fix_enclosure(state, violation)
+        elif cat == "area":
+            return self._fix_area(state, violation)
+        elif cat == "overlap":
+            return self._fix_overlap(state, violation)
+        else:
+            return self._fix_unknown(state, violation)
+
+    # ── Spacing ──────────────────────────────────────────────────────────────
+
+    def _fix_spacing(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Spacing violation: two shapes too close → move them apart."""
+        layer = v.layer
+        shapes = state.near(v.x, v.y, self.search_radius, layer=layer)
+        if len(shapes) < 2:
+            # Widen search
+            shapes = state.on_layer(layer)
+
+        if len(shapes) < 2:
+            return []
+
+        # Find the closest pair
+        best_pair = None
+        best_dist = float("inf")
+        for i, a in enumerate(shapes):
+            for b in shapes[i + 1:]:
+                d = a.edge_dist(b)
+                if 0 < d < best_dist:
+                    best_dist = d
+                    best_pair = (a, b)
+
+        if best_pair is None:
+            return []
+
+        a, b = best_pair
+        # min_gap = target gap (required), not deficit (required - measured)
+        needed = v.required + _EPS if v.required > 0 else v.deficit + _EPS
+        if needed <= 0:
+            needed = 0.01
+
+        # Move the smaller shape away from the larger one
+        mover, anchor = (a, b) if a.area <= b.area else (b, a)
+        dx, dy = self._repulsion_vector(mover, anchor, needed)
+
+        return [MoveShape(rid=mover.rid, dx=dx, dy=dy)]
+
+    # ── Width ────────────────────────────────────────────────────────────────
+
+    def _fix_width(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Width violation: a shape is too narrow → widen it."""
+        shapes = state.near(v.x, v.y, self.search_radius, layer=v.layer)
+        if not shapes:
+            shapes = state.on_layer(v.layer)
+
+        # Find the narrowest shape
+        target = None
+        min_dim = float("inf")
+        for s in shapes:
+            d = min(s.width, s.height)
+            if d < min_dim:
+                min_dim = d
+                target = s
+
+        if target is None:
+            return []
+
+        needed = v.deficit + _EPS
+        if needed <= 0:
+            needed = v.required - min_dim + _EPS if v.required > 0 else 0.01
+
+        # Stretch the narrow dimension symmetrically
+        actions: list[Action] = []
+        half = needed / 2
+        if target.width <= target.height:
+            # Narrow in X
+            actions.append(StretchEdge(target.rid, "left", half))
+            actions.append(StretchEdge(target.rid, "right", half))
+        else:
+            # Narrow in Y
+            actions.append(StretchEdge(target.rid, "bottom", half))
+            actions.append(StretchEdge(target.rid, "top", half))
+
+        return actions
+
+    # ── Enclosure ────────────────────────────────────────────────────────────
+
+    def _fix_enclosure(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Enclosure violation: outer layer doesn't cover inner layer enough."""
+        inner_layer = v.inner_layer or ""
+        outer_layer = v.layer
+
+        # Find the inner shape (via/contact) near the violation
+        inner_shapes = state.near(v.x, v.y, self.search_radius,
+                                  layer=inner_layer) if inner_layer else []
+
+        if not inner_shapes:
+            # Try all layers near the point
+            inner_shapes = state.at_point(v.x, v.y)
+
+        if not inner_shapes:
+            return []
+
+        inner = min(inner_shapes, key=lambda s: s.area)
+
+        # Find the outer shape
+        outer_shapes = state.near(inner.cx, inner.cy, self.search_radius,
+                                  layer=outer_layer)
+        if not outer_shapes:
+            return []
+
+        outer = min(outer_shapes,
+                    key=lambda s: ((s.cx - inner.cx)**2 + (s.cy - inner.cy)**2))
+
+        needed = v.deficit + _EPS
+        if needed <= 0:
+            needed = 0.01
+
+        # Check each edge of outer: if it doesn't enclose inner by enough,
+        # stretch it outward
+        actions: list[Action] = []
+
+        # Left edge: outer.x0 must be <= inner.x0 - required
+        left_gap = inner.x0 - outer.x0
+        if left_gap < v.required:
+            actions.append(StretchEdge(outer.rid, "left", v.required - left_gap + _EPS))
+
+        # Right edge: outer.x1 must be >= inner.x1 + required
+        right_gap = outer.x1 - inner.x1
+        if right_gap < v.required:
+            actions.append(StretchEdge(outer.rid, "right", v.required - right_gap + _EPS))
+
+        # Bottom edge
+        bot_gap = inner.y0 - outer.y0
+        if bot_gap < v.required:
+            actions.append(StretchEdge(outer.rid, "bottom", v.required - bot_gap + _EPS))
+
+        # Top edge
+        top_gap = outer.y1 - inner.y1
+        if top_gap < v.required:
+            actions.append(StretchEdge(outer.rid, "top", v.required - top_gap + _EPS))
+
+        return actions
+
+    # ── Area ─────────────────────────────────────────────────────────────────
+
+    def _fix_area(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Area violation: shape is too small → enlarge it."""
+        shapes = state.near(v.x, v.y, self.search_radius, layer=v.layer)
+        if not shapes:
+            shapes = state.on_layer(v.layer)
+
+        # Find the smallest shape
+        target = min(shapes, key=lambda s: s.area) if shapes else None
+        if target is None:
+            return []
+
+        required_area = v.required
+        if required_area <= 0:
+            return []
+
+        current_area = target.area
+        if current_area >= required_area:
+            return []
+
+        # Scale up the shorter dimension
+        ratio = (required_area / current_area) ** 0.5
+        actions: list[Action] = []
+        if target.width <= target.height:
+            extra = target.width * (ratio - 1) / 2 + _EPS
+            actions.append(StretchEdge(target.rid, "left", extra))
+            actions.append(StretchEdge(target.rid, "right", extra))
+        else:
+            extra = target.height * (ratio - 1) / 2 + _EPS
+            actions.append(StretchEdge(target.rid, "bottom", extra))
+            actions.append(StretchEdge(target.rid, "top", extra))
+
+        return actions
+
+    # ── Overlap ──────────────────────────────────────────────────────────────
+
+    def _fix_overlap(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Overlap/short violation: two shapes touch that shouldn't."""
+        shapes = state.near(v.x, v.y, self.search_radius, layer=v.layer)
+
+        # Find overlapping pair
+        for i, a in enumerate(shapes):
+            for b in shapes[i + 1:]:
+                if a.overlaps(b) and a.edge_dist(b) == 0:
+                    # Move the smaller one away
+                    mover = a if a.area <= b.area else b
+                    anchor = b if mover is a else a
+                    dx, dy = self._repulsion_vector(mover, anchor, 0.01)
+                    return [MoveShape(mover.rid, dx, dy)]
+        return []
+
+    # ── Unknown ──────────────────────────────────────────────────────────────
+
+    def _fix_unknown(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Fallback: try spacing fix, then width fix."""
+        actions = self._fix_spacing(state, v)
+        if actions:
+            return actions
+        return self._fix_width(state, v)
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _repulsion_vector(
+        mover: Rect, anchor: Rect, min_gap: float,
+    ) -> tuple[float, float]:
+        """Compute (dx, dy) to push *mover* away from *anchor* by *min_gap*.
+
+        Moves in the direction of shortest separation.
+        """
+        # Overlaps in X and Y
+        ox = min(mover.x1, anchor.x1) - max(mover.x0, anchor.x0)
+        oy = min(mover.y1, anchor.y1) - max(mover.y0, anchor.y0)
+
+        # Gaps in X and Y
+        gx_left  = anchor.x0 - mover.x1  # gap if mover is left
+        gx_right = mover.x0 - anchor.x1  # gap if mover is right
+        gy_below = anchor.y0 - mover.y1
+        gy_above = mover.y0 - anchor.y1
+
+        # Choose the direction with smallest displacement needed
+        candidates = []
+        if gx_left >= 0 or ox > 0:
+            # mover is left of anchor (or overlapping)
+            delta = min_gap - gx_left if gx_left >= 0 else min_gap + abs(gx_left)
+            candidates.append((-delta, 0.0, abs(delta)))
+        if gx_right >= 0 or ox > 0:
+            delta = min_gap - gx_right if gx_right >= 0 else min_gap + abs(gx_right)
+            candidates.append((delta, 0.0, abs(delta)))
+        if gy_below >= 0 or oy > 0:
+            delta = min_gap - gy_below if gy_below >= 0 else min_gap + abs(gy_below)
+            candidates.append((0.0, -delta, abs(delta)))
+        if gy_above >= 0 or oy > 0:
+            delta = min_gap - gy_above if gy_above >= 0 else min_gap + abs(gy_above)
+            candidates.append((0.0, delta, abs(delta)))
+
+        if not candidates:
+            # Default: push right
+            return (min_gap, 0.0)
+
+        # Pick the move with the smallest displacement
+        candidates.sort(key=lambda c: c[2])
+        return (candidates[0][0], candidates[0][1])

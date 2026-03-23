@@ -78,6 +78,52 @@ def available_tools() -> list[str]:
     return registry.available()
 
 
+def get_runner(rules: "PDKRules | None" = None) -> "DRCRunner | None":
+    """Auto-detect and return the first available DRC runner.
+
+    Checks environment variables ``KLAYOUT_BIN`` and ``MAGIC_BIN`` for
+    custom tool paths, then falls back to the default binary names on
+    ``$PATH``.
+
+    Parameters
+    ----------
+    rules :
+        PDK rules.  If ``None``, loads them via :func:`~layout_gen.pdk.load_pdk`.
+
+    Returns
+    -------
+    DRCRunner or None
+        The first available runner, or ``None`` if no tool is found.
+    """
+    import os
+
+    if rules is None:
+        from layout_gen import load_pdk
+        rules = load_pdk()
+
+    # Try KLayout first (fully implemented), then Magic
+    _TOOL_ENV = {
+        "klayout": "KLAYOUT_BIN",
+        "magic":   "MAGIC_BIN",
+    }
+    for tool_name in ("klayout", "magic"):
+        env_var = _TOOL_ENV[tool_name]
+        exe = os.environ.get(env_var)
+        kwargs: dict = {"rules": rules}
+        if exe:
+            # Map env var to the runner's __init__ kwarg
+            kwarg_name = f"{tool_name}_exe"
+            kwargs[kwarg_name] = exe
+        try:
+            runner = registry.get(tool_name, **kwargs)
+            if runner.is_available():
+                return runner
+        except Exception:
+            continue
+
+    return None
+
+
 __all__ = [
     "DRCViolation",
     "DRCRunner",
@@ -85,4 +131,5 @@ __all__ = [
     "MagicDRCRunner",
     "run_drc",
     "available_tools",
+    "get_runner",
 ]

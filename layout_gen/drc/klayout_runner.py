@@ -68,28 +68,56 @@ class KLayoutDRCRunner(DRCRunner):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
+    def _resolve_deck(self) -> Path | None:
+        """Return the path to a real PDK DRC deck, or None to use auto-generated."""
+        drc_cfg = getattr(self.rules, "drc", None) or {}
+        deck_path = drc_cfg.get("klayout")
+        if deck_path and Path(deck_path).is_file():
+            return Path(deck_path)
+        return None
+
     def run(
         self,
         gds_path: Path,
         cell_name: str | None = None,
     ) -> List[DRCViolation]:
         gds_path = Path(gds_path).resolve()
-        script   = _generate_drc_script(self.rules)
+        deck     = self._resolve_deck()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir      = Path(tmpdir)
-            script_path = tmpdir / "drc.drc"
             report_path = tmpdir / "violations.lyrdb"
-            script_path.write_text(script, encoding="utf-8")
 
-            cmd = [
-                self.klayout_exe, "-b",
-                "-r", str(script_path),
-                "-rd", f"input={gds_path}",
-                "-rd", f"report={report_path}",
-            ]
-            if cell_name:
-                cmd += ["-rd", f"topcell={cell_name}"]
+            if deck is not None:
+                # Use the real PDK DRC deck (e.g. sky130A_mr.drc)
+                script_path = deck
+                cmd = [
+                    self.klayout_exe, "-b",
+                    "-r", str(script_path),
+                    "-rd", f"input={gds_path}",
+                    "-rd", f"report={report_path}",
+                    # Enable all relevant check groups
+                    "-rd", "feol=true",
+                    "-rd", "beol=true",
+                    "-rd", "offgrid=true",
+                    "-rd", "seal=false",
+                    "-rd", "floating_met=false",
+                ]
+                if cell_name:
+                    cmd += ["-rd", f"top_cell={cell_name}"]
+            else:
+                # Fall back to auto-generated script from PDK YAML rules
+                script  = _generate_drc_script(self.rules)
+                script_path = tmpdir / "drc.drc"
+                script_path.write_text(script, encoding="utf-8")
+                cmd = [
+                    self.klayout_exe, "-b",
+                    "-r", str(script_path),
+                    "-rd", f"input={gds_path}",
+                    "-rd", f"report={report_path}",
+                ]
+                if cell_name:
+                    cmd += ["-rd", f"topcell={cell_name}"]
 
             result = subprocess.run(
                 cmd,
@@ -242,6 +270,51 @@ def _generate_drc_script(rules: PDKRules) -> str:
             f".output('nwell.5', 'Nwell must enclose PMOS diff by {nwenc} um')"
         )
 
+    # ── Met2 ──────────────────────────────────────────────────────────────────
+    m2 = R.met2 if R.met2 else None
+    if m2 and "met2" in lyr:
+        m2w, m2s = m2['width_min_um'], m2['spacing_min_um']
+        lines += [
+            "",
+            f"met2   = {inp('met2')}",
+            "# ── Met2 ────────────────────────────────────────────────────────",
+            f"met2.width({m2w}.um).output('met2.1', 'Met2 width < {m2w} um')",
+            f"met2.space({m2s}.um).output('met2.2', 'Met2 spacing < {m2s} um')",
+        ]
+
+    # ── Via1 (met1 → met2) ────────────────────────────────────────────────────
+    v1 = R.via1 if R.via1 else None
+    if v1 and "via1" in lyr:
+        v1sz = v1['size_um']
+        v1sp = v1['spacing_um']
+        v1em1 = v1.get('enclosure_in_met1_um', 0.055)
+        v1em2 = v1.get('enclosure_in_met2_um', 0.055)
+        lines += [
+            "",
+            f"via1   = {inp('via1')}",
+            "# ── Via1 ────────────────────────────────────────────────────────",
+            f"via1.width({v1sz}.um).output('via.1a', 'Via1 size < {v1sz} um')",
+            f"via1.space({v1sp}.um).output('via.2', 'Via1 spacing < {v1sp} um')",
+            f"met1.enclosing(via1, {v1em1}.um)"
+            f".output('via.4a', 'Met1 must enclose via1 by {v1em1} um')",
+        ]
+        if m2 and "met2" in lyr:
+            lines.append(
+                f"met2.enclosing(via1, {v1em2}.um)"
+                f".output('via.5a', 'Met2 must enclose via1 by {v1em2} um')"
+            )
+
+    # ── Poly endcap ───────────────────────────────────────────────────────────
+    endcap = R.poly.get("endcap_over_diff_um")
+    if endcap:
+        lines += [
+            "",
+            "# ── Poly endcap ─────────────────────────────────────────────────",
+            f"# poly.4: poly must extend {endcap} um past diff edge",
+            f"gate_poly = poly.and(diff).extents",
+            f"# (Informational — edge-based endcap checks require custom logic)",
+        ]
+
     # ── Implant ───────────────────────────────────────────────────────────────
     impl = R.implant
     if "enclosure_of_diff_um" in impl:
@@ -254,6 +327,14 @@ def _generate_drc_script(rules: PDKRules) -> str:
             f"psdm.enclosing(diff.and(psdm), {ienc}.um)"
             f".output('psdm.3', 'Psdm must enclose PMOS diff by {ienc} um')",
         ]
+
+    # ── Antenna ───────────────────────────────────────────────────────────────
+    lines += [
+        "",
+        "# ── Cross-layer overlap checks ─────────────────────────────────",
+        "# nsdm and psdm must not overlap (implant exclusivity)",
+        "nsdm.and(psdm).output('implant.overlap', 'Nsdm/Psdm overlap')",
+    ]
 
     return "\n".join(lines) + "\n"
 
@@ -322,7 +403,11 @@ def _centroid_from_item(item: ET.Element) -> tuple[float, float]:
 
 
 def _parse_pts(s: str) -> list[tuple[float, float]]:
-    """Parse '(x1,y1;x2,y2;...)' dbu → list of (x_um, y_um)."""
+    """Parse '(x1,y1;x2,y2;...)' → list of (x_um, y_um).
+
+    KLayout may output coordinates as integer dbu (multiply by _DBU)
+    or as floating-point µm values.  We try int first, then float.
+    """
     s = s.strip().strip("()")
     pts = []
     for token in s.split(";"):
@@ -332,7 +417,10 @@ def _parse_pts(s: str) -> list[tuple[float, float]]:
             try:
                 pts.append((int(xs) * _DBU, int(ys) * _DBU))
             except ValueError:
-                pass
+                try:
+                    pts.append((float(xs), float(ys)))
+                except ValueError:
+                    pass
     return pts
 
 

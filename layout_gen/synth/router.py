@@ -194,7 +194,7 @@ def _drain_bridge(
     dev_p = placed[p_name]
 
     j_n = dev_n.geom.n_fingers   # drain index for n_fingers=1 is j=1
-    dx0, dx1 = global_sd_x(dev_n, j_n)
+    dx0, dx1 = global_sd_x(dev_n, j_n, rules)
 
     nd_y0, nd_y1 = global_diff_y(dev_n, rules)
     pd_y0, pd_y1 = global_diff_y(dev_p, rules)
@@ -336,9 +336,13 @@ def _poly_stub_met1_bus(
     """
     c_size   = rules.contacts["size_um"]                       # licon1/mcon: 0.17 µm
     enc_poly = rules.contacts.get("poly_enclosure_um", 0.05)   # poly enc of licon1
-    enc_m1   = rules.mcon.get("enclosure_in_met1_um", 0.03)
+    enc_li_2adj = rules.contacts.get("enclosure_in_li1_2adj_um", 0.08)  # li.5
+    enc_m1_2adj = rules.met1.get("enclosure_of_mcon_2adj_um", 0.06)     # m1.5
     ch       = c_size / 2                                       # 0.085 µm
+    li1_lh   = ch + enc_li_2adj                                 # li1 landing half
+    m1_lh    = ch + enc_m1_2adj                                 # met1 landing half
     pad_half = (c_size + 2 * enc_poly) / 2                     # 0.135 µm
+    li1_sp   = rules.li1.get("spacing_min_um", 0.17)
 
     lyr_g       = rules.layer("poly")
     lyr_li1     = rules.layer("li1")
@@ -359,15 +363,21 @@ def _poly_stub_met1_bus(
         gx0, gx1 = global_gate_x(dev, 0)
         gcx      = (gx0 + gx1) / 2
         pg_ty    = global_poly_top(dev)        # top Y of transistor body
-        stub_cy  = pg_ty + pad_half            # polycontact center Y
+
+        # Place stub high enough to maintain li1 spacing from S/D li1 rails
+        _, diff_y1 = global_diff_y(dev, rules)
+        stub_cy_min = diff_y1 + li1_sp + li1_lh   # li1 landing bottom >= diff_y1 + li1_sp
+        stub_cy     = max(pg_ty + pad_half, stub_cy_min)
 
         # Widened poly pad above transistor body (same net as gate poly)
+        poly_pad_top = stub_cy + ch + enc_poly
         _rect(comp, gcx - pad_half, gcx + pad_half,
-                    pg_ty, pg_ty + 2 * pad_half, lyr_g)
+                    pg_ty, poly_pad_top, lyr_g)
         # Polycontact (licon1 on poly)
         _rect(comp, gcx - ch, gcx + ch, stub_cy - ch, stub_cy + ch, lyr_contact)
-        # Li1 landing over licon1
-        _rect(comp, gcx - ch, gcx + ch, stub_cy - ch, stub_cy + ch, lyr_li1)
+        # Li1 landing over licon1 (li.5: 2-adj-edge enc)
+        _rect(comp, gcx - li1_lh, gcx + li1_lh,
+                    stub_cy - li1_lh, stub_cy + li1_lh, lyr_li1)
         # Mcon (li1 → met1)
         _rect(comp, gcx - ch, gcx + ch, stub_cy - ch, stub_cy + ch, lyr_mcon)
 
@@ -376,13 +386,13 @@ def _poly_stub_met1_bus(
     if not stub_locs:
         return []
 
-    # Met1 bus spanning all stubs (enclosing each mcon by enc_m1)
+    # Met1 bus spanning all stubs (m1.5: enclosing each mcon, 2-adj-edge)
     xs        = [gcx for gcx, _ in stub_locs]
     cy        = stub_locs[0][1]                # all stubs at same Y (same device type)
-    wl_x0    = min(xs) - ch - enc_m1
-    wl_x1    = max(xs) + ch + enc_m1
-    wl_y0    = cy - ch - enc_m1
-    wl_y1    = cy + ch + enc_m1
+    wl_x0    = min(xs) - m1_lh
+    wl_x1    = max(xs) + m1_lh
+    wl_y0    = cy - m1_lh
+    wl_y1    = cy + m1_lh
     _rect(comp, wl_x0, wl_x1, wl_y0, wl_y1, lyr_m1)
 
     # Port at left edge of WL bus, facing West (row decoder direction)
@@ -424,16 +434,31 @@ def _cross_couple_gate(
             track=1 → one track higher (Q_→INV_L, avoids overlap)
     """
     # ── Geometry constants ────────────────────────────────────────────────────
-    c_size   = rules.contacts["size_um"]                       # 0.17 µm
+    c_size   = rules.contacts["size_um"]                       # 0.17 µm (licon1/mcon)
     enc_poly = rules.contacts.get("poly_enclosure_um", 0.05)
-    enc_m1   = rules.mcon.get("enclosure_in_met1_um", 0.03)
-    enc_m2   = enc_m1
+    enc_li_licon_2adj = rules.contacts.get("enclosure_in_li1_2adj_um", 0.08)
+    enc_m1_mcon = rules.mcon.get("enclosure_in_met1_um", 0.03)  # met1 enc of mcon (all sides)
+    enc_m1_mcon_2adj = rules.met1.get("enclosure_of_mcon_2adj_um", 0.06)  # met1 enc of mcon (2 adj)
+    _met2    = rules.met2 if rules.met2 else rules.met1  # fallback for older PDKs
+    _via1    = rules.via1 if rules.via1 else {}
+    via1_size = _via1.get("size_um", c_size)                    # via1 cut size (0.15 µm)
+    enc_m1_via = _via1.get("enclosure_in_met1_um", 0.055)      # met1 enc of via1 (all sides)
+    enc_m1_via_2adj = _via1.get("enclosure_in_met1_2adj_um", 0.085)  # met1 enc of via1 (2 adj)
+    enc_m2_via = _via1.get("enclosure_in_met2_um", 0.055)      # met2 enc of via1 (all sides)
+    enc_m2_via_2adj = _met2.get("enclosure_of_via1_2adj_um", 0.085)  # met2 enc of via1 (2 adj)
     met1_sp  = rules.met1.get("spacing_min_um", 0.14)
-    met2_w   = rules.met1.get("width_min_um",   0.14)
-    met2_sp  = rules.met1.get("spacing_min_um", 0.14)
-    ch       = c_size / 2                                      # 0.085 µm
+    met2_w   = _met2.get("width_min_um",   0.14)
+    met2_sp  = _met2.get("spacing_min_um", 0.14)
+    ch       = c_size / 2                                      # 0.085 µm (half of licon1)
+    vh       = via1_size / 2                                   # 0.075 µm (half of via1)
     pad_half = (c_size + 2 * enc_poly) / 2                    # 0.135 µm
-    rail_h   = 0.17
+    rail_h   = max(rules.met1.get("width_min_um", 0.14),
+                   rules.li1.get("width_min_um", 0.17))
+    # Landing half-extents that satisfy both minimum and 2-adjacent-edge enclosure
+    li1_land_half = ch + enc_li_licon_2adj      # li1 landing around licon1
+    m1_land_half  = max(ch + enc_m1_mcon_2adj,  # met1 landing: enclose mcon (2adj)
+                        vh + enc_m1_via_2adj)   #   AND via1 (2adj)
+    m2_land_half  = vh + enc_m2_via_2adj        # met2 landing around via1
 
     lyr_g       = rules.layer("poly")
     lyr_li1     = rules.layer("li1")
@@ -450,8 +475,7 @@ def _cross_couple_gate(
     cell_ytop = max(d.y + d.geom.total_y_um for d in pmos_devs)
 
     # Gate stub contact centre Y — must clear VDD rail top + met1 spacing
-    # gsc_y = cell_ytop + rail_h + met1_sp + ch + enc_m1
-    gsc_y = cell_ytop + rail_h + met1_sp + ch + enc_m1
+    gsc_y = cell_ytop + rail_h + met1_sp + m1_land_half
 
     # ── Source: Q/Q_ li1 bridge centre ────────────────────────────────────────
     # Derive from placed device terminal→net mapping.
@@ -479,15 +503,15 @@ def _cross_couple_gate(
     q_x      = (t_drain.x1 + t_source.x0) / 2   # li1 bridge centre X
     nd_ymid  = (t_drain.y0 + t_drain.y1) / 2
 
-    # Via stack at Q/Q_ source node (li1 → met1 → via1 → met2)
+    # Via stack at Q/Q_ source node (li1 → mcon → met1 → via1 → met2)
     _rect(comp, q_x - ch, q_x + ch,
                 nd_ymid - ch, nd_ymid + ch, lyr_mcon)
-    _rect(comp, q_x - ch - enc_m1, q_x + ch + enc_m1,
-                nd_ymid - ch - enc_m1, nd_ymid + ch + enc_m1, lyr_m1)
-    _rect(comp, q_x - ch, q_x + ch,
-                nd_ymid - ch, nd_ymid + ch, lyr_via1)
-    _rect(comp, q_x - ch - enc_m2, q_x + ch + enc_m2,
-                nd_ymid - ch - enc_m2, nd_ymid + ch + enc_m2, lyr_m2)
+    _rect(comp, q_x - m1_land_half, q_x + m1_land_half,
+                nd_ymid - m1_land_half, nd_ymid + m1_land_half, lyr_m1)
+    _rect(comp, q_x - vh, q_x + vh,
+                nd_ymid - vh, nd_ymid + vh, lyr_via1)
+    _rect(comp, q_x - m2_land_half, q_x + m2_land_half,
+                nd_ymid - m2_land_half, nd_ymid + m2_land_half, lyr_m2)
 
     # ── Target gate stubs (one per unique gate X position) ────────────────────
     gate_xs: list[float] = []
@@ -514,40 +538,48 @@ def _cross_couple_gate(
                     cell_ytop, gsc_y + ch + enc_poly, lyr_g)
         # Licon1 (polycontact: poly → li1)
         _rect(comp, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_contact)
-        # Li1 landing
-        _rect(comp, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_li1)
+        # Li1 landing (must satisfy li.5: 2-adj-edge enclosure of licon)
+        _rect(comp, gcx - li1_land_half, gcx + li1_land_half,
+                    gsc_y - li1_land_half, gsc_y + li1_land_half, lyr_li1)
         # Mcon (li1 → met1)
         _rect(comp, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_mcon)
-        # Met1 enclosing mcon
-        _rect(comp, gcx - ch - enc_m1, gcx + ch + enc_m1,
-                    gsc_y - ch - enc_m1, gsc_y + ch + enc_m1, lyr_m1)
+        # Met1 landing (satisfies both m1.5 mcon enc and via.5a via1 enc, 2-adj)
+        _rect(comp, gcx - m1_land_half, gcx + m1_land_half,
+                    gsc_y - m1_land_half, gsc_y + m1_land_half, lyr_m1)
         # Via1 (met1 → met2)
-        _rect(comp, gcx - ch, gcx + ch, gsc_y - ch, gsc_y + ch, lyr_via1)
-        # Met2 landing
-        _rect(comp, gcx - ch - enc_m2, gcx + ch + enc_m2,
-                    gsc_y - ch - enc_m2, gsc_y + ch + enc_m2, lyr_m2)
+        _rect(comp, gcx - vh, gcx + vh, gsc_y - vh, gsc_y + vh, lyr_via1)
+        # Met2 landing (satisfies m2.5: 2-adj-edge enc of via1)
+        _rect(comp, gcx - m2_land_half, gcx + m2_land_half,
+                    gsc_y - m2_land_half, gsc_y + m2_land_half, lyr_m2)
 
     if not gate_xs:
         return []
 
     gcx_target = gate_xs[0]
     track      = int(spec.extra.get("track", 0))
-    route_y    = gsc_y + track * (met2_w + met2_sp)
+    # Track pitch must clear the gate-stub met2 landing (m2_land_half above gsc_y)
+    # plus met2 spacing, plus the wire half-width of the next track.
+    track_pitch = m2_land_half + met2_sp + met2_w / 2
+    route_y    = gsc_y + track * track_pitch
 
     # ── Met2 route: source → gate stub ────────────────────────────────────────
-    x_lo = min(q_x, gcx_target)
-    x_hi = max(q_x, gcx_target)
+    # Use met2_w for wire width.  Extend horizontal wires to fully overlap
+    # the met2 via-landings at both endpoints to avoid narrow notches that
+    # trip the width DRC check.
+    hw = met2_w / 2                        # wire half-width
+    x_lo = min(q_x, gcx_target) - hw      # left edge of left-most landing
+    x_hi = max(q_x, gcx_target) + hw      # right edge of right-most landing
 
     if track == 0:
         # L-shape: vertical at q_x from nd_ymid to route_y, then horizontal
-        _rect(comp, q_x - met2_w / 2, q_x + met2_w / 2, nd_ymid, route_y, lyr_m2)
-        _rect(comp, x_lo, x_hi, route_y - met2_w / 2, route_y + met2_w / 2, lyr_m2)
+        _rect(comp, q_x - hw, q_x + hw, nd_ymid, route_y + hw, lyr_m2)
+        _rect(comp, x_lo, x_hi, route_y - hw, route_y + hw, lyr_m2)
     else:
         # U-shape: vertical up to route_y, horizontal, vertical down to gsc_y
-        _rect(comp, q_x - met2_w / 2, q_x + met2_w / 2, nd_ymid, route_y, lyr_m2)
-        _rect(comp, x_lo, x_hi, route_y - met2_w / 2, route_y + met2_w / 2, lyr_m2)
-        _rect(comp, gcx_target - met2_w / 2, gcx_target + met2_w / 2,
-                    gsc_y, route_y, lyr_m2)
+        _rect(comp, q_x - hw, q_x + hw, nd_ymid, route_y + hw, lyr_m2)
+        _rect(comp, x_lo, x_hi, route_y - hw, route_y + hw, lyr_m2)
+        _rect(comp, gcx_target - hw, gcx_target + hw,
+                    gsc_y - hw, route_y + hw, lyr_m2)
 
     # No new port — ports for Q/Q_ come from li1_bridge candidates
     return []

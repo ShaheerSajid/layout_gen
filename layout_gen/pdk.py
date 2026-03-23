@@ -17,6 +17,7 @@ Typical use::
 """
 from __future__ import annotations
 
+import os
 import pathlib
 from dataclasses import dataclass, field
 
@@ -76,10 +77,13 @@ class PDKRules:
     contacts: dict
     li1:      dict
     met1:     dict
+    met2:     dict
+    via1:     dict
     implant:  dict
     nwell:    dict
     mcon:     dict
     devices:  dict
+    drc:      dict    # DRC deck paths: {"klayout": "...", "magic": "..."}
 
     def layer(self, name: str) -> tuple[int, int]:
         """Return the ``(gds_layer, gds_datatype)`` pair for a logical layer name.
@@ -140,8 +144,22 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
     pdk_yaml :
         Path to the layout PDK YAML.  Defaults to the bundled sky130A config.
     """
-    data   = _load_yaml(pathlib.Path(pdk_yaml))
+    pdk_yaml = pathlib.Path(pdk_yaml)
+    data   = _load_yaml(pdk_yaml)
     rules  = data.get("rules", {})
+
+    # Resolve DRC deck paths: expand env vars, resolve relative to YAML dir
+    raw_drc = data.get("drc", {})
+    drc: dict[str, str] = {}
+    for tool, path_str in raw_drc.items():
+        # Env-var override takes priority (e.g. DRC_DECK_KLAYOUT)
+        env_key = f"DRC_DECK_{tool.upper()}"
+        resolved = os.environ.get(env_key) or os.path.expandvars(path_str)
+        p = pathlib.Path(resolved)
+        if not p.is_absolute():
+            p = pdk_yaml.parent / p
+        drc[tool] = str(p.resolve())
+
     return PDKRules(
         name     = data["name"],
         layers   = data.get("layers",  {}),
@@ -150,15 +168,41 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
         contacts = rules.get("contacts", {}),
         li1      = rules.get("li1",     {}),
         met1     = rules.get("met1",    {}),
+        met2     = rules.get("met2",    {}),
+        via1     = rules.get("via1",    {}),
         implant  = rules.get("implant", {}),
         nwell    = rules.get("nwell",   {}),
         mcon     = rules.get("mcon",    {}),
         devices  = data.get("devices",  {}),
+        drc      = drc,
     )
 
 
 # ── Module-level default (sky130A) ────────────────────────────────────────────
-# Cell modules import RULES directly so they don't repeat load_pdk() calls.
-# Override by passing pdk_yaml= to any layout function.
+# Lazy-loaded: avoids import-time crash if the bundled PDK YAML is absent.
+# First access via ``RULES`` or any cell/transistor function triggers loading.
 
-RULES: PDKRules = load_pdk()
+class _LazyRules:
+    """Proxy that loads PDKRules on first attribute access."""
+
+    __slots__ = ('_rules',)
+
+    def __init__(self):
+        object.__setattr__(self, '_rules', None)
+
+    def _load(self) -> PDKRules:
+        r = object.__getattribute__(self, '_rules')
+        if r is None:
+            r = load_pdk()
+            object.__setattr__(self, '_rules', r)
+        return r
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+    def __repr__(self) -> str:
+        r = object.__getattribute__(self, '_rules')
+        return repr(r) if r is not None else 'PDKRules(<lazy: not yet loaded>)'
+
+
+RULES: PDKRules = _LazyRules()  # type: ignore[assignment]
