@@ -172,8 +172,10 @@ class Synthesizer:
                 ref.move((dev.x, dev.y))
                 dev.component = tc
 
-            # ── Merge implant regions (avoid nsdm.1/psdm.1 spacing violations) ──
+            # ── Merge implant/nwell regions ──
             _merge_implants(comp, placed, self.rules)
+            if template.layout_mode == "stacked":
+                _merge_nwells_stacked(comp, placed, self.rules)
 
             # ── Routing ────────────────────────────────────────────────────
             router     = Router(self.rules)
@@ -236,60 +238,116 @@ def _merge_implants(
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
 ) -> None:
-    """Draw merged implant rectangles that cover same-type devices in each row pair.
+    """Draw merged implant rectangles for devices that are close enough to
+    cause implant spacing violations.
 
-    Individual transistor primitives already draw their own implant boxes,
-    but when two same-type devices are placed close together (closer than
-    ``implant.spacing_min_um``), their implant regions must merge to avoid
-    nsdm.1/psdm.1 spacing violations.
-
-    For stacked layouts, implants are merged per row pair to avoid nsdm/psdm
-    overlap between different row pairs.  For standard layouts, all same-type
-    devices are merged into one bounding implant (backwards compatible).
+    In standard mode: one bounding implant per device type (original behaviour).
+    In stacked mode: group by implant layer and merge clusters of devices whose
+    individual implant regions are closer than ``implant.spacing_min_um``.
     """
     from layout_gen.cells.standard import _diff_y
 
     impl_enc = rules.implant.get("enclosure_of_diff_um", 0.125)
+    impl_sp  = rules.implant.get("spacing_min_um", 0.38)
 
-    # Group devices by (row_pair, implant_layer).
-    # row_pair == -1 means standard (non-stacked) mode → all in one group.
-    groups: dict[tuple[int, str], list[PlacedDevice]] = {}
+    # Collect per-device implant bounding boxes, grouped by implant layer
+    layer_devboxes: dict[str, list[tuple[PlacedDevice, tuple]]] = {}
     for dev in placed.values():
         dev_rules = rules.device(dev.spec.device_type)
         impl_layer = dev_rules["implant_layer"]
-        key = (dev.spec.row_pair, impl_layer)
-        groups.setdefault(key, []).append(dev)
+        dy0, dy1 = _diff_y(dev.geom, rules)
+        bbox = (
+            dev.x - impl_enc,
+            dev.x + dev.geom.total_x_um + impl_enc,
+            dy0 + dev.y - impl_enc,
+            dy1 + dev.y + impl_enc,
+        )
+        layer_devboxes.setdefault(impl_layer, []).append((dev, bbox))
 
-    for (_, impl_layer_name), devs in groups.items():
-        if len(devs) < 2:
-            continue  # single device — no merging needed
+    for impl_layer_name, devboxes in layer_devboxes.items():
+        if len(devboxes) < 2:
+            continue
 
         lyr = rules.layer(impl_layer_name)
 
-        # Compute bounding box of all diff regions + implant enclosure
-        x0_min = float("inf")
-        x1_max = float("-inf")
-        y0_min = float("inf")
-        y1_max = float("-inf")
+        # Sort by Y bottom edge, then cluster devices whose implant boxes
+        # are closer than impl_sp in Y (they need to merge).
+        devboxes.sort(key=lambda db: db[1][2])  # sort by y0
 
-        for dev in devs:
-            # Diff X: from dev.x to dev.x + total_x
-            dx0 = dev.x
-            dx1 = dev.x + dev.geom.total_x_um
-            # Diff Y
-            dy0, dy1 = _diff_y(dev.geom, rules)
-            dy0 += dev.y
-            dy1 += dev.y
+        clusters: list[list[tuple]] = [[devboxes[0][1]]]
+        for _, bbox in devboxes[1:]:
+            prev_cluster = clusters[-1]
+            prev_y1 = max(b[3] for b in prev_cluster)
+            if bbox[2] - prev_y1 < impl_sp:
+                prev_cluster.append(bbox)
+            else:
+                clusters.append([bbox])
 
-            x0_min = min(x0_min, dx0 - impl_enc)
-            x1_max = max(x1_max, dx1 + impl_enc)
-            y0_min = min(y0_min, dy0 - impl_enc)
-            y1_max = max(y1_max, dy1 + impl_enc)
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            x0 = min(b[0] for b in cluster)
+            x1 = max(b[1] for b in cluster)
+            y0 = min(b[2] for b in cluster)
+            y1 = max(b[3] for b in cluster)
+            comp.add_polygon(
+                [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+                layer=lyr,
+            )
 
-        # Draw merged implant covering all devices of this type in this row pair
+
+def _merge_nwells_stacked(
+    comp:   Any,
+    placed: dict[str, PlacedDevice],
+    rules:  PDKRules,
+) -> None:
+    """Draw one merged nwell per cluster of PMOS devices in stacked layouts.
+
+    Individual PMOS transistors draw their own nwell, but adjacent nwells
+    closer than ``nwell.spacing_min_um`` (1.27 µm) violate nwell.2.  In a
+    stacked layout the safest fix is to merge all PMOS nwells into one
+    continuous region (or per-cluster when gaps are large enough).
+    """
+    from layout_gen.cells.standard import _diff_y
+
+    nw_enc = rules.nwell.get("enclosure_of_pdiff_um", 0.18)
+    nw_sp  = rules.nwell.get("spacing_min_um", 1.27)
+
+    pmos_devs = [d for d in placed.values() if d.spec.device_type == "pmos"]
+    if len(pmos_devs) < 2:
+        return
+
+    # Compute nwell bbox per device
+    boxes: list[tuple[float, float, float, float]] = []
+    for dev in pmos_devs:
+        dy0, dy1 = _diff_y(dev.geom, rules)
+        boxes.append((
+            dev.x - nw_enc,
+            dev.x + dev.geom.total_x_um + nw_enc,
+            dy0 + dev.y - nw_enc,
+            dy1 + dev.y + nw_enc,
+        ))
+
+    # Sort by Y bottom, cluster nwells that are closer than nw_sp
+    boxes.sort(key=lambda b: b[2])
+    clusters: list[list[tuple]] = [[boxes[0]]]
+    for box in boxes[1:]:
+        prev_y1 = max(b[3] for b in clusters[-1])
+        if box[2] - prev_y1 < nw_sp:
+            clusters[-1].append(box)
+        else:
+            clusters.append([box])
+
+    lyr = rules.layer("nwell")
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        x0 = min(b[0] for b in cluster)
+        x1 = max(b[1] for b in cluster)
+        y0 = min(b[2] for b in cluster)
+        y1 = max(b[3] for b in cluster)
         comp.add_polygon(
-            [(x0_min, y0_min), (x1_max, y0_min),
-             (x1_max, y1_max), (x0_min, y1_max)],
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
             layer=lyr,
         )
 
