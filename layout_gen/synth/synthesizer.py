@@ -206,9 +206,21 @@ class Synthesizer:
             geo_loop = GeoFixLoop(self.geo_agent, self.drc_runner, self.rules)
             geo_result = geo_loop.run(comp, max_iter=self.geo_max_iter)
             if geo_result.converged:
-                comp = geo_result.state.to_component(self.rules,
-                                                     name=_cell_name(template, 0))
-                return SynthResult(comp, placed, current_params,
+                geo_comp = geo_result.state.to_component(
+                    self.rules, name=_cell_name(template, 0))
+                # Carry over ports from the original component
+                for port in comp.ports:
+                    try:
+                        geo_comp.add_port(
+                            port.name,
+                            center=port.center,
+                            width=port.width,
+                            orientation=port.orientation,
+                            layer=port.layer,
+                        )
+                    except Exception:
+                        pass
+                return SynthResult(geo_comp, placed, current_params,
                                    [], iteration + geo_result.iterations, True)
             violations = geo_result.violations
 

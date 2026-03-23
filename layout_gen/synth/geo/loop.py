@@ -36,6 +36,8 @@ from layout_gen.synth.geo.agent      import GeoFixAgent
 
 log = logging.getLogger(__name__)
 
+_geo_counter = 0
+
 
 @dataclass
 class FixRecord:
@@ -152,7 +154,9 @@ class GeoFixLoop:
 
     def _run_drc(self, state: LayoutState) -> list[DRCViolation]:
         """Export state to GDS, run DRC, return violations."""
-        comp = state.to_component(self.rules, name="geo_fix_check")
+        global _geo_counter
+        _geo_counter += 1
+        comp = state.to_component(self.rules, name=f"geo_fix_check_{_geo_counter}")
         with tempfile.TemporaryDirectory() as tmpdir:
             gds = Path(tmpdir) / "check.gds"
             comp.write_gds(str(gds))
