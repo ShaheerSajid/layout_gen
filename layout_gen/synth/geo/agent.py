@@ -119,7 +119,13 @@ class RuleGeoAgent(GeoFixAgent):
     # ── Spacing ──────────────────────────────────────────────────────────────
 
     def _fix_spacing(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
-        """Spacing violation: two shapes too close → move them apart."""
+        """Spacing violation: two shapes too close → shrink facing edges.
+
+        Prefers StretchEdge (shrinking the facing edge inward) over MoveShape,
+        because moving an entire shape breaks contact/via alignment and causes
+        cascading violations.  Falls back to MoveShape only when shrinking
+        would make a shape narrower than the layer's minimum width.
+        """
         layer = v.layer
         shapes = state.near(v.x, v.y, self.search_radius, layer=layer)
         if len(shapes) < 2:
@@ -143,16 +149,98 @@ class RuleGeoAgent(GeoFixAgent):
             return []
 
         a, b = best_pair
-        # min_gap = target gap (required), not deficit (required - measured)
-        needed = v.required + _EPS if v.required > 0 else v.deficit + _EPS
-        if needed <= 0:
-            needed = 0.01
+        # Total gap increase needed
+        deficit = v.deficit + _EPS if v.deficit > 0 else v.required - best_dist + _EPS
+        if deficit <= 0:
+            deficit = 0.01
 
-        # Move the smaller shape away from the larger one
-        mover, anchor = (a, b) if a.area <= b.area else (b, a)
-        dx, dy = self._repulsion_vector(mover, anchor, needed)
+        # Determine separation axis: which edges face each other?
+        # X-separated: a.x1 ≤ b.x0 or b.x1 ≤ a.x0
+        # Y-separated: a.y1 ≤ b.y0 or b.y1 ≤ a.y0
+        gap_x = max(a.x0 - b.x1, b.x0 - a.x1)  # positive = separated in X
+        gap_y = max(a.y0 - b.y1, b.y0 - a.y1)  # positive = separated in Y
 
-        return [MoveShape(rid=mover.rid, dx=dx, dy=dy)]
+        # Pick the axis with the actual spacing gap (positive = separated)
+        if gap_x > 0 and (gap_y <= 0 or gap_x <= gap_y):
+            # Separated in X — shrink facing edges
+            if a.cx < b.cx:
+                left, right = a, b  # a is left, b is right
+            else:
+                left, right = b, a
+            return self._stretch_facing_edges(
+                state, left, "right", right, "left", deficit, "width")
+        elif gap_y > 0:
+            # Separated in Y — shrink facing edges
+            if a.cy < b.cy:
+                bot, top = a, b
+            else:
+                bot, top = b, a
+            return self._stretch_facing_edges(
+                state, bot, "top", top, "bottom", deficit, "height")
+        else:
+            # Overlapping — fall back to MoveShape
+            mover, anchor = (a, b) if a.area <= b.area else (b, a)
+            needed = v.required + _EPS if v.required > 0 else deficit
+            dx, dy = self._repulsion_vector(mover, anchor, needed)
+            return [MoveShape(rid=mover.rid, dx=dx, dy=dy)]
+
+    def _stretch_facing_edges(
+        self,
+        state:      LayoutState,
+        shape_a:    Rect,
+        edge_a:     str,       # edge of shape_a that faces shape_b
+        shape_b:    Rect,
+        edge_b:     str,       # edge of shape_b that faces shape_a
+        deficit:    float,
+        dim_attr:   str,       # "width" or "height" — the dimension being shrunk
+    ) -> list[Action]:
+        """Shrink facing edges to increase gap by *deficit*.
+
+        Splits the shrink between both shapes when possible.  Falls back to
+        MoveShape on the smaller shape if shrinking would make either shape
+        narrower than a safe minimum (contact size + 2× enclosure).
+        """
+        min_dim = 0.0
+        if self.rules is not None:
+            c_size = self.rules.contacts.get("size_um", 0.17)
+            c_enc  = self.rules.contacts.get("enclosure_in_diff_um", 0.06)
+            min_dim = c_size + 2 * c_enc  # minimum safe dimension
+
+        dim_a = getattr(shape_a, dim_attr)
+        dim_b = getattr(shape_b, dim_attr)
+
+        # How much each shape can safely shrink
+        slack_a = max(0.0, dim_a - min_dim)
+        slack_b = max(0.0, dim_b - min_dim)
+        total_slack = slack_a + slack_b
+
+        if total_slack >= deficit:
+            # Split deficit proportionally to available slack
+            if slack_a >= deficit and slack_b >= deficit:
+                # Both can absorb it — split evenly
+                half = deficit / 2
+                return [
+                    StretchEdge(shape_a.rid, edge_a, -half),
+                    StretchEdge(shape_b.rid, edge_b, -half),
+                ]
+            elif slack_a >= deficit:
+                # Only A can absorb the full deficit
+                return [StretchEdge(shape_a.rid, edge_a, -deficit)]
+            elif slack_b >= deficit:
+                return [StretchEdge(shape_b.rid, edge_b, -deficit)]
+            else:
+                # Split: each absorbs what it can
+                return [
+                    StretchEdge(shape_a.rid, edge_a, -slack_a),
+                    StretchEdge(shape_b.rid, edge_b, -(deficit - slack_a)),
+                ]
+        else:
+            # Not enough slack — fall back to MoveShape on the smaller shape
+            mover, anchor = ((shape_a, shape_b) if shape_a.area <= shape_b.area
+                             else (shape_b, shape_a))
+            needed = deficit
+            dx, dy = self._repulsion_vector(mover, anchor, needed)
+            return [MoveShape(rid=mover.rid, dx=dx, dy=dy)]
 
     # ── Width ────────────────────────────────────────────────────────────────
 

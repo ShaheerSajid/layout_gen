@@ -428,8 +428,16 @@ class TestRuleGeoAgent:
         )
         agent = RuleGeoAgent(search_radius=3.0)
         actions = agent.propose_fix(s, v)
-        assert len(actions) == 1
-        assert isinstance(actions[0], MoveShape)
+        # Agent should shrink facing edges (StretchEdge) rather than move
+        assert len(actions) == 2
+        assert all(isinstance(a, StretchEdge) for a in actions)
+        # First shape's right edge and second shape's left edge should shrink
+        edges = {a.edge for a in actions}
+        assert "right" in edges
+        assert "left" in edges
+        # Total shrink should cover the deficit
+        total_shrink = sum(abs(a.delta) for a in actions)
+        assert total_shrink >= 0.09  # deficit = 0.09
 
     def test_fix_width(self):
         """Narrow met1 shape → agent proposes StretchEdge pair."""
