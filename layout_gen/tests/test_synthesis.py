@@ -231,3 +231,112 @@ class TestDRCClean:
             f"Bit cell has {len(result.violations)} DRC violation(s):\n"
             + "\n".join(f"  {v}" for v in result.violations[:5])
         )
+
+
+# ── Stacked layout tests ────────────────────────────────────────────────────
+
+class TestStackedPlacement:
+    """Verify stacked multi-row placement for DIDO column peripheral."""
+
+    @pytest.fixture(scope="class")
+    def rules(self):
+        return load_pdk()
+
+    @pytest.fixture(scope="class")
+    def template(self):
+        return load_template("dido")
+
+    @pytest.fixture(scope="class")
+    def placed(self, rules, template):
+        from layout_gen.synth.placer import Placer
+        return Placer(rules, {"w": 0.42, "l": 0.15}).place(template)
+
+    def test_layout_mode(self, template):
+        assert template.layout_mode == "stacked"
+
+    def test_row_pair_count(self, template):
+        assert len(template.row_pairs) == 10
+
+    def test_device_count(self, placed):
+        assert len(placed) == 21
+
+    def test_cell_width_within_column(self, placed):
+        """All devices must fit within bit cell column width (~1.5 µm)."""
+        x_max = max(d.x + d.geom.total_x_um for d in placed.values())
+        assert x_max <= 1.5, f"Cell width {x_max:.3f} µm exceeds column pitch"
+
+    def test_abutment_overlap(self, placed):
+        """Abutting devices in the same row pair should share one S/D region."""
+        # Row 0 NMOS: N_PB and N_PD should abut (N_PD starts before N_PB ends)
+        n_pb = placed["N_PB"]
+        n_pd = placed["N_PD"]
+        overlap = (n_pb.x + n_pb.geom.total_x_um) - n_pd.x
+        expected = n_pb.geom.sd_length_um
+        assert _approx(overlap, expected, tol=0.001), (
+            f"NMOS abutment overlap {overlap:.3f} != sd_length {expected:.3f}"
+        )
+
+    def test_sd_flip_flags(self, placed):
+        """Devices with sd_flip should have it set."""
+        assert placed["N_PB"].spec.sd_flip is True
+        assert placed["P_PB"].spec.sd_flip is True
+        assert placed["N_SB"].spec.sd_flip is True
+        assert placed["N_PD"].spec.sd_flip is False
+        assert placed["N_NA"].spec.sd_flip is False
+
+    def test_sd_flip_terminal_swap(self, rules, placed):
+        """Flipped device should have S and D positions swapped."""
+        from layout_gen.synth.placer import resolve_terminal
+
+        # N_PB is flipped: D should be on LEFT (j=0), S on RIGHT (j=nf)
+        t_d = resolve_terminal("N_PB.D", placed, rules)
+        t_s = resolve_terminal("N_PB.S", placed, rules)
+        # D center X should be less than S center X (D on left when flipped)
+        d_cx = (t_d.x0 + t_d.x1) / 2
+        s_cx = (t_s.x0 + t_s.x1) / 2
+        assert d_cx < s_cx, (
+            f"Flipped N_PB: D center ({d_cx:.3f}) should be left of S ({s_cx:.3f})"
+        )
+
+        # N_PD is NOT flipped: S on LEFT, D on RIGHT
+        t_d2 = resolve_terminal("N_PD.D", placed, rules)
+        t_s2 = resolve_terminal("N_PD.S", placed, rules)
+        d2_cx = (t_d2.x0 + t_d2.x1) / 2
+        s2_cx = (t_s2.x0 + t_s2.x1) / 2
+        assert s2_cx < d2_cx, (
+            f"Normal N_PD: S center ({s2_cx:.3f}) should be left of D ({d2_cx:.3f})"
+        )
+
+    def test_row_pairs_vertically_ordered(self, placed, template):
+        """Row pairs should be stacked vertically — later rows at higher Y."""
+        for i in range(len(template.row_pairs) - 1):
+            rp_a = template.row_pairs[i]
+            rp_b = template.row_pairs[i + 1]
+            devs_a = [placed[n] for n in rp_a.nmos_devices + rp_a.pmos_devices if n in placed]
+            devs_b = [placed[n] for n in rp_b.nmos_devices + rp_b.pmos_devices if n in placed]
+            if devs_a and devs_b:
+                max_y_a = max(d.y + d.geom.total_y_um for d in devs_a)
+                min_y_b = min(d.y for d in devs_b)
+                assert max_y_a < min_y_b, (
+                    f"Row pair {rp_a.id} top ({max_y_a:.3f}) overlaps "
+                    f"row pair {rp_b.id} bottom ({min_y_b:.3f})"
+                )
+
+    def test_pmos_only_rows_no_nmos(self, placed, template):
+        """PMOS-only row pairs should have no NMOS placement."""
+        for rp in template.row_pairs:
+            if not rp.nmos_devices:
+                # All devices in this row pair should be PMOS
+                for name in rp.pmos_devices:
+                    assert placed[name].spec.device_type == "pmos"
+
+    def test_synth_produces_ports(self, rules, template):
+        """Full synthesis should produce all 11 ports."""
+        synth = Synthesizer(rules)
+        result = synth.synthesize(template, {"w": 0.42, "l": 0.15})
+        port_names = {p.name for p in result.component.ports}
+        expected = {"PCHG", "SEL", "WREN", "BL", "BL_",
+                    "DR", "DR_", "DW", "DW_", "VDD", "VSS"}
+        assert port_names == expected, (
+            f"Port mismatch. Got: {sorted(port_names)} Expected: {sorted(expected)}"
+        )
