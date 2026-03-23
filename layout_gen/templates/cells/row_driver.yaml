@@ -13,7 +13,7 @@
 #
 #   Output inverter stage (2 transistors, wider for high drive):
 #     N_INV NMOS  G=Y_nd  D=B     S=GND   — inverter pull-down (W=0.42)
-#     P_INV PMOS  G=Y_nd  D=B     S=VDD   — inverter pull-up  (W=1.624)
+#     P_INV PMOS  G=Y_nd  D=B     S=VDD   — inverter pull-up  (W=1.624, 4 fingers → W/f=0.406)
 #
 # net1  = NMOS internal node (N_A.D / N_WL.S abutting)
 # Y_nd  = NAND2 output = inverter input   (active low)
@@ -36,9 +36,9 @@ devices:
   P_A:   {template: planar_mosfet, type: pmos, terminals: {G: A,    D: Y_nd, S: VDD}}
   P_WL:  {template: planar_mosfet, type: pmos, terminals: {G: WLEN, D: Y_nd, S: VDD}}
 
-  # Output inverter stage (wider PMOS for drive strength)
+  # Output inverter stage (wider PMOS for drive strength, split across 4 fingers to reduce height)
   N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}}
-  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}}
+  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, fingers: 4}
 
 # ── Nets ──────────────────────────────────────────────────────────────────────
 nets: [A, WLEN, Y_nd, B, VDD, GND, net1]

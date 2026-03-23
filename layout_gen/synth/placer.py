@@ -145,9 +145,17 @@ def global_gate_x(dev: PlacedDevice, finger: int = 0) -> tuple[float, float]:
     return lx0 + dev.x, lx1 + dev.x
 
 
-def global_sd_x(dev: PlacedDevice, j: int) -> tuple[float, float]:
-    """Global (x0, x1) of the *j*-th source/drain region."""
-    lx0, lx1 = _sd_x(j, dev.geom)
+def global_sd_x(
+    dev:   PlacedDevice,
+    j:     int,
+    rules: PDKRules | None = None,
+) -> tuple[float, float]:
+    """Global (x0, x1) of the *j*-th source/drain region.
+
+    When *rules* is provided, li1 pullback is applied (matching the
+    geometry produced by :func:`~layout_gen.transistor.draw_transistor`).
+    """
+    lx0, lx1 = _sd_x(j, dev.geom, rules)
     return lx0 + dev.x, lx1 + dev.x
 
 
@@ -219,15 +227,29 @@ class Placer:
         return self.params.get(f"l_{dev_name.lower()}") or self.params.get("l") or _DEFAULT_L
 
     def _compute_geoms(self, template: CellTemplate) -> dict[str, TransistorGeom]:
-        return {
-            name: transistor_geom(
+        from dataclasses import replace as _replace
+        result: dict[str, TransistorGeom] = {}
+        for name, spec in template.devices.items():
+            geom = transistor_geom(
                 self._w(name, spec.device_type),
                 self._l(name),
                 spec.device_type,
                 self.rules,
             )
-            for name, spec in template.devices.items()
-        }
+            n = int(spec.fingers)
+            if n > 0 and n != geom.n_fingers:
+                w_f    = geom.w_um / n
+                endcap = self.rules.poly["endcap_over_diff_um"]
+                geom   = _replace(
+                    geom,
+                    n_fingers    = n,
+                    w_finger_um  = w_f,
+                    total_x_um   = (n + 1) * geom.sd_length_um + n * geom.l_um,
+                    total_y_um   = w_f + 2 * endcap,
+                    n_contacts_y = self.rules.sd_contact_columns(w_f),
+                )
+            result[name] = geom
+        return result
 
     def _place_devices(
         self,

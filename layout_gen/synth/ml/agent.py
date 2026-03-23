@@ -1,17 +1,29 @@
 """
 layout_gen.synth.ml.agent — ML-guided parameter optimiser.
 
-Wraps a trained :class:`~layout_gen.synth.ml.model.MarginPredictor` and exposes
-it as an ``MLModel`` callable compatible with
-:class:`~layout_gen.synth.synthesizer.Synthesizer`.
+Wraps a trained :class:`~layout_gen.synth.ml.model.MarginPredictor` and
+optimises cell parameters to maximise DRC margin while minimising area.
 
-The optimiser finds the ``(w_N, w_P, l, gap_y, finger_N, finger_P)`` vector
-that maximises the minimum predicted DRC margin across all 10 rules (i.e. the
-most room from any violation).  scipy Nelder-Mead is used when available; a
-simple coordinate-descent fallback is used otherwise.
+Optimisation strategy
+---------------------
+1. **Multi-start L-BFGS-B** — gradient-free bounds are natively respected
+   (unlike Nelder-Mead which only clips post-hoc).  Multiple initial points
+   avoid local-minima traps.
 
-``finger_N`` and ``finger_P`` use continuous relaxation during optimisation and
-are rounded to the nearest integer in the returned parameter dict.
+2. **Lower Confidence Bound (LCB)** acquisition — when the model provides
+   uncertainty estimates (ensemble disagreement), the objective becomes::
+
+       LCB(x) = mean_min_margin(x) - kappa * std_min_margin(x)
+
+   This balances exploitation (large predicted margin) with exploration
+   (high uncertainty → worth investigating).
+
+3. **Area-aware objective** — a penalty term discourages unnecessarily large
+   cells.  The combined objective is::
+
+       obj(x) = -min_margin(x) + alpha * area(x) / area_ref
+
+   where ``alpha`` controls the area penalty weight (default 0.1).
 
 Usage::
 
@@ -35,25 +47,59 @@ import numpy as np
 from layout_gen.pdk              import PDKRules
 from layout_gen.synth.ml.features import cell_features
 from layout_gen.synth.ml.model    import MarginPredictor
+from layout_gen.transistor        import transistor_geom
+from layout_gen.cells.standard    import _inter_cell_gap
 
 
-# ── Exceptions ────────────────────────────────────────────────────────────────
+# ── Exceptions ────────────────────────────────────────────────────────────
 
 class ModelNotTrainedError(RuntimeError):
     """Raised when :class:`MLAgent` is asked to optimise without a model."""
 
 
-# ── Bounds ────────────────────────────────────────────────────────────────────
+# ── Bounds ────────────────────────────────────────────────────────────────
 
 # Physically reasonable search bounds for sky130 (and similar nodes).
-# Widths and lengths in µm; finger counts are continuous relaxations of integers.
-_W_MIN,      _W_MAX      = 0.15, 5.0   # per-finger total channel width
-_L_MIN,      _L_MAX      = 0.15, 2.0   # gate length
-_GAP_MIN,    _GAP_MAX    = 0.00, 0.50  # Y gap between NMOS/PMOS rows (µm)
-_FINGER_MIN, _FINGER_MAX = 1.0,  4.0   # gate finger count (rounded to int at output)
+_W_MIN,      _W_MAX      = 0.15, 5.0   # total channel width (µm)
+_L_MIN,      _L_MAX      = 0.15, 2.0   # gate length (µm)
+_GAP_MIN,    _GAP_MAX    = 0.00, 0.50  # Y gap between NMOS/PMOS rows
+_FINGER_MIN, _FINGER_MAX = 1.0,  4.0   # finger count (continuous relaxation)
+
+_BOUNDS = [
+    (_W_MIN,      _W_MAX),
+    (_W_MIN,      _W_MAX),
+    (_L_MIN,      _L_MAX),
+    (_GAP_MIN,    _GAP_MAX),
+    (_FINGER_MIN, _FINGER_MAX),
+    (_FINGER_MIN, _FINGER_MAX),
+]
+
+_LO = np.array([b[0] for b in _BOUNDS])
+_HI = np.array([b[1] for b in _BOUNDS])
 
 
-# ── MLAgent ───────────────────────────────────────────────────────────────────
+# ── Area computation ─────────────────────────────────────────────────────
+
+def _cell_area(x: np.ndarray, rules: PDKRules) -> float:
+    """Estimate cell area (µm²) from parameter vector."""
+    w_N, w_P, l, gap_y, fn, fp = (
+        float(x[0]), float(x[1]), float(x[2]),
+        float(x[3]), float(x[4]), float(x[5]),
+    )
+    try:
+        from layout_gen.synth.ml.features import _geom_override_fingers
+        ng = transistor_geom(w_N, l, "nmos", rules)
+        pg = transistor_geom(w_P, l, "pmos", rules)
+        ng = _geom_override_fingers(ng, max(1, int(round(fn))), rules)
+        pg = _geom_override_fingers(pg, max(1, int(round(fp))), rules)
+        width  = max(ng.total_x_um, pg.total_x_um)
+        height = ng.total_y_um + gap_y + pg.total_y_um
+        return width * height
+    except Exception:
+        return 1e6
+
+
+# ── MLAgent ───────────────────────────────────────────────────────────────
 
 class MLAgent:
     """ML-guided cell parameter optimiser.
@@ -62,89 +108,130 @@ class MLAgent:
     ----------
     model :
         A fitted :class:`~layout_gen.synth.ml.model.MarginPredictor`.
+    n_restarts :
+        Number of random restarts for multi-start optimization.
+    alpha :
+        Area penalty weight in the objective (0 = ignore area).
+    kappa :
+        Exploration weight for LCB acquisition (0 = pure exploitation).
     step :
-        Coordinate-descent step size in µm (used only when scipy is absent).
+        Coordinate-descent step size (fallback when scipy is absent).
     """
 
     def __init__(
         self,
-        model: MarginPredictor,
-        step:  float = 0.01,
+        model:      MarginPredictor,
+        n_restarts: int   = 5,
+        alpha:      float = 0.1,
+        kappa:      float = 1.0,
+        step:       float = 0.01,
     ):
-        self.model = model
-        self.step  = step
+        self.model      = model
+        self.n_restarts = n_restarts
+        self.alpha      = alpha
+        self.kappa      = kappa
+        self.step       = step
 
-    # ── Factory ───────────────────────────────────────────────────────────────
+    # ── Factory ───────────────────────────────────────────────────────────
 
     @classmethod
     def load(cls, path: str | Path, **kwargs) -> "MLAgent":
-        """Load a saved :class:`MarginPredictor` and wrap it in an MLAgent.
-
-        Parameters
-        ----------
-        path :
-            Path to the ``.pkl`` file produced by
-            :meth:`~layout_gen.synth.ml.model.MarginPredictor.save`.
-        **kwargs :
-            Forwarded to :class:`MLAgent.__init__` (e.g. ``step``).
-        """
+        """Load a saved model and wrap it in an MLAgent."""
         model = MarginPredictor.load(path)
         return cls(model, **kwargs)
 
-    # ── Objective ─────────────────────────────────────────────────────────────
+    # ── Objective ─────────────────────────────────────────────────────────
 
     def _objective(
         self,
         x:     np.ndarray,
         rules: PDKRules,
+        area_ref: float,
     ) -> float:
-        """Negative minimum DRC margin (to be minimised by the optimiser)."""
-        w_N, w_P, l      = float(x[0]), float(x[1]), float(x[2])
-        gap_y, fn, fp     = float(x[3]), float(x[4]), float(x[5])
+        """Combined objective: -min_margin + area_penalty + uncertainty_penalty.
+
+        Lower is better (minimisation target).
+        """
+        w_N, w_P, l = float(x[0]), float(x[1]), float(x[2])
+        gap_y, fn, fp = float(x[3]), float(x[4]), float(x[5])
         try:
             feat = cell_features(
                 w_N, w_P, l, rules,
                 gap_y=gap_y, finger_N=fn, finger_P=fp,
             )
         except Exception:
-            return 1e6   # degenerate geometry → high penalty
-        margins = self.model.predict(feat)
-        return -float(np.min(margins))
+            return 1e6
 
-    # ── Optimisers ────────────────────────────────────────────────────────────
+        result = self.model.predict(feat, return_std=True)
+        if isinstance(result, tuple):
+            margins, std = result
+        else:
+            margins, std = result, np.zeros_like(result)
+
+        min_margin = float(np.min(margins))
+
+        # LCB: penalise uncertainty (explore regions where model is unsure)
+        min_std = float(np.max(std))  # worst-case uncertainty
+        lcb = min_margin - self.kappa * min_std
+
+        # Area penalty: normalised by reference area
+        area = _cell_area(x, rules)
+        area_term = self.alpha * (area / area_ref) if area_ref > 0 else 0
+
+        return -lcb + area_term
+
+    # ── Optimisers ────────────────────────────────────────────────────────
 
     def _optimise_scipy(
         self,
-        x0:    np.ndarray,
-        rules: PDKRules,
-    ) -> np.ndarray:
-        """Nelder-Mead optimisation via scipy."""
-        from scipy.optimize import minimize, Bounds
+        x0:       np.ndarray,
+        rules:    PDKRules,
+        area_ref: float,
+    ) -> tuple[np.ndarray, float]:
+        """Multi-start L-BFGS-B optimisation."""
+        from scipy.optimize import minimize
 
-        bounds = Bounds(
-            lb=[_W_MIN, _W_MIN, _L_MIN, _GAP_MIN, _FINGER_MIN, _FINGER_MIN],
-            ub=[_W_MAX, _W_MAX, _L_MAX, _GAP_MAX, _FINGER_MAX, _FINGER_MAX],
-        )
-        res = minimize(
-            self._objective,
-            x0,
-            args=(rules,),
-            method="Nelder-Mead",
-            bounds=bounds,
-            options={"maxiter": 800, "xatol": 1e-4, "fatol": 1e-6},
-        )
-        return res.x
+        bounds = list(_BOUNDS)
+        best_x = x0.copy()
+        best_f = self._objective(x0, rules, area_ref)
+
+        # Generate diverse starting points
+        rng = np.random.default_rng(42)
+        starts = [x0]
+        for _ in range(self.n_restarts - 1):
+            x_rand = rng.uniform(_LO, _HI)
+            # Round finger counts
+            x_rand[4] = round(x_rand[4])
+            x_rand[5] = round(x_rand[5])
+            starts.append(x_rand)
+
+        for x_start in starts:
+            try:
+                res = minimize(
+                    self._objective,
+                    x_start,
+                    args=(rules, area_ref),
+                    method="L-BFGS-B",
+                    bounds=bounds,
+                    options={"maxiter": 200, "ftol": 1e-8},
+                )
+                if res.fun < best_f:
+                    best_x = res.x
+                    best_f = res.fun
+            except Exception:
+                continue
+
+        return best_x, best_f
 
     def _optimise_coord(
         self,
-        x0:    np.ndarray,
-        rules: PDKRules,
-    ) -> np.ndarray:
-        """Simple coordinate-descent fallback (no scipy required)."""
+        x0:       np.ndarray,
+        rules:    PDKRules,
+        area_ref: float,
+    ) -> tuple[np.ndarray, float]:
+        """Coordinate-descent fallback (no scipy required)."""
         x = x0.copy()
-        f = self._objective(x, rules)
-        lo = np.array([_W_MIN, _W_MIN, _L_MIN, _GAP_MIN, _FINGER_MIN, _FINGER_MIN])
-        hi = np.array([_W_MAX, _W_MAX, _L_MAX, _GAP_MAX, _FINGER_MAX, _FINGER_MAX])
+        f = self._objective(x, rules, area_ref)
 
         improved = True
         while improved:
@@ -152,46 +239,28 @@ class MLAgent:
             for i in range(len(x)):
                 for delta in (self.step, -self.step):
                     x_try    = x.copy()
-                    x_try[i] = np.clip(x_try[i] + delta, lo[i], hi[i])
-                    f_try    = self._objective(x_try, rules)
+                    x_try[i] = np.clip(x_try[i] + delta, _LO[i], _HI[i])
+                    f_try    = self._objective(x_try, rules, area_ref)
                     if f_try < f - 1e-8:
                         x, f     = x_try, f_try
                         improved = True
-        return x
+        return x, f
 
-    # ── MLModel callable ──────────────────────────────────────────────────────
+    # ── MLModel callable ──────────────────────────────────────────────────
 
     def __call__(
         self,
-        template: Any,           # CellTemplate (not imported to avoid circulars)
+        template: Any,
         rules:    PDKRules,
-        violations: list,        # list[DRCViolation]
+        violations: list,
         params:   dict,
     ) -> dict:
         """Suggest improved cell parameters.
 
-        This method matches the ``MLModel`` protocol expected by
+        Matches the ``MLModel`` protocol expected by
         :class:`~layout_gen.synth.synthesizer.Synthesizer`.
-
-        Parameters
-        ----------
-        template :
-            Current cell template (unused; kept for protocol compatibility).
-        rules :
-            PDK rules used for feature extraction.
-        violations :
-            Current DRC violations (unused; ML objective drives optimisation).
-        params :
-            Current parameter dict.  Recognised keys: ``"w_N"``, ``"w_P"``,
-            ``"l"``, ``"gap_y"``, ``"finger_N"``, ``"finger_P"``.
-
-        Returns
-        -------
-        dict
-            Updated parameter dict with keys ``"w_N"``, ``"w_P"``, ``"l"``,
-            ``"gap_y"``, ``"finger_N"`` (int), ``"finger_P"`` (int).
         """
-        if self.model.pipeline_ is None:
+        if not self.model._models:
             raise ModelNotTrainedError(
                 "MLAgent has no fitted model.  "
                 "Train one with: python -m layout_gen.synth.ml.train"
@@ -206,30 +275,65 @@ class MLAgent:
 
         x0 = np.array([w_N, w_P, l, gap_y, finger_N, finger_P])
 
+        # Reference area for normalisation (area at initial params)
+        area_ref = max(_cell_area(x0, rules), 0.01)
+
         try:
             import scipy  # noqa: F401
-            x_opt = self._optimise_scipy(x0, rules)
+            x_opt, _ = self._optimise_scipy(x0, rules, area_ref)
         except ImportError:
-            x_opt = self._optimise_coord(x0, rules)
+            x_opt, _ = self._optimise_coord(x0, rules, area_ref)
 
-        w_N_opt  = float(np.clip(x_opt[0], _W_MIN,      _W_MAX))
-        w_P_opt  = float(np.clip(x_opt[1], _W_MIN,      _W_MAX))
-        l_opt    = float(np.clip(x_opt[2], _L_MIN,      _L_MAX))
-        gap_opt  = float(np.clip(x_opt[3], _GAP_MIN,    _GAP_MAX))
-        fn_opt   = int(round(np.clip(x_opt[4], _FINGER_MIN, _FINGER_MAX)))
-        fp_opt   = int(round(np.clip(x_opt[5], _FINGER_MIN, _FINGER_MAX)))
-
-        # Round continuous params to 2 decimal places — keeps GDS coordinates clean.
         return {
-            "w_N":      round(w_N_opt, 2),
-            "w_P":      round(w_P_opt, 2),
-            "l":        round(l_opt,   2),
-            "gap_y":    round(gap_opt, 3),
-            "finger_N": fn_opt,
-            "finger_P": fp_opt,
+            "w_N":      round(float(np.clip(x_opt[0], _W_MIN,      _W_MAX)), 2),
+            "w_P":      round(float(np.clip(x_opt[1], _W_MIN,      _W_MAX)), 2),
+            "l":        round(float(np.clip(x_opt[2], _L_MIN,      _L_MAX)), 2),
+            "gap_y":    round(float(np.clip(x_opt[3], _GAP_MIN,    _GAP_MAX)), 3),
+            "finger_N": int(round(np.clip(x_opt[4], _FINGER_MIN, _FINGER_MAX))),
+            "finger_P": int(round(np.clip(x_opt[5], _FINGER_MIN, _FINGER_MAX))),
+        }
+
+    # ── Standalone optimization (for scripts like run_ml_bitcell) ────────
+
+    def optimize(self, rules: PDKRules, x0: np.ndarray | None = None) -> dict:
+        """Run standalone optimization without the Synthesizer loop.
+
+        Parameters
+        ----------
+        rules :
+            PDK rules.
+        x0 :
+            Initial parameter vector [w_N, w_P, l, gap_y, fn, fp].
+            Defaults to ``[0.52, 0.42, 0.15, gap_min, 1, 1]``.
+
+        Returns
+        -------
+        dict
+            Optimised parameters.
+        """
+        if x0 is None:
+            gap_min = _inter_cell_gap(rules)
+            x0 = np.array([0.52, 0.42, 0.15, gap_min, 1.0, 1.0])
+
+        area_ref = max(_cell_area(x0, rules), 0.01)
+
+        try:
+            import scipy  # noqa: F401
+            x_opt, _ = self._optimise_scipy(x0, rules, area_ref)
+        except ImportError:
+            x_opt, _ = self._optimise_coord(x0, rules, area_ref)
+
+        return {
+            "w_N":      round(float(np.clip(x_opt[0], _W_MIN,      _W_MAX)), 2),
+            "w_P":      round(float(np.clip(x_opt[1], _W_MIN,      _W_MAX)), 2),
+            "l":        round(float(np.clip(x_opt[2], _L_MIN,      _L_MAX)), 2),
+            "gap_y":    round(float(np.clip(x_opt[3], _GAP_MIN,    _GAP_MAX)), 3),
+            "finger_N": int(round(np.clip(x_opt[4], _FINGER_MIN, _FINGER_MAX))),
+            "finger_P": int(round(np.clip(x_opt[5], _FINGER_MIN, _FINGER_MAX))),
         }
 
     def __repr__(self) -> str:
         return (
-            f"MLAgent(model={self.model!r}, step={self.step})"
+            f"MLAgent(model={self.model!r}, n_restarts={self.n_restarts}, "
+            f"alpha={self.alpha}, kappa={self.kappa})"
         )

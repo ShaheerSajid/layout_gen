@@ -168,6 +168,8 @@ def draw_transistor(
     l_um:        float,
     device_type: str,
     rules:       PDKRules = RULES,
+    *,
+    n_fingers:   int | None = None,
 ) -> "gf.Component":
     """Draw a single transistor and return a gdsfactory Component.
 
@@ -200,6 +202,18 @@ def draw_transistor(
         _GENERIC.activate()
 
     geom = transistor_geom(w_um, l_um, device_type, rules)
+    if n_fingers is not None and n_fingers != geom.n_fingers:
+        from dataclasses import replace as _replace
+        n   = max(1, int(n_fingers))
+        w_f = w_um / n
+        geom = _replace(
+            geom,
+            n_fingers    = n,
+            w_finger_um  = w_f,
+            total_x_um   = (n + 1) * geom.sd_length_um + n * l_um,
+            total_y_um   = w_f + 2 * rules.poly["endcap_over_diff_um"],
+            n_contacts_y = rules.sd_contact_columns(w_f),
+        )
     dev  = rules.device(device_type)
 
     # Unique cell name so repeated calls in the same Python session don't clash
@@ -306,9 +320,31 @@ def draw_transistor(
                 layer=lyr_contact,
             )
 
-        # li1 rail covering entire S/D region height
-        li_x0 = cx - geom.sd_length_um / 2
-        li_x1 = cx + geom.sd_length_um / 2
+        # li1 rail covering S/D region, pulled back from poly edge
+        # to maintain li1.2 spacing (li1 spacing >= li1_spacing_min).
+        # Without pullback, adjacent li1 rails are separated by only
+        # l_um (gate length), which violates li1.2 when l < li1_spacing.
+        li1_sp  = rules.li1.get("spacing_min_um", 0.17)
+        li_enc  = rules.contacts.get("enclosure_in_li1_um", 0.0)
+        half_sd = geom.sd_length_um / 2
+
+        # How much to pull back each li1 edge that faces a poly gate
+        pullback = max(0.0, (li1_sp - geom.l_um) / 2)
+        # Ensure li1 still encloses all contacts after pullback
+        max_pullback = half_sd - c_size / 2 - li_enc
+        pullback = min(pullback, max(0.0, max_pullback))
+
+        li_x0 = cx - half_sd
+        li_x1 = cx + half_sd
+
+        # Pull back edges adjacent to poly fingers
+        has_poly_left  = (j > 0)
+        has_poly_right = (j < geom.n_fingers)
+        if has_poly_left:
+            li_x0 += pullback
+        if has_poly_right:
+            li_x1 -= pullback
+
         c.add_polygon(
             [(li_x0, diff_y0), (li_x1, diff_y0),
              (li_x1, diff_y1), (li_x0, diff_y1)],

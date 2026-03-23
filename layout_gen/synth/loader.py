@@ -34,6 +34,7 @@ class DeviceSpec:
     template:     str              # "planar_mosfet"
     device_type:  str              # "nmos" | "pmos"
     terminals:    dict[str, str]   # {terminal: net}, e.g. {"G": "IN", "D": "OUT"}
+    fingers:      int  = 0         # 0 = auto (ceil(w / w_finger_max_um)); >0 = explicit
     # ── Floorplan fields (populated from floorplan section) ──────────────────
     region:       str  = "bottom"  # "bottom", "top", "bottom_only"
     in_nwell:     bool = False
@@ -130,6 +131,7 @@ def _parse_devices(raw: dict) -> dict[str, DeviceSpec]:
             template    = spec.get("template", "planar_mosfet"),
             device_type = spec.get("type", "nmos"),
             terminals   = dict(spec.get("terminals", {})),
+            fingers     = int(spec.get("fingers", 0)),
         )
     return devices
 

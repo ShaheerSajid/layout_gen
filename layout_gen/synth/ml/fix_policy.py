@@ -61,6 +61,8 @@ _RULE_FIX_PARAM: dict[str, int] = {
     "diff.2":     3,  # gap_y
     "nwell.1":    1,  # w_P
     "li1.1":      0,  # w_N
+    "li1.2":      2,  # l  (li1 gap across gate = gate length; increase l)
+    "poly.2":     3,  # gap_y  (increase device spacing via inter-cell gap)
 }
 
 # Tiny headroom added on top of rule boundary when computing fix delta
@@ -72,17 +74,17 @@ _EPS = 0.005   # µm
 class ViolationEncoder:
     """Encode a list of DRC violations + current params into a fixed-length vector.
 
-    Feature vector layout (31 floats):
-    - ``[0:10]``  — rule indicator: sum over violations of ``-margin``
-                   for each of the 10 MARGIN_NAMES (≥ 0 when violated).
-    - ``[10:16]`` — current parameter values (w_N, w_P, l, gap_y, finger_N, finger_P).
-    - ``[16:18]`` — centroid of violating geometry (x_mean, y_mean), µm.
-    - ``[18]``    — number of violations (scalar).
+    Feature vector layout (21 floats):
+    - ``[0:12]``  — rule indicator: sum over violations of ``-margin``
+                   for each of the 12 MARGIN_NAMES (≥ 0 when violated).
+    - ``[12:18]`` — current parameter values (w_N, w_P, l, gap_y, finger_N, finger_P).
+    - ``[18:20]`` — centroid of violating geometry (x_mean, y_mean), µm.
+    - ``[20]``    — number of violations (scalar).
     """
 
-    N_RULES    = len(MARGIN_NAMES)   # 10
+    N_RULES    = len(MARGIN_NAMES)   # 12
     N_PARAMS   = len(_PARAM_NAMES)   # 6
-    FEATURE_DIM = N_RULES + N_PARAMS + 2 + 1  # = 19... no: 10+6+2+1 = 19
+    FEATURE_DIM = N_RULES + N_PARAMS + 2 + 1  # = 12+6+2+1 = 21
 
     def encode(
         self,
@@ -90,7 +92,7 @@ class ViolationEncoder:
         params:     dict,
         rules:      PDKRules,
     ) -> np.ndarray:
-        """Return a (19,) feature vector describing *violations* and *params*."""
+        """Return a (21,) feature vector describing *violations* and *params*."""
         vec = np.zeros(self.FEATURE_DIM, dtype=np.float64)
 
         # Recompute analytical margins given current params
@@ -134,7 +136,7 @@ class FixDataset(NamedTuple):
     Attributes
     ----------
     X :
-        Violation-encoded feature matrix, shape ``(N, 19)``.
+        Violation-encoded feature matrix, shape ``(N, 21)``.
     y :
         Parameter delta matrix, shape ``(N, 6)``.
         Column order matches :data:`_PARAM_NAMES`.
@@ -263,10 +265,21 @@ def generate_fix_dataset(
                 # we need more fingers or wider device. Fix via increasing fp:
                 # If fp < 4: suggest fp+1 (which increases total_x_P by sd+l)
                 # Otherwise widen w_P.
-                if fn < 4:
+                if fp < 4:
                     delta[5] = max(delta[5], 1.0)  # finger_P += 1
                 else:
                     delta[p_idx] = max(delta[p_idx], deficit)
+
+            elif rule_name == "li1.2":
+                # li1 spacing across gate = l.  Need l >= li1_spacing_min.
+                # Increase l by deficit.
+                delta[p_idx] = max(delta[p_idx], deficit)
+
+            elif rule_name == "poly.2":
+                # Poly spacing between adjacent devices depends on diff spacing.
+                # When diff_spacing < poly_spacing_min, increase gap_y to push
+                # devices further apart.
+                delta[p_idx] = max(delta[p_idx], deficit)
 
         # Skip if no deltas were computed (shouldn't happen)
         if not np.any(delta > 0):

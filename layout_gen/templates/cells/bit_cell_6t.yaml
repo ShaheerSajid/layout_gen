@@ -80,6 +80,17 @@ routing:
     path:  [PD_R.D, PG_R.S]
     layer: li1
 
+  # Shared gate poly bridges (INV_L and INV_R gate poly continuity)
+  - net:   Q_
+    style: shared_gate_poly
+    path:  [PD_L.G, PU_L.G]
+    layer: poly
+
+  - net:   Q
+    style: shared_gate_poly
+    path:  [PD_R.G, PU_R.G]
+    layer: poly
+
   # Cross-coupling Q → INV_R gate (PD_R.G + PU_R.G)
   # track=0: met2 horizontal at gsc_y (lower track)
   - net:   Q

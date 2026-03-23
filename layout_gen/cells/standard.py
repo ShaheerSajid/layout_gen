@@ -49,10 +49,36 @@ def _activate_pdk() -> None:
 
 # ── Geometry helpers ──────────────────────────────────────────────────────────
 
-def _sd_x(j: int, geom: TransistorGeom) -> tuple[float, float]:
-    """(x0, x1) of the j-th source/drain li1 region in local transistor coords."""
+def _sd_x(
+    j: int,
+    geom: TransistorGeom,
+    rules: PDKRules | None = None,
+) -> tuple[float, float]:
+    """(x0, x1) of the j-th source/drain li1 region in local transistor coords.
+
+    When *rules* is provided, the edges adjacent to poly gate fingers are
+    pulled back to maintain ``li1.spacing_min_um`` (mirrors the pullback
+    applied in :func:`~layout_gen.transistor.draw_transistor`).
+    """
     x0 = j * (geom.sd_length_um + geom.l_um)
-    return x0, x0 + geom.sd_length_um
+    x1 = x0 + geom.sd_length_um
+
+    if rules is not None:
+        li1_sp   = rules.li1.get("spacing_min_um", 0.17)
+        c_size   = rules.contacts["size_um"]
+        li_enc   = rules.contacts.get("enclosure_in_li1_um", 0.0)
+        half_sd  = geom.sd_length_um / 2
+        pullback = max(0.0, (li1_sp - geom.l_um) / 2)
+        pullback = min(pullback, max(0.0, half_sd - c_size / 2 - li_enc))
+
+        has_poly_left  = (j > 0)
+        has_poly_right = (j < geom.n_fingers)
+        if has_poly_left:
+            x0 += pullback
+        if has_poly_right:
+            x1 -= pullback
+
+    return x0, x1
 
 
 def _gate_x(i: int, geom: TransistorGeom) -> tuple[float, float]:
@@ -189,7 +215,7 @@ def draw_inverter(
         _rect(c, gx0, gx1, ng.total_y_um, pmos_y, lyr_g)
 
     # OUT: drain = j=1 for a 1-finger device
-    dx0, dx1 = _sd_x(1, ng)
+    dx0, dx1 = _sd_x(1, ng, rules)
     # Li1 bridge from NMOS drain top to PMOS drain bottom
     _rect(c, dx0, dx1, nd_y1, pd_y0, lyr_li1)
 
@@ -278,18 +304,19 @@ def draw_nand2(
     # ── Series NMOS internal node: N_A drain → N_B source ────────────────────
     # N_A drain li1 right edge = sd+l+sd (= total_x); N_B source li1 left = x_off
     # Bridge li1 from N_A drain right to N_B source left (width = dev_spacing)
-    na_d_x0, na_d_x1 = _sd_x(1, ng)    # N_A drain x (local = global since x_off=0)
-    nb_s_x0, nb_s_x1 = x_off, x_off + sd
+    na_d_x0, na_d_x1 = _sd_x(1, ng, rules)    # N_A drain x (local = global since x_off=0)
+    nb_s_x0, nb_s_x1 = _sd_x(0, ng, rules)
+    nb_s_x0 += x_off; nb_s_x1 += x_off
     _rect(c, na_d_x1, nb_s_x0, nd_y0, nd_y1, lyr_li1)
 
     # ── OUT connection ────────────────────────────────────────────────────────
     # N_B drain (j=1 of N_B) → P_B drain (j=1 of P_B): vertical bridge at same X
-    nb_d_x0 = x_off + gx1     # = x_off + sd + l
-    nb_d_x1 = x_off + ng.total_x_um   # = x_off + 2*sd + l
+    nb_d_x0, nb_d_x1 = _sd_x(1, ng, rules)
+    nb_d_x0 += x_off; nb_d_x1 += x_off
     _rect(c, nb_d_x0, nb_d_x1, nd_y1, pd_y0, lyr_li1)   # vertical bridge
 
     # P_A drain (j=1 of P_A) → routing track → vertical bridge
-    pa_d_x0, pa_d_x1 = _sd_x(1, pg)  # local = global (P_A at x_off=0)
+    pa_d_x0, pa_d_x1 = _sd_x(1, pg, rules)  # local = global (P_A at x_off=0)
     # Routing track: horizontal li1 from P_A drain x to vertical bridge
     _rect(c, pa_d_x0, nb_d_x1, rt_y0, rt_y1, lyr_li1)
     # Vertical connector: P_A drain bottom (pd_y0) down to routing track top (rt_y1)
@@ -380,19 +407,20 @@ def draw_nor2(
     # ── Series PMOS internal node: P_A drain → P_B source ────────────────────
     # P_A drain (j=1) right edge = pa_d_x1 (global = local since x_off=0 for P_A)
     # P_B source (j=0) left edge = x_off
-    pa_d_x0, pa_d_x1 = _sd_x(1, pg)
-    pb_s_x0 = x_off
+    pa_d_x0, pa_d_x1 = _sd_x(1, pg, rules)
+    pb_s_x0, pb_s_x1 = _sd_x(0, pg, rules)
+    pb_s_x0 += x_off; pb_s_x1 += x_off
     _rect(c, pa_d_x1, pb_s_x0, pd_y0, pd_y1, lyr_li1)
 
     # ── OUT connection ────────────────────────────────────────────────────────
     # N_B drain (j=1 of N_B) and P_B drain (j=1 of P_B) share the same X column
-    nb_d_x0 = x_off + gx1            # = x_off + sd + l
-    nb_d_x1 = x_off + ng.total_x_um  # = x_off + 2*sd + l
+    nb_d_x0, nb_d_x1 = _sd_x(1, ng, rules)
+    nb_d_x0 += x_off; nb_d_x1 += x_off
     # Vertical bridge N_B drain → P_B drain
     _rect(c, nb_d_x0, nb_d_x1, nd_y1, pd_y0, lyr_li1)
 
     # N_A drain (j=1 of N_A) → routing track → merges into vertical bridge
-    na_d_x0, na_d_x1 = _sd_x(1, ng)
+    na_d_x0, na_d_x1 = _sd_x(1, ng, rules)
     # Routing track: horizontal li1 from N_A drain to vertical bridge
     _rect(c, na_d_x0, nb_d_x1, rt_y0, rt_y1, lyr_li1)
     # Vertical connector: N_A drain top (nd_y1) → routing track bottom (rt_y0)

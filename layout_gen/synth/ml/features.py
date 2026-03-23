@@ -16,7 +16,7 @@ MARGIN_NAMES : list[str]
 Functions
 ---------
 cell_features(w_N, w_P, l, rules, *, gap_y, finger_N, finger_P) -> np.ndarray  shape (23,)
-drc_margins(w_N, w_P, l, rules, *, gap_y, finger_N, finger_P)   -> np.ndarray  shape (10,)
+drc_margins(w_N, w_P, l, rules, *, gap_y, finger_N, finger_P)   -> np.ndarray  shape (12,)
 margin_vector(...)                                                -> alias for drc_margins
 
 The three optional keyword arguments extend the optimisation space:
@@ -78,7 +78,9 @@ MARGIN_NAMES: list[str] = [
     "diff.2",       # inter-cell diff-to-diff spacing >= 0
     "nwell.1",      # nwell wide enough to enclose PMOS diff
     "li1.1",        # drain bridge li1 width >= li1_width_min
-]  # 10 total
+    "li1.2",        # li1 spacing across gate (S/D li1 gap >= li1_spacing_min)
+    "poly.2",       # poly spacing between adjacent devices
+]  # 12 total
 
 
 # ── Geometry helper ───────────────────────────────────────────────────────────
@@ -215,7 +217,7 @@ def drc_margins(
 
     Returns
     -------
-    np.ndarray, shape (10,)
+    np.ndarray, shape (12,)
         See :data:`MARGIN_NAMES` for column order.
     """
     ng_base = transistor_geom(w_N, l, "nmos", rules)
@@ -279,6 +281,23 @@ def drc_margins(
     # li1.1 — drain bridge li1 width = sd_length must be >= li1_width_min
     m_li1_1 = sd_N - li1_wmin
 
+    # li1.2 — li1 spacing across gate: the gap between adjacent S/D li1 rails
+    #   equals the gate length after pullback.  With pullback applied on both
+    #   sides (pullback = max(0, (li1_sp - l) / 2)), the effective gap is:
+    #   gap = l + 2 * pullback = max(l, li1_sp).
+    #   Without pullback the gap = l.  The analytical margin measures the raw
+    #   gap so the model can learn when pullback is needed:
+    #   margin = l - li1_spacing_min   (negative when l < li1_sp)
+    li1_sp  = li["spacing_min_um"]
+    m_li1_2 = l - li1_sp
+
+    # poly.2 — poly spacing between adjacent devices (e.g. INV drain gate vs
+    #   adjacent PG gate in a bit cell).  The minimum gap = diff.spacing_min
+    #   (device-to-device spacing).  Margin = diff_spacing - poly_spacing_min.
+    poly_sp = p["spacing_min_um"]
+    diff_sp = d["spacing_min_um"]
+    m_poly2 = diff_sp - poly_sp
+
     return np.array([
         m_poly1,
         m_diff1_N, m_diff1_P,
@@ -287,6 +306,8 @@ def drc_margins(
         m_diff2,
         m_nwell1,
         m_li1_1,
+        m_li1_2,
+        m_poly2,
     ], dtype=np.float64)
 
 
