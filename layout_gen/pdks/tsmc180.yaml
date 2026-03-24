@@ -1,0 +1,138 @@
+# layout_gen PDK descriptor — TSMC 0.18 µm CMOS (1P6M)
+#
+# All dimensions in micrometres (µm) unless noted.
+# Sourced from TSMC 0.18um Mixed Signal RF GP II (CR018GPII_V1D0)
+# Calibre DRC deck v2.8a (T-018-LO-DR-001)
+#
+# IMPORTANT: This file is derived from the published design rule manual.
+# Verify against your licensed PDK before taping out.
+
+name: tsmc180
+description: TSMC 0.18um 1P6M Mixed Signal RF General Purpose II
+
+# ── Layer map: logical name → (GDS layer, GDS datatype) ──────────────────────
+#
+# Layer names follow layout_gen conventions (same logical names as sky130A).
+# TSMC names in comments.
+layers:
+  nwell:  {layer: 2,   datatype: 0}   # NWELL
+  diff:   {layer: 3,   datatype: 0}   # DIFF / OD (active diffusion)
+  poly:   {layer: 13,  datatype: 0}   # POLY1
+  nsdm:   {layer: 8,   datatype: 0}   # NIMP (N+ implant select)
+  psdm:   {layer: 7,   datatype: 0}   # PIMP (P+ implant select)
+  licon1: {layer: 15,  datatype: 0}   # CONT (contact)
+  li1:    {layer: 16,  datatype: 0}   # METAL1 — TSMC has no li1; map to met1
+  mcon:   {layer: 17,  datatype: 0}   # VIA12  — used as li1→met1 bridge
+  met1:   {layer: 16,  datatype: 0}   # METAL1
+  via1:   {layer: 17,  datatype: 0}   # VIA12
+  met2:   {layer: 18,  datatype: 0}   # METAL2
+  via2:   {layer: 27,  datatype: 0}   # VIA23
+  met3:   {layer: 28,  datatype: 0}   # METAL3
+  via3:   {layer: 29,  datatype: 0}   # VIA34
+  met4:   {layer: 31,  datatype: 0}   # METAL4
+  via4:   {layer: 32,  datatype: 0}   # VIA45
+  met5:   {layer: 33,  datatype: 0}   # METAL5
+
+# ── Layer display colours ────────────────────────────────────────────────────
+colors:
+  nwell:  {fill: "#ffd0e0", opacity: 0.35}
+  diff:   {fill: "#00c000", opacity: 0.50}
+  poly:   {fill: "#ff4040", opacity: 0.65}
+  nsdm:   {fill: "#ffe060", opacity: 0.30}
+  psdm:   {fill: "#6060ff", opacity: 0.30}
+  licon1: {fill: "#404040", opacity: 0.85}
+  li1:    {fill: "#4040ff", opacity: 0.50}
+  mcon:   {fill: "#303030", opacity: 0.85}
+  met1:   {fill: "#4040ff", opacity: 0.50}
+  via1:   {fill: "#303030", opacity: 0.85}
+  met2:   {fill: "#c000c0", opacity: 0.50}
+  via2:   {fill: "#303030", opacity: 0.85}
+  met3:   {fill: "#c08000", opacity: 0.50}
+  via3:   {fill: "#303030", opacity: 0.85}
+  met4:   {fill: "#00a0a0", opacity: 0.50}
+  via4:   {fill: "#303030", opacity: 0.85}
+  met5:   {fill: "#a0a000", opacity: 0.50}
+
+# ── Design rules ──────────────────────────────────────────────────────────────
+rules:
+  poly:
+    width_min_um:        0.18   # PO.W.3 — min poly interconnect width
+    spacing_min_um:      0.25   # PO.S.2 — min poly-to-poly space (no contact)
+    endcap_over_diff_um: 0.22   # PO.O.1 — poly must extend past OD edge
+
+  diff:
+    width_min_um:            0.22   # OD.W.1 — min OD width
+    spacing_min_um:          0.28   # OD.S.1 — min OD-to-OD space
+    extension_past_poly_um:  0.32   # PO.C.2 — OD must extend past gate in width dir
+
+  contacts:                         # CO rules
+    size_um:               0.22   # CO.W.1 — square contact cut
+    spacing_um:            0.25   # CO.S.1 — contact-to-contact spacing
+    enclosure_in_diff_um:  0.10   # CO.E.1 — OD must enclose contact on each side
+    enclosure_in_li1_um:   0.005  # M1.E.1 — met1 extension beyond contact (min)
+    enclosure_in_li1_2adj_um: 0.06  # M1.E.2 — met1 end-of-line extension beyond CO
+    space_to_poly_um:      0.16   # CO.C.1 — contact must clear gate edge
+    poly_enclosure_um:     0.10   # CO.E.2 — poly enclosure of poly-contact
+
+  met1:
+    width_min_um:   0.23   # M1.W.1
+    spacing_min_um: 0.23   # M1.S.1
+    area_min_um2:   0.202  # M1.A.1
+    enclosure_of_mcon_2adj_um: 0.06  # M1.E.2 — met1 end-of-line extension beyond CO
+
+  met2:
+    width_min_um:   0.28   # M2.W.1
+    spacing_min_um: 0.28   # M2.S.1
+    area_min_um2:   0.202  # M2.A.1
+    enclosure_of_via1_2adj_um: 0.06  # M2.E.2 — met2 end-of-line enc of VIA1
+
+  via1:                            # VIA12: met1 → met2
+    size_um:               0.26   # VIA1.W.1 — square via cut
+    spacing_um:            0.26   # VIA1.S.1
+    enclosure_in_met1_um:  0.01   # VIA1.E.1 — met1 min enc of via1
+    enclosure_in_met1_2adj_um: 0.06  # VIA1.E.2 — met1 end-of-line enc of via1
+    enclosure_in_met2_um:  0.01   # VIA1.E.1 (met2 side)
+
+  mcon:                            # TSMC has no li1; this maps CO to met1
+    size_um:               0.22   # CO.W.1
+    spacing_um:            0.25   # CO.S.1
+    enclosure_in_li1_um:   0.005  # M1.E.1
+    enclosure_in_met1_um:  0.005  # M1.E.1
+
+  li1:
+    width_min_um:   0.23   # Met1 width (TSMC has no separate li1 layer)
+    spacing_min_um: 0.23   # Met1 spacing
+    area_min_um2:   0.202  # Met1 area
+
+  implant:
+    enclosure_of_diff_um: 0.18    # NP.E.1 / PP.E.1 — implant encloses OD
+    spacing_min_um:       0.44    # NP.S.1 / PP.S.1 — min implant spacing
+
+  nwell:
+    width_min_um:          0.86   # NW.W.1
+    spacing_min_um:        1.40   # NW.S.1 — different potential
+    enclosure_of_pdiff_um: 0.18   # NW enclosure of PMOS OD (derived from rules)
+
+# ── DRC decks ────────────────────────────────────────────────────────────────
+drc:
+  calibre: "${PDK_ROOT}/tsmc180/Calibre/calibre.drc"
+
+# ── Per-device rules ──────────────────────────────────────────────────────────
+devices:
+  nmos:
+    diff_layer:       diff
+    gate_layer:       poly
+    implant_layer:    nsdm
+    bulk_layer:       psdm
+    nwell:            false
+    w_finger_max_um:  4.0
+    sd_length_min_um: 0.42    # CO.W + 2*CO.E.1 = 0.22 + 2*0.10
+
+  pmos:
+    diff_layer:       diff
+    gate_layer:       poly
+    implant_layer:    psdm
+    bulk_layer:       nsdm
+    nwell:            true
+    w_finger_max_um:  4.0
+    sd_length_min_um: 0.42    # CO.W + 2*CO.E.1 = 0.22 + 2*0.10
