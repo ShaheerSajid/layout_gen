@@ -3,10 +3,22 @@
 # Cross-coupled CMOS inverter pair (INV_L, INV_R) with two NMOS access
 # transistors (PG_L, PG_R) controlled by a common WL wordline.
 #
-# Placement: INV_L (PD_L/PU_L) | PG_L | cross_gap | PD_R/PU_R | PG_R
-# The auto-router handles gate bridges, Q/Q_ storage node li1 bridges,
-# drain bridges, and power rails.  Cross-coupling routes and WL bus
-# require specialized style handlers (cross_couple_gate, poly_stub_met1_bus).
+# Placement (NMOS row):  PG_L | PD_L | PD_R | PG_R
+# Placement (PMOS row):        PU_L | PU_R
+#                              ↕ gate   ↕ gate
+#
+# Left inverter (PG_L, PD_L, PU_L) is mirrored (orientation: MY).
+# Right inverter (PD_R, PU_R, PG_R) is normal (R0).
+# Mirror axis at PD_L⟷PD_R boundary.
+#
+# Shared diffusion abutment:
+#   PG_L⟷PD_L (net Q)    — pass-gate shares Q with pull-down
+#   PD_L⟷PD_R (net GND)  — pull-downs share GND (power meets at mirror axis)
+#   PD_R⟷PG_R (net Q_)   — pull-down shares Q_ with pass-gate
+#   PU_L⟷PU_R (net VDD)  — pull-ups share VDD (power meets at mirror axis)
+#
+# Cell width fixed at 3.600 um for array tiling.
+# Bitlines on met2 (full height), WL on met1 (full width).
 
 name: sram_6t_bit_cell
 description: >
@@ -14,7 +26,20 @@ description: >
   Cross-coupled CMOS inverter pair (INV_L, INV_R) with two NMOS access
   transistors (PG_L, PG_R) controlled by a common WL wordline.
 
+cell_dimensions:
+  width: 3.600     # array column pitch
+
+abutment:
+  pitch_x: 3.600
+  mirror_x: true
+  rail_align: true
+
+label_layers:
+  met1: [68, 5]
+  met2: [69, 5]
+
 devices:
+  # Per-device w/l override global PARAMS.  Omit or set to 0 to use PARAMS.
   PD_L:   {template: planar_mosfet, type: nmos, terminals: {G: Q_,  D: Q,  S: GND}}
   PU_L:   {template: planar_mosfet, type: pmos, terminals: {G: Q_,  D: Q,  S: VDD}}
   PD_R:   {template: planar_mosfet, type: nmos, terminals: {G: Q,   D: Q_, S: GND}}
@@ -31,22 +56,77 @@ nets:
   BL:   {type: signal}
   BL_:  {type: signal}
 
-placement:
-  mode: standard
-  pairs:
-    - nmos: [PD_L, PG_L, PD_R, PG_R]
-      pmos: [PU_L, PU_R]
-  constraints:
-    inter_cell_gap:
-      min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
-    cross_gap:
-      min: "max(2*rules.li1.spacing_min_um + rules.li1.width_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um, rules.nwell.spacing_min_um - 2*rules.nwell.enclosure_of_pdiff_um)"
+# ── Placement: explicit per-device directives ──────────────────────────────
+#
+# Each device says exactly where it goes relative to another device.
+# The engine resolves spacing_rule values from the PDK automatically.
+# No symbolic expressions — the YAML author names the intent, not the formula.
+
+placement_logic:
+  # ── NMOS row (left to right) ──────────────────────────────────────────
+  #
+  # Left inverter is mirrored (MY): internal nets face outward (toward
+  # pass gates), power nets face centre.  Right inverter is normal (R0).
+  # Mirror axis is the PD_L⟷PD_R abutment boundary.
+
+  - name: PG_L                    # Pass-gate left: origin device
+    origin: [0, 0]
+    orientation: MY               # BL on left (outer), Q on right (shared with PD_L)
+
+  - name: PD_L                    # Pull-down left: abuts PG_L (shared Q diffusion)
+    relative_to: PG_L
+    relation: abut_x
+    alignment: bottom
+    orientation: MY               # Q on left (shared with PG_L), GND on right (shared with PD_R)
+
+  - name: PD_R                    # Pull-down right: abuts PD_L (shared GND diffusion)
+    relative_to: PD_L
+    relation: abut_x
+    alignment: bottom             # R0 (default): GND on left (shared with PD_L), Q_ on right
+
+  - name: PG_R                    # Pass-gate right: abuts PD_R (shared Q_ diffusion)
+    relative_to: PD_R
+    relation: abut_x
+    alignment: bottom             # R0 (default): Q_ on left (shared with PD_R), BL_ on right
+
+  # ── PMOS row (gate-aligned with NMOS) ─────────────────────────────────
+
+  - name: PU_L                    # Pull-up left: gate aligns with PD_L
+    relative_to: PD_L
+    relation: align_gate
+    alignment: gate
+    orientation: MY               # Q on left, VDD on right (shared with PU_R)
+
+  - name: PU_R                    # Pull-up right: gate aligns with PD_R
+    relative_to: PD_R
+    relation: align_gate
+    alignment: gate               # R0 (default): VDD on left (shared with PU_L), Q_ on right
+
+routing:
+  WL:
+    layer: met1
+    path_type: trunk
+    coverage: full_width
+    port_side: [west, east]
+    width_type: fixed_min
+  BL:
+    layer: met2
+    coverage: full_height
+    port_side: [north]
+    width_type: fixed_min
+  BL_:
+    layer: met2
+    coverage: full_height
+    port_side: [north]
+    width_type: fixed_min
+  Q:    {strategy: local}
+  Q_:   {strategy: local}
 
 ports:
-  WL:  {side: north, terminal: PG_L.G}
-  BL:  {side: north, terminal: PG_L.D}
-  BL_: {side: north, terminal: PG_R.D}
-  Q:   {side: west, terminal: PD_L.D}
-  Q_:  {side: east, terminal: PD_R.D}
-  GND: {side: south}
-  VDD: {side: north}
+  WL:  {side: west,  layer: met1, terminal: PG_L.G}
+  BL:  {side: north, layer: met2, terminal: PG_L.D}
+  BL_: {side: north, layer: met2, terminal: PG_R.D}
+  Q:   {side: west,  terminal: PD_L.D}
+  Q_:  {side: east,  terminal: PD_R.D}
+  GND: {side: south, layer: met1}
+  VDD: {side: north, layer: met1}

@@ -175,8 +175,7 @@ class Synthesizer:
 
             # ── Merge implant/nwell regions ──
             _merge_implants(comp, placed, self.rules)
-            if template.layout_mode == "stacked":
-                _merge_nwells_stacked(comp, placed, self.rules)
+            _merge_nwells(comp, placed, self.rules)
 
             # ── Routing ────────────────────────────────────────────────────
             router = Router(self.rules)
@@ -193,6 +192,9 @@ class Synthesizer:
                 comp, template, net_graph,
                 placed, candidates, self.rules,
             )
+
+            # ── GDS labels ────────────────────────────────────────────────
+            _add_labels(comp, template)
 
             # ── DRC (optional) ─────────────────────────────────────────────
             if self.drc_runner is None:
@@ -227,28 +229,39 @@ class Synthesizer:
         if violations and self.geo_agent is not None and self.drc_runner is not None:
             geo_loop = GeoFixLoop(self.geo_agent, self.drc_runner, self.rules)
             geo_result = geo_loop.run(comp, max_iter=self.geo_max_iter)
+
+            # Use geo-fixed component (even if not fully converged,
+            # it typically has fewer violations than the original)
+            geo_comp = geo_result.state.to_component(
+                self.rules, name=_cell_name(template, 0))
+            # Carry over ports from the original component
+            for port in comp.ports:
+                try:
+                    geo_comp.add_port(
+                        port.name,
+                        center=port.center,
+                        width=port.width,
+                        orientation=port.orientation,
+                        layer=port.layer,
+                    )
+                except Exception:
+                    pass
+
             if geo_result.converged:
-                geo_comp = geo_result.state.to_component(
-                    self.rules, name=_cell_name(template, 0))
-                # Carry over ports from the original component
-                for port in comp.ports:
-                    try:
-                        geo_comp.add_port(
-                            port.name,
-                            center=port.center,
-                            width=port.width,
-                            orientation=port.orientation,
-                            layer=port.layer,
-                        )
-                    except Exception:
-                        pass
                 return SynthResult(geo_comp, placed, current_params,
                                    [], iteration + geo_result.iterations, True)
-            violations = geo_result.violations
+
+            # Use geo-fixed component as the output
+            comp = geo_comp
+
+        # ── Final full DRC on actual output component ─────────────────
+        if self.drc_runner is not None:
+            violations = _run_drc(self.drc_runner, comp)
 
         # Return best result even if DRC is not clean
         return SynthResult(comp, placed, current_params,
-                           violations, self.max_iter, False)
+                           violations, self.max_iter,
+                           converged=(not violations))
 
 
 # ── Implant merging ────────────────────────────────────────────────────────────
@@ -316,17 +329,16 @@ def _merge_implants(
             )
 
 
-def _merge_nwells_stacked(
+def _merge_nwells(
     comp:   Any,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
 ) -> None:
-    """Draw one merged nwell per cluster of PMOS devices in stacked layouts.
+    """Draw one merged nwell per cluster of PMOS devices.
 
     Individual PMOS transistors draw their own nwell, but adjacent nwells
-    closer than ``nwell.spacing_min_um`` (1.27 µm) violate nwell.2.  In a
-    stacked layout the safest fix is to merge all PMOS nwells into one
-    continuous region (or per-cluster when gaps are large enough).
+    closer than ``nwell.spacing_min_um`` (1.27 µm) violate nwell.2.
+    Merge all nearby PMOS nwells into one continuous region.
     """
     from layout_gen.cells.standard import _diff_y
 
@@ -359,13 +371,21 @@ def _merge_nwells_stacked(
             clusters.append([box])
 
     lyr = rules.layer("nwell")
+    # Minimum nwell width from PDK
+    nw_min_w = rules.nwell.get("width_min_um", 0.84)
     for cluster in clusters:
-        if len(cluster) < 2:
-            continue
         x0 = min(b[0] for b in cluster)
         x1 = max(b[1] for b in cluster)
         y0 = min(b[2] for b in cluster)
         y1 = max(b[3] for b in cluster)
+        # Ensure minimum nwell width in both directions
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        if x1 - x0 < nw_min_w:
+            x0 = cx - nw_min_w / 2
+            x1 = cx + nw_min_w / 2
+        if y1 - y0 < nw_min_w:
+            y0 = cy - nw_min_w / 2
+            y1 = cy + nw_min_w / 2
         comp.add_polygon(
             [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
             layer=lyr,
@@ -391,6 +411,47 @@ def _clamp_params(params: dict, rules: PDKRules) -> dict:
         if k in clamped:
             clamped[k] = max(1, int(round(float(clamped[k]))))
     return clamped
+
+
+# ── GDS label export ──────────────────────────────────────────────────────────
+
+def _add_labels(comp: Any, template: "CellTemplate") -> None:
+    """Add GDS text labels at port locations for LVS connectivity."""
+    label_map = {
+        "met1": template.label_layers.met1,
+        "met2": template.label_layers.met2,
+    }
+    for port in comp.ports:
+        # Determine label layer from port's GDS layer
+        port_layer = port.layer
+        label_layer = None
+        if isinstance(port_layer, (list, tuple)) and len(port_layer) >= 2:
+            # Match (layer, datatype) to met1/met2
+            gds_layer = port_layer[0] if isinstance(port_layer[0], int) else port_layer
+            for metal, ll in label_map.items():
+                try:
+                    rules_layer = None  # can't access rules here easily
+                    if gds_layer == ll[0]:
+                        label_layer = ll
+                        break
+                except Exception:
+                    pass
+        # Default: use met1 label layer
+        if label_layer is None:
+            # Check if port has explicit layer in template
+            pspec = template.ports.get(port.name)
+            if pspec and pspec.layer == "met2":
+                label_layer = label_map["met2"]
+            else:
+                label_layer = label_map["met1"]
+        try:
+            comp.add_label(
+                port.name,
+                position=port.center,
+                layer=label_layer,
+            )
+        except Exception:
+            pass  # label support varies by gdsfactory version
 
 
 # ── DRC helper ────────────────────────────────────────────────────────────────

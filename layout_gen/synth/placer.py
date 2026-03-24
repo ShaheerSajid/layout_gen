@@ -23,14 +23,80 @@ from typing import Any
 from layout_gen.pdk        import PDKRules
 from layout_gen.transistor import draw_transistor, transistor_geom, TransistorGeom
 from layout_gen.cells.standard import _gate_x, _sd_x, _diff_y
-from layout_gen.synth.loader      import CellTemplate, DeviceSpec, RowPairSpec
+from layout_gen.synth.loader      import (
+    CellTemplate, DeviceSpec, PlacementDirective, RowPairSpec, CellDimensions,
+)
 from layout_gen.synth.constraints import eval_expr, resolve_named_constraints
 
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 _DEFAULT_W: dict[str, float] = {"nmos": 0.52, "pmos": 0.52}
-_DEFAULT_L: float = 0.15
+
+
+# ── Named spacing rules ──────────────────────────────────────────────────────
+#
+# Each entry maps a semantic spacing name to a callable(PDKRules) → float.
+# The YAML author writes ``spacing_rule: cross_couple_wiring`` and the engine
+# looks up the PDK-derived value automatically.
+
+def _spacing_min_diff(r: PDKRules) -> float:
+    """Minimum diffusion-to-diffusion spacing."""
+    return r.diff["spacing_min_um"]
+
+
+def _spacing_inter_cell_gap(r: PDKRules) -> float:
+    """Gap between NMOS and PMOS tiers.
+
+    Must satisfy:
+    1. diff-to-diff spacing (diff.2)
+    2. N-diff to N-well spacing (tap.9) — accounts for nwell min-width expansion
+    """
+    endcap = r.poly["endcap_over_diff_um"]
+    gap_diff = r.diff["spacing_min_um"] - 2 * endcap
+    # N-diff to nwell: conservative (assumes nwell may expand to min width)
+    nw_enc = r.nwell.get("enclosure_of_pdiff_um", 0.18)
+    nw_min_w = r.nwell.get("width_min_um", 0.84)
+    tap_rules = r.tap if hasattr(r, 'tap') and r.tap else {}
+    ndiff_to_nwell = tap_rules.get("ndiff_to_nwell_um", 0.34)
+    gap_nwell = ndiff_to_nwell - 2 * endcap + max(nw_enc, nw_min_w / 2)
+    return max(0.0, gap_diff, gap_nwell)
+
+
+def _spacing_cross_couple_wiring(r: PDKRules) -> float:
+    """Cross-couple gap: room for li1 wires AND nwell separation."""
+    endcap = r.poly["endcap_over_diff_um"]
+    li1_room = (2 * r.li1["spacing_min_um"] + r.li1["width_min_um"]
+                - 2 * endcap)
+    nw_room = r.nwell["spacing_min_um"] - 2 * r.nwell["enclosure_of_pdiff_um"]
+    return max(li1_room, nw_room)
+
+
+def _spacing_min_well_separation(r: PDKRules) -> float:
+    """Minimum nwell-to-nwell separation (edge to edge)."""
+    return r.nwell["spacing_min_um"] - 2 * r.nwell["enclosure_of_pdiff_um"]
+
+
+SPACING_RULES: dict[str, callable] = {
+    "min_diff_spacing":      _spacing_min_diff,
+    "inter_cell_gap":        _spacing_inter_cell_gap,
+    "cross_couple_wiring":   _spacing_cross_couple_wiring,
+    "min_well_separation":   _spacing_min_well_separation,
+}
+
+
+def resolve_spacing_rule(name: str, rules: PDKRules) -> float:
+    """Look up a named spacing rule and return the value in µm.
+
+    Raises KeyError if the name is not registered.
+    """
+    fn = SPACING_RULES.get(name)
+    if fn is None:
+        raise KeyError(
+            f"Unknown spacing_rule {name!r}. "
+            f"Available: {sorted(SPACING_RULES)}"
+        )
+    return fn(rules)
 
 
 # ── PlacedDevice ──────────────────────────────────────────────────────────────
@@ -122,7 +188,7 @@ def resolve_terminal(
         )
     elif phys_term == "D":
         j = geom.n_fingers   # rightmost S/D = drain for finger 0
-        lx0, lx1 = _sd_x(j, geom)
+        lx0, lx1 = _sd_x(j, geom, rules)
         ly0, ly1 = _diff_y(geom, rules)
         return TerminalGeom(
             dev_name, term,
@@ -131,7 +197,7 @@ def resolve_terminal(
             layer="li1",
         )
     elif phys_term == "S":
-        lx0, lx1 = _sd_x(0, geom)
+        lx0, lx1 = _sd_x(0, geom, rules)
         ly0, ly1 = _diff_y(geom, rules)
         return TerminalGeom(
             dev_name, term,
@@ -199,6 +265,7 @@ class Placer:
     def __init__(self, rules: PDKRules, params: dict[str, Any] | None = None):
         self.rules  = rules
         self.params = {k.lower(): v for k, v in (params or {}).items()}
+        self._device_params: dict[str, dict[str, Any]] = {}
 
     def place(self, template: CellTemplate) -> dict[str, PlacedDevice]:
         """Resolve all device positions.
@@ -208,6 +275,9 @@ class Placer:
         dict[str, PlacedDevice]
             Ordered by placement evaluation order (bottom devices before top).
         """
+        # Store per-device overrides from template
+        self._device_params = template.device_params
+
         # Pass 1: compute transistor geometries
         geoms = self._compute_geoms(template)
 
@@ -217,13 +287,33 @@ class Placer:
         )
 
         # Pass 3: place devices
-        if template.layout_mode == "stacked":
-            return self._place_stacked(template, geoms, named)
-        return self._place_devices(template, geoms, named)
+        if template.placement_directives:
+            placed = self._place_from_directives(template, geoms, named)
+        elif template.layout_mode == "stacked":
+            placed = self._place_stacked(template, geoms, named)
+        else:
+            placed = self._place_devices(template, geoms, named)
+
+        # Pass 4: apply fixed cell width — centre devices within cell
+        if template.cell_dimensions.width > 0:
+            _apply_cell_width(placed, template.cell_dimensions.width)
+
+        # Pass 5: snap all device positions to manufacturing grid
+        grid = self.rules.mfg_grid
+        if grid > 0:
+            for dev in placed.values():
+                dev.x = round(round(dev.x / grid) * grid, 6)
+                dev.y = round(round(dev.y / grid) * grid, 6)
+
+        return placed
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _w(self, dev_name: str, dev_type: str) -> float:
+        # Check per-device override from template YAML first
+        dev_ovr = self._device_params.get(dev_name, {})
+        if "w" in dev_ovr:
+            return float(dev_ovr["w"])
         p = self.params
         return (
             p.get(f"w_{dev_name.lower()}")
@@ -232,7 +322,11 @@ class Placer:
         )
 
     def _l(self, dev_name: str) -> float:
-        return self.params.get(f"l_{dev_name.lower()}") or self.params.get("l") or _DEFAULT_L
+        dev_ovr = self._device_params.get(dev_name, {})
+        if "l" in dev_ovr:
+            return float(dev_ovr["l"])
+        default_l = self.rules.poly["width_min_um"]
+        return self.params.get(f"l_{dev_name.lower()}") or self.params.get("l") or default_l
 
     def _compute_geoms(self, template: CellTemplate) -> dict[str, TransistorGeom]:
         from dataclasses import replace as _replace
@@ -292,6 +386,117 @@ class Placer:
 
         return placed
 
+    def _place_from_directives(
+        self,
+        template: CellTemplate,
+        geoms:    dict[str, TransistorGeom],
+        named:    dict[str, float],
+    ) -> dict[str, PlacedDevice]:
+        """Place devices using explicit PlacementDirective list.
+
+        Each directive specifies exactly how to position a device relative
+        to another (or at an absolute origin).  The directive order defines
+        the dependency evaluation order.
+        """
+        placed: dict[str, PlacedDevice] = {}
+        rules = self.rules
+        endcap = rules.poly["endcap_over_diff_um"]
+
+        for d in template.placement_directives:
+            if d.name not in template.devices:
+                import warnings
+                warnings.warn(
+                    f"PlacementDirective references unknown device {d.name!r}; skipped.",
+                    stacklevel=3,
+                )
+                continue
+
+            spec = template.devices[d.name]
+            # orientation: MY (mirror across Y axis) implies sd_flip
+            if d.sd_flip or d.orientation in ("MY", "R180"):
+                spec.sd_flip = True
+            geom = geoms[d.name]
+
+            # ── Absolute origin (first device) ─────────────────────────────
+            if d.origin is not None and not d.relative_to:
+                x, y = d.origin
+                placed[d.name] = PlacedDevice(
+                    name=d.name, spec=spec, geom=geom, x=x, y=y,
+                )
+                continue
+
+            # ── Relative placement ─────────────────────────────────────────
+            if d.relative_to not in placed:
+                import warnings
+                warnings.warn(
+                    f"PlacementDirective for {d.name!r}: relative_to "
+                    f"{d.relative_to!r} not yet placed; placing at origin.",
+                    stacklevel=3,
+                )
+                placed[d.name] = PlacedDevice(
+                    name=d.name, spec=spec, geom=geom, x=0.0, y=0.0,
+                )
+                continue
+
+            anchor = placed[d.relative_to]
+            anchor_geom = geoms[d.relative_to]
+
+            # ── Compute X ──────────────────────────────────────────────────
+            if d.relation == "abut_x":
+                # Shared-diffusion abutment: overlap one S/D region
+                x = anchor.x + anchor_geom.total_x_um - anchor_geom.sd_length_um
+
+            elif d.relation == "space_x":
+                # Place with named spacing gap
+                gap = 0.0
+                if d.spacing_rule:
+                    gap = resolve_spacing_rule(d.spacing_rule, rules)
+                elif "cross_gap" in named:
+                    gap = named["cross_gap"]
+                else:
+                    gap = rules.diff["spacing_min_um"]
+                x = anchor.x + anchor_geom.total_x_um + gap
+
+            elif d.relation == "align_gate":
+                # Align gate poly X with anchor device
+                x = anchor.x
+
+            elif d.relation == "mirror_x":
+                # Mirror: place symmetrically around anchor's right edge
+                # The device is flipped so its right edge touches
+                x = anchor.x + anchor_geom.total_x_um
+
+            else:
+                # Default: place right of anchor with diff spacing
+                x = anchor.x + anchor_geom.total_x_um + rules.diff["spacing_min_um"]
+
+            # ── Compute Y ──────────────────────────────────────────────────
+            if d.alignment == "gate" or d.relation == "align_gate":
+                # For PMOS above NMOS: offset by inter-cell gap
+                if spec.device_type != template.devices[d.relative_to].device_type:
+                    icg = named.get(
+                        "inter_cell_gap",
+                        _spacing_inter_cell_gap(rules),
+                    )
+                    y = anchor.y + anchor_geom.total_y_um + icg
+                else:
+                    y = anchor.y
+
+            elif d.alignment == "top":
+                y = anchor.y + anchor_geom.total_y_um - geom.total_y_um
+
+            elif d.alignment == "center":
+                y = anchor.y + (anchor_geom.total_y_um - geom.total_y_um) / 2
+
+            else:  # "bottom" (default)
+                y = anchor.y
+
+            placed[d.name] = PlacedDevice(
+                name=d.name, spec=spec, geom=geom, x=x, y=y,
+            )
+
+        return placed
+
     def _place_stacked(
         self,
         template: CellTemplate,
@@ -307,12 +512,9 @@ class Placer:
         placed: dict[str, PlacedDevice] = {}
 
         # Compute the inter-cell gap (within a row pair, between N and P tiers)
-        endcap = self.rules.poly["endcap_over_diff_um"]
-        ext_y  = self.rules.diff["extension_past_poly_um"]
-        diff_sp = self.rules.diff["spacing_min_um"]
         icg = named.get(
             "inter_cell_gap",
-            diff_sp - 2 * endcap + 2 * ext_y,
+            _spacing_inter_cell_gap(self.rules),
         )
 
         # Gap between adjacent row pairs (default: diff spacing)
@@ -374,17 +576,56 @@ class Placer:
 def _topo_order(devices: dict[str, DeviceSpec]) -> list[str]:
     """Return device names sorted so dependencies come first.
 
-    Simple heuristic: devices with ``region`` containing ``"bottom"`` are
-    placed before those with ``region == "top"``.  Within each tier the
-    original YAML insertion order is preserved.
+    Performs a topological sort: any device whose ``x_spec`` or
+    ``y_offset_expr`` references ``DEV_x`` or ``DEV_y`` (i.e. depends on
+    the placed position of ``DEV``) is placed after ``DEV``.
+    Within each dependency level, devices with ``region`` containing
+    ``"bottom"`` come before ``"top"``.
     """
-    def _tier(spec: DeviceSpec) -> int:
-        r = spec.region.lower()
-        if "top" in r:
-            return 1
-        return 0   # "bottom", "bottom_only", default
+    import re
 
-    return sorted(devices.keys(), key=lambda n: _tier(devices[n]))
+    # Build dependency graph: device → set of devices it depends on
+    all_names = list(devices.keys())
+    deps: dict[str, set[str]] = {n: set() for n in all_names}
+
+    for name, spec in devices.items():
+        for expr in (spec.x_spec, spec.y_offset_expr):
+            if not isinstance(expr, str):
+                continue
+            # Find references like DEV_x, DEV_y, or DEV.attr
+            for other in all_names:
+                if other == name:
+                    continue
+                if re.search(rf'\b{re.escape(other)}[_.]', expr):
+                    deps[name].add(other)
+
+    # Kahn's algorithm for topological sort
+    in_degree = {n: len(deps[n]) for n in all_names}
+    queue = [n for n in all_names if in_degree[n] == 0]
+    # Sort queue by tier (bottom first) for stable ordering
+    def _tier(n: str) -> int:
+        r = devices[n].region.lower()
+        return 1 if "top" in r else 0
+    queue.sort(key=_tier)
+
+    result: list[str] = []
+    while queue:
+        n = queue.pop(0)
+        result.append(n)
+        for other in all_names:
+            if n in deps[other]:
+                deps[other].discard(n)
+                in_degree[other] -= 1
+                if in_degree[other] == 0:
+                    queue.append(other)
+                    queue.sort(key=_tier)
+
+    # Append any remaining (circular deps — shouldn't happen)
+    for n in all_names:
+        if n not in result:
+            result.append(n)
+
+    return result
 
 
 def _resolve_x(
@@ -448,3 +689,25 @@ def _resolve_x(
         f"Cannot resolve x_spec {xs!r}; defaulting to 0.0", stacklevel=4
     )
     return 0.0
+
+
+def _apply_cell_width(
+    placed: dict[str, PlacedDevice],
+    target_width: float,
+) -> None:
+    """Centre all placed devices within a fixed cell width.
+
+    Shifts all devices by the same X offset so the active area is centred
+    within ``target_width``.  This ensures the cell meets array pitch
+    requirements without changing internal device-to-device spacing.
+    """
+    if not placed:
+        return
+    x_min = min(d.x for d in placed.values())
+    x_max = max(d.x + d.geom.total_x_um for d in placed.values())
+    actual_width = x_max - x_min
+    if actual_width >= target_width:
+        return  # devices already wider; can't shrink
+    offset = (target_width - actual_width) / 2 - x_min
+    for dev in placed.values():
+        dev.x += offset

@@ -17,6 +17,7 @@ description: TSMC 0.18um 1P6M Mixed Signal RF General Purpose II
 layers:
   nwell:  {layer: 2,   datatype: 0}   # NWELL
   diff:   {layer: 3,   datatype: 0}   # DIFF / OD (active diffusion)
+  tap:    {layer: 3,   datatype: 0}   # OD — same layer as diff (no separate tap in TSMC)
   poly:   {layer: 13,  datatype: 0}   # POLY1
   nsdm:   {layer: 8,   datatype: 0}   # NIMP (N+ implant select)
   psdm:   {layer: 7,   datatype: 0}   # PIMP (P+ implant select)
@@ -113,6 +114,12 @@ rules:
     spacing_min_um:        1.40   # NW.S.1 — different potential
     enclosure_of_pdiff_um: 0.18   # NW enclosure of PMOS OD (derived from rules)
 
+  tap:                             # well/substrate tap contact rules
+    enclosure_of_licon_um: 0.10   # CO.E.1 — OD must enclose contact
+    spacing_to_diff_um:    0.28   # OD.S.1 — tap-to-gate diffusion spacing
+    ndiff_to_nwell_um:     0.43   # NW.S.4 — N-diff spacing to N-well edge
+    ptap_to_nwell_um:      0.18   # NW enclosure margin for P-tap
+
 # ── DRC decks ────────────────────────────────────────────────────────────────
 drc:
   calibre: "${PDK_ROOT}/tsmc180/Calibre/calibre.drc"
@@ -136,3 +143,14 @@ devices:
     nwell:            true
     w_finger_max_um:  4.0
     sd_length_min_um: 0.42    # CO.W + 2*CO.E.1 = 0.22 + 2*0.10
+
+# ── Metal stack ──────────────────────────────────────────────────────────────
+#
+# TSMC 180nm has no separate li1 — li1 maps to Metal1.
+metal_stack:
+  - metal: met1
+  - metal: met2
+    via: via1
+    via_rules: via1
+    lower_enc: {section: via1,  key: enclosure_in_met1_2adj_um}
+    upper_enc: {section: met2,  key: enclosure_of_via1_2adj_um}

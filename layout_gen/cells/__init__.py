@@ -1,10 +1,8 @@
-# Cell layout modules — one per cell template.
-# Each module exposes draw_<cell>(params, rules) → gf.Component.
+# Cell layout modules.
 #
-# standard.py  — CMOS primitives: inverter, NAND2, NOR2
-# (planned) bit_cell.py, ms_reg.py, row_driver.py, write_driver.py, dido.py
+# standard.py  — geometry helpers used by the synthesizer
+# tap.py       — standalone well/substrate tap cell
 
-from layout_gen.cells.standard import draw_inverter, draw_nand2, draw_nor2
-from layout_gen.cells.bit_cell  import draw_bit_cell
+from layout_gen.cells.tap import draw_tap_cell
 
-__all__ = ["draw_inverter", "draw_nand2", "draw_nor2", "draw_bit_cell"]
+__all__ = ["draw_tap_cell"]

@@ -92,7 +92,9 @@ class GeoFixLoop:
         Parameters
         ----------
         component :
-            Initial gdsfactory Component (will not be modified).
+            Initial gdsfactory Component.  DRC is always run on the full
+            component (not the simplified LayoutState export) so that
+            transistor primitives and other subcell geometry are included.
         max_iter :
             Maximum repair iterations.
         state :
@@ -107,12 +109,24 @@ class GeoFixLoop:
         if state is None:
             state = LayoutState.from_component(component, self.rules)
 
+        # Detect via/contact stacks so the agent can move them as groups
+        n_groups = state.tag_via_groups()
+        if n_groups:
+            log.info("GeoFixLoop: tagged %d via/contact group(s)", n_groups)
+
         history: list[FixRecord] = []
         violations: list[DRCViolation] = []
 
+        # Use the full component for DRC when provided (preserves transistor
+        # cells, implants, nwell, etc. that LayoutState doesn't capture)
+        use_full_drc = component is not None
+
         for iteration in range(1, max_iter + 1):
-            # ── DRC ─────────────────────────────────────────────────────
-            violations = self._run_drc(state)
+            # ── DRC on the current state ─────────────────────────────────
+            if use_full_drc:
+                violations = self._run_drc_full(component)
+            else:
+                violations = self._run_drc(state)
             if not violations:
                 log.info("GeoFixLoop: DRC clean at iteration %d", iteration)
                 return GeoFixResult(state, [], True, iteration, history)
@@ -130,7 +144,12 @@ class GeoFixLoop:
             # ── Apply ───────────────────────────────────────────────────
             for action in actions:
                 log.debug("  %s", action.describe() if hasattr(action, 'describe') else action)
-                apply_action(state, action)
+                try:
+                    apply_action(state, action)
+                except KeyError:
+                    # Shape was already removed by a prior fix in this batch
+                    log.debug("  (skipped — target shape no longer exists)")
+                    continue
 
             # ── Record ──────────────────────────────────────────────────
             history.append(FixRecord(
@@ -149,7 +168,10 @@ class GeoFixLoop:
                 )
 
         # Final DRC check
-        violations = self._run_drc(state)
+        if use_full_drc:
+            violations = self._run_drc_full(component)
+        else:
+            violations = self._run_drc(state)
         if history:
             history[-1].remaining = len(violations)
 
@@ -160,8 +182,15 @@ class GeoFixLoop:
             history=history,
         )
 
+    def _run_drc_full(self, component: Any) -> list[DRCViolation]:
+        """Run DRC on the full component (with all subcells)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gds = Path(tmpdir) / "check.gds"
+            component.write_gds(str(gds))
+            return self.drc_runner.run(gds, component.name)
+
     def _run_drc(self, state: LayoutState) -> list[DRCViolation]:
-        """Export state to GDS, run DRC, return violations."""
+        """Export state to GDS, run DRC, return violations (simplified)."""
         global _geo_counter
         _geo_counter += 1
         comp = state.to_component(self.rules, name=f"geo_fix_check_{_geo_counter}")

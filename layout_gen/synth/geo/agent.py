@@ -38,8 +38,8 @@ from typing import Any
 
 from layout_gen.synth.geo.state      import LayoutState, Rect
 from layout_gen.synth.geo.actions    import (
-    Action, StretchEdge, MoveShape, AddRect, MergeShapes, SnapToGrid,
-    ResizeContact, LayerPromote,
+    Action, StretchEdge, MoveShape, MoveGroup, AddRect, MergeShapes,
+    SnapToGrid, ResizeContact, LayerPromote,
 )
 from layout_gen.synth.geo.violations import ViolationInfo
 
@@ -249,6 +249,19 @@ class RuleGeoAgent(GeoFixAgent):
         deficit = v.deficit + _EPS if v.deficit > 0 else v.required - best_dist + _EPS
         if deficit <= 0:
             deficit = 0.01
+
+        # ── Via group handling: if one shape is a via_pad, move its group ──
+        via_pad = None
+        gate = None
+        if a.shape_type == "via_pad" and a.group_id >= 0:
+            via_pad, gate = a, b
+        elif b.shape_type == "via_pad" and b.group_id >= 0:
+            via_pad, gate = b, a
+
+        if via_pad is not None:
+            # Push the via group away from the gate poly
+            dx, dy = self._repulsion_vector(via_pad, gate, v.required + _EPS)
+            return [MoveGroup(group_id=via_pad.group_id, dx=dx, dy=dy)]
 
         # Determine separation axis: which edges face each other?
         # X-separated: a.x1 ≤ b.x0 or b.x1 ≤ a.x0

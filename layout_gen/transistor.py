@@ -241,9 +241,10 @@ def draw_transistor(
     lyr_bulk    = rules.layer(dev["bulk_layer"])
 
     # ── Diffusion rectangle (covers all fingers) ──────────────────────────────
-    # Y: w_finger_um, centred in total_y so poly endcap is symmetric
-    diff_y0 = endcap - ext_y          # diff starts below poly endcap
-    diff_y1 = endcap + geom.w_finger_um + ext_y
+    # Y: diff spans the channel width, contained within poly so poly overhangs
+    # by endcap (poly.8).  extension_past_poly is X-only (S/D extends past gate).
+    diff_y0 = endcap
+    diff_y1 = endcap + geom.w_finger_um
     diff_x0 = 0.0
     diff_x1 = geom.total_x_um
     c.add_polygon(
@@ -283,6 +284,35 @@ def draw_transistor(
             layer=lyr_gate,
         )
         gate_port_x.append((gx0 + gx1) / 2)
+
+    # ── NPC (Nitride Poly Cut) on poly endcaps ────────────────────────────────
+    # Prevents silicide on poly stubs extending beyond diffusion.
+    # Only generated if the PDK defines an 'npc' layer.
+    try:
+        lyr_npc = rules.layer("npc")
+        npc_rules = rules.npc if rules.npc else {}
+        npc_enc = npc_rules.get("enclosure_of_poly_um", 0.10)
+        for i in range(geom.n_fingers):
+            gx0 = (i + 1) * geom.sd_length_um + i * geom.l_um
+            gx1 = gx0 + geom.l_um
+            # Bottom endcap stub: poly from y=0 to diff_y0
+            c.add_polygon(
+                [(gx0 - npc_enc, 0.0 - npc_enc),
+                 (gx1 + npc_enc, 0.0 - npc_enc),
+                 (gx1 + npc_enc, diff_y0 + npc_enc),
+                 (gx0 - npc_enc, diff_y0 + npc_enc)],
+                layer=lyr_npc,
+            )
+            # Top endcap stub: poly from diff_y1 to total_y_um
+            c.add_polygon(
+                [(gx0 - npc_enc, diff_y1 - npc_enc),
+                 (gx1 + npc_enc, diff_y1 - npc_enc),
+                 (gx1 + npc_enc, geom.total_y_um + npc_enc),
+                 (gx0 - npc_enc, geom.total_y_um + npc_enc)],
+                layer=lyr_npc,
+            )
+    except KeyError:
+        pass  # PDK doesn't define NPC — skip
 
     # ── Contacts + li1 rails per S/D region ──────────────────────────────────
     # Contacts are centred in Y within the diff (respecting enclosure).
@@ -324,30 +354,26 @@ def draw_transistor(
         # to maintain li1.2 spacing (li1 spacing >= li1_spacing_min).
         # Without pullback, adjacent li1 rails are separated by only
         # l_um (gate length), which violates li1.2 when l < li1_spacing.
+        #
+        # li.5 asymmetric enclosure: li1 must enclose licon by
+        #   enc_li_2adj (0.08) on north+south (Y),
+        #   enc_li_opp  (0.00) on east+west   (X).
         li1_sp  = rules.li1.get("spacing_min_um", 0.17)
-        li_enc  = rules.contacts.get("enclosure_in_li1_um", 0.0)
+        enc_li_2adj, enc_li_opp = rules.enclosure("contacts", "enclosure_in_li1")
         half_sd = geom.sd_length_um / 2
 
-        # How much to pull back each li1 edge that faces a poly gate
-        pullback = max(0.0, (li1_sp - geom.l_um) / 2)
-        # Ensure li1 still encloses all contacts after pullback
-        max_pullback = half_sd - c_size / 2 - li_enc
-        pullback = min(pullback, max(0.0, max_pullback))
+        # Li1 strip width: max of contact size and li1 min width.
+        li1_half_w = max(c_size / 2, li_w / 2)
+        li_x0 = cx - li1_half_w + contact_x_offset
+        li_x1 = cx + li1_half_w + contact_x_offset
 
-        li_x0 = cx - half_sd
-        li_x1 = cx + half_sd
-
-        # Pull back edges adjacent to poly fingers
-        has_poly_left  = (j > 0)
-        has_poly_right = (j < geom.n_fingers)
-        if has_poly_left:
-            li_x0 += pullback
-        if has_poly_right:
-            li_x1 -= pullback
+        # Y extent: ensure enc_li_2adj (0.08) above/below outermost contacts
+        li_y0 = min(diff_y0, c_y_centres[0]  - c_size / 2 - enc_li_2adj)
+        li_y1 = max(diff_y1, c_y_centres[-1] + c_size / 2 + enc_li_2adj)
 
         c.add_polygon(
-            [(li_x0, diff_y0), (li_x1, diff_y0),
-             (li_x1, diff_y1), (li_x0, diff_y1)],
+            [(li_x0, li_y0), (li_x1, li_y0),
+             (li_x1, li_y1), (li_x0, li_y1)],
             layer=lyr_li1,
         )
 

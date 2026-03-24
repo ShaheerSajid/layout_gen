@@ -3,9 +3,23 @@
 # Stacked multi-row layout.  Zero routing directives — the auto-router
 # infers all intra-pair bridges, cross-row connections (met1/met2), and
 # bitline vertical buses from device connectivity.
+#
+# Cell width fixed at 3.600 um to match bit_cell_6t column pitch.
 
 name: dido
 description: SRAM column peripheral — precharge, column select, read/write pass (stacked)
+
+cell_dimensions:
+  width: 3.600     # match bitcell pitch for array integration
+
+abutment:
+  pitch_x: 3.600
+  mirror_x: true
+  rail_align: true
+
+label_layers:
+  met1: [68, 5]
+  met2: [69, 5]
 
 devices:
   # PCHG buffer inverter
@@ -60,6 +74,12 @@ nets:
   DR:   {type: signal}
   DR_:  {type: signal}
 
+params:
+  defaults: {w_N: 0.52, w_P: 0.42, l: 0.15}
+  overrides:
+    N_WP0: {w: 1.0}
+    N_WP1: {w: 1.0}
+
 placement:
   mode: stacked
   row_pairs:
@@ -67,20 +87,24 @@ placement:
       nmos: [N_PB, N_PD]
       pmos: [P_PB, P_PD]
       sd_flip: {N_PB: true, P_PB: true}
+      rail_top: VDD
 
     - id: 1
       nmos: [N_SB, N_SI]
       pmos: [P_SB, P_SI]
       sd_flip: {N_SB: true, P_SB: true}
+      rail_top: VSS
 
     - id: 2
       nmos: [N_NA, N_NB]
       pmos: [P_NA, P_NB]
       sd_flip: {P_NB: true}
+      rail_top: VSS
 
     - id: 3
       nmos: [N_NT]
       pmos: [P_NT]
+      rail_top: VDD
 
     - id: 4
       nmos: []
@@ -89,6 +113,7 @@ placement:
     - id: 5
       nmos: []
       pmos: [P_PC2]
+      rail_top: VDD
 
     - id: 6
       nmos: []
@@ -112,14 +137,14 @@ placement:
     inter_row_gap: "rules.diff.spacing_min_um"
 
 ports:
-  PCHG: {side: west}
-  SEL:  {side: west}
-  WREN: {side: west}
-  BL:   {side: east, terminal: P_PC1.D}
-  BL_:  {side: west, terminal: P_PC0.D}
-  DR:   {side: east, terminal: P_RP1.D}
-  DR_:  {side: west, terminal: P_RP0.S}
-  DW:   {side: south, terminal: N_WP0.S}
-  DW_:  {side: south, terminal: N_WP1.D}
-  VDD:  {side: north}
-  VSS:  {side: south}
+  PCHG: {side: west,  layer: met1}
+  SEL:  {side: west,  layer: met1}
+  WREN: {side: west,  layer: met1}
+  BL:   {side: north, layer: met2, terminal: P_PC1.D}
+  BL_:  {side: north, layer: met2, terminal: P_PC0.D}
+  DR:   {side: south, layer: met2, terminal: P_RP1.D}
+  DR_:  {side: south, layer: met2, terminal: P_RP0.S}
+  DW:   {side: south, layer: met2, terminal: N_WP0.S}
+  DW_:  {side: south, layer: met2, terminal: N_WP1.D}
+  VDD:  {side: north, layer: met1}
+  VSS:  {side: south, layer: met1}

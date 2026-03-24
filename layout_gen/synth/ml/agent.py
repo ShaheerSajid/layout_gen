@@ -59,23 +59,27 @@ class ModelNotTrainedError(RuntimeError):
 
 # ── Bounds ────────────────────────────────────────────────────────────────
 
-# Physically reasonable search bounds for sky130 (and similar nodes).
-_W_MIN,      _W_MAX      = 0.15, 5.0   # total channel width (µm)
-_L_MIN,      _L_MAX      = 0.15, 2.0   # gate length (µm)
+_W_MAX      = 5.0   # total channel width (µm)
+_L_MAX      = 2.0   # gate length (µm)
 _GAP_MIN,    _GAP_MAX    = 0.00, 0.50  # Y gap between NMOS/PMOS rows
 _FINGER_MIN, _FINGER_MAX = 1.0,  4.0   # finger count (continuous relaxation)
 
-_BOUNDS = [
-    (_W_MIN,      _W_MAX),
-    (_W_MIN,      _W_MAX),
-    (_L_MIN,      _L_MAX),
-    (_GAP_MIN,    _GAP_MAX),
-    (_FINGER_MIN, _FINGER_MAX),
-    (_FINGER_MIN, _FINGER_MAX),
-]
 
-_LO = np.array([b[0] for b in _BOUNDS])
-_HI = np.array([b[1] for b in _BOUNDS])
+def _get_bounds(rules: PDKRules) -> tuple[list, np.ndarray, np.ndarray]:
+    """Return (bounds_list, lo_array, hi_array) derived from PDK rules."""
+    w_min = rules.diff["width_min_um"]
+    l_min = rules.poly["width_min_um"]
+    bounds = [
+        (w_min,       _W_MAX),
+        (w_min,       _W_MAX),
+        (l_min,       _L_MAX),
+        (_GAP_MIN,    _GAP_MAX),
+        (_FINGER_MIN, _FINGER_MAX),
+        (_FINGER_MIN, _FINGER_MAX),
+    ]
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+    return bounds, lo, hi
 
 
 # ── Area computation ─────────────────────────────────────────────────────
@@ -191,7 +195,7 @@ class MLAgent:
         """Multi-start L-BFGS-B optimisation."""
         from scipy.optimize import minimize
 
-        bounds = list(_BOUNDS)
+        bounds, lo, hi = _get_bounds(rules)
         best_x = x0.copy()
         best_f = self._objective(x0, rules, area_ref)
 
@@ -199,7 +203,7 @@ class MLAgent:
         rng = np.random.default_rng(42)
         starts = [x0]
         for _ in range(self.n_restarts - 1):
-            x_rand = rng.uniform(_LO, _HI)
+            x_rand = rng.uniform(lo, hi)
             # Round finger counts
             x_rand[4] = round(x_rand[4])
             x_rand[5] = round(x_rand[5])
@@ -230,6 +234,7 @@ class MLAgent:
         area_ref: float,
     ) -> tuple[np.ndarray, float]:
         """Coordinate-descent fallback (no scipy required)."""
+        _, lo, hi = _get_bounds(rules)
         x = x0.copy()
         f = self._objective(x, rules, area_ref)
 
@@ -239,7 +244,7 @@ class MLAgent:
             for i in range(len(x)):
                 for delta in (self.step, -self.step):
                     x_try    = x.copy()
-                    x_try[i] = np.clip(x_try[i] + delta, _LO[i], _HI[i])
+                    x_try[i] = np.clip(x_try[i] + delta, lo[i], hi[i])
                     f_try    = self._objective(x_try, rules, area_ref)
                     if f_try < f - 1e-8:
                         x, f     = x_try, f_try

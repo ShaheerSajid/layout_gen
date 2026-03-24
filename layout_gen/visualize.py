@@ -97,7 +97,11 @@ def write_svg(
 
     # ── Build layer maps ──────────────────────────────────────────────────────
     rev_map  = _reverse_layer_map(rules)
-    pdk_data = _load_yaml(pdk_yaml)
+    # Prefer colors from rules object; fall back to pdk_yaml file
+    if rules.colors:
+        pdk_data = {"colors": rules.colors}
+    else:
+        pdk_data = _load_yaml(pdk_yaml)
 
     # ── Collect all polygons with their layers ────────────────────────────────
     # gdsfactory 9 / kfactory API:

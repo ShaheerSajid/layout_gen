@@ -53,6 +53,9 @@ from layout_gen.synth.loader      import (
     NetSpec,
     PortSpec,
     RoutingSpec,
+    CellDimensions,
+    AbutmentSpec,
+    LabelLayerSpec,
 )
 from layout_gen.synth.constraints import (
     eval_expr,

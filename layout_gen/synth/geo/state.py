@@ -53,6 +53,7 @@ class Rect:
     y1:         float
     net:        str = ""
     shape_type: str = ""
+    group_id:   int = -1     # shapes in same via/contact stack share a group_id
 
     @property
     def width(self) -> float:
@@ -98,7 +99,7 @@ class Rect:
 
     def copy(self) -> "Rect":
         return Rect(self.rid, self.layer, self.x0, self.y0, self.x1, self.y1,
-                    self.net, self.shape_type)
+                    self.net, self.shape_type, self.group_id)
 
 
 class LayoutState:
@@ -259,6 +260,75 @@ class LayoutState:
             if ref.edge_dist(r) <= max_dist:
                 result.append(r)
         return result
+
+    # ── Via group detection ─────────────────────────────────────────────
+
+    def tag_via_groups(self, tol: float = 0.02) -> int:
+        """Detect contact/via stacks and assign group_ids.
+
+        A poly contact stack is identified when a licon1 rect has a
+        co-centred poly rect (poly pad) — these are tagged as a group.
+        Any li1, mcon, met1 rects at the same centre are added to the group.
+
+        A diff contact stack is identified when a licon1 rect has a
+        co-centred li1 rect but NO co-centred poly rect.
+
+        Returns the number of groups found.
+        """
+        licon_rects = self.on_layer("licon1")
+        if not licon_rects:
+            return 0
+
+        group_count = 0
+
+        for licon in licon_rects:
+            if licon.group_id >= 0:
+                continue  # already assigned
+
+            cx, cy = licon.cx, licon.cy
+            group_count += 1
+            gid = group_count
+
+            # Find all shapes centred at the same point
+            members = [licon]
+            for r in self._rects.values():
+                if r.rid == licon.rid or r.group_id >= 0:
+                    continue
+                if abs(r.cx - cx) <= tol and abs(r.cy - cy) <= tol:
+                    if r.layer in ("poly", "li1", "mcon", "met1", "via1", "met2"):
+                        members.append(r)
+
+            # Check if this is a poly contact (has co-centred poly)
+            has_poly = any(m.layer == "poly" for m in members)
+
+            for m in members:
+                m.group_id = gid
+                if has_poly:
+                    m.shape_type = "via"  # poly contact stack
+                else:
+                    m.shape_type = "contact"  # diff contact
+
+            # Tag the poly member specifically
+            if has_poly:
+                for m in members:
+                    if m.layer == "poly":
+                        m.shape_type = "via_pad"  # poly pad (movable, not gate)
+
+        return group_count
+
+    def group_members(self, group_id: int) -> list[Rect]:
+        """All rectangles belonging to *group_id*."""
+        if group_id < 0:
+            return []
+        return [r for r in self._rects.values() if r.group_id == group_id]
+
+    def move_group(self, group_id: int, dx: float, dy: float) -> None:
+        """Translate all shapes in a group by (dx, dy)."""
+        for r in self.group_members(group_id):
+            r.x0 += dx
+            r.x1 += dx
+            r.y0 += dy
+            r.y1 += dy
 
     # ── Import / Export ──────────────────────────────────────────────────────
 

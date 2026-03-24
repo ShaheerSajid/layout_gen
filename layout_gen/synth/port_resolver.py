@@ -147,6 +147,10 @@ def resolve_ports(
 
         width = max(width, rules.li1.get("width_min_um", 0.17))
 
+        # Explicit port layer from YAML overrides auto-detected layer
+        if pspec.layer:
+            layer = pspec.layer
+
         try:
             lyr = rules.layer(layer) if isinstance(layer, str) else layer
         except (KeyError, TypeError):

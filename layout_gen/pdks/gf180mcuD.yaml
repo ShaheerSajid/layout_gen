@@ -1,0 +1,190 @@
+# layout_gen PDK descriptor — GlobalFoundries GF180MCU 0.18 µm CMOS (5LM)
+#
+# All dimensions in micrometres (µm) unless noted.
+# Sourced from GF180MCU open-source PDK design rule manual (gf180mcu_fd_pr).
+# Variant D (5 metal layers).
+#
+# IMPORTANT: Verify against your licensed PDK before taping out.
+
+name: gf180mcuD
+description: GlobalFoundries GF180MCU 0.18um 5LM open-source PDK
+
+# ── Layer map: logical name → (GDS layer, GDS datatype) ──────────────────────
+#
+# Layer names follow layout_gen conventions.
+# GF180 names in comments.
+layers:
+  nwell:  {layer: 21,  datatype: 0}   # Nwell
+  diff:   {layer: 22,  datatype: 0}   # COMP (active diffusion)
+  tap:    {layer: 22,  datatype: 0}   # COMP — same layer as diff
+  poly:   {layer: 30,  datatype: 0}   # Poly2 (gate poly)
+  nsdm:   {layer: 32,  datatype: 0}   # Nplus (N+ implant select)
+  psdm:   {layer: 31,  datatype: 0}   # Pplus (P+ implant select)
+  licon1: {layer: 33,  datatype: 0}   # Contact
+  li1:    {layer: 34,  datatype: 0}   # Metal1 — GF180 has no li1; map to met1
+  mcon:   {layer: 35,  datatype: 0}   # Via1   — used as li1→met2 bridge
+  met1:   {layer: 34,  datatype: 0}   # Metal1
+  via1:   {layer: 35,  datatype: 0}   # Via1
+  met2:   {layer: 36,  datatype: 0}   # Metal2
+  via2:   {layer: 38,  datatype: 0}   # Via2
+  met3:   {layer: 42,  datatype: 0}   # Metal3
+  via3:   {layer: 40,  datatype: 0}   # Via3
+  met4:   {layer: 46,  datatype: 0}   # Metal4
+  via4:   {layer: 41,  datatype: 0}   # Via4
+  met5:   {layer: 81,  datatype: 0}   # Metal5
+
+# ── Layer display colours ────────────────────────────────────────────────────
+colors:
+  nwell:  {fill: "#ffd0e0", opacity: 0.35}
+  diff:   {fill: "#00c000", opacity: 0.50}
+  poly:   {fill: "#ff4040", opacity: 0.65}
+  nsdm:   {fill: "#ffe060", opacity: 0.30}
+  psdm:   {fill: "#6060ff", opacity: 0.30}
+  licon1: {fill: "#404040", opacity: 0.85}
+  li1:    {fill: "#4040ff", opacity: 0.50}
+  mcon:   {fill: "#303030", opacity: 0.85}
+  met1:   {fill: "#4040ff", opacity: 0.50}
+  via1:   {fill: "#303030", opacity: 0.85}
+  met2:   {fill: "#c000c0", opacity: 0.50}
+  via2:   {fill: "#303030", opacity: 0.85}
+  met3:   {fill: "#c08000", opacity: 0.50}
+  via3:   {fill: "#303030", opacity: 0.85}
+  met4:   {fill: "#00a0a0", opacity: 0.50}
+  via4:   {fill: "#303030", opacity: 0.85}
+  met5:   {fill: "#a0a000", opacity: 0.50}
+
+# ── Design rules ──────────────────────────────────────────────────────────────
+#
+# Rule IDs reference GF180MCU DRM (gf180mcu_fd_pr design rule manual).
+rules:
+  poly:
+    width_min_um:        0.18   # PL.1  — min poly interconnect width
+    gate_length_min_um:  0.28   # PL.2  — min transistor gate length (3.3V)
+    spacing_min_um:      0.24   # PL.3a — min poly-to-poly space
+    endcap_over_diff_um: 0.22   # PL.5a — poly extension past COMP edge
+
+  diff:
+    width_min_um:            0.22   # CO.1 — min COMP width
+    spacing_min_um:          0.28   # CO.2 — min COMP-to-COMP space
+    extension_past_poly_um:  0.24   # PL.4 — COMP extension past gate (S/D)
+
+  contacts:                         # CT (Contact) rules
+    size_um:               0.22   # CT.1 — contact size (square)
+    spacing_um:            0.25   # CT.2 — contact-to-contact spacing
+    enclosure_in_diff_um:  0.07   # CT.3 — COMP enclosure of contact
+    enclosure_in_li1_um:   0.005  # CO.5 — Metal1 extension beyond contact (min)
+    enclosure_in_li1_2adj_um: 0.055  # CO.6 — Metal1 enc of contact in one direction
+    space_to_poly_um:      0.15   # CT.4 — contact to poly gate spacing
+    poly_enclosure_um:     0.07   # CT.3 — poly enclosure of poly-contact
+
+  met1:
+    width_min_um:   0.23   # M1.1  — Metal1 min width
+    spacing_min_um: 0.23   # M1.2  — Metal1 min spacing
+    area_min_um2:   0.1444 # M1.4  — Metal1 min area
+    enclosure_of_mcon_um: 0.005       # CO.5 — Metal1 min enc of contact
+    enclosure_of_mcon_2adj_um: 0.055  # CO.6 — Metal1 end-of-line enc of contact
+
+  met2:
+    width_min_um:   0.28   # M2.1  — Metal2 min width
+    spacing_min_um: 0.28   # M2.2  — Metal2 min spacing
+    area_min_um2:   0.1444 # M2.4  — Metal2 min area
+    enclosure_of_via1_2adj_um: 0.06  # M2.3a — Metal2 end-of-line enc of Via1
+
+  via1:                            # Via1: met1 → met2
+    size_um:               0.26   # V1.1 — Via1 size (square)
+    spacing_um:            0.26   # V1.2 — Via1 spacing
+    enclosure_in_met1_um:  0.01   # V1.3 — Metal1 min enc of Via1
+    enclosure_in_met1_2adj_um: 0.06  # V1.3a — Metal1 end-of-line enc of Via1
+    enclosure_in_met2_um:  0.01   # V1.3 — Metal2 min enc of Via1
+
+  via2:                            # Via2: met2 → met3
+    size_um:               0.26   # V2.1 — Via2 size (square)
+    spacing_um:            0.26   # V2.2 — Via2 spacing
+    enclosure_in_met2_um:  0.01   # V2.3 — Metal2 min enc of Via2
+    enclosure_in_met2_2adj_um: 0.06  # V2.3a — Metal2 end-of-line enc of Via2
+    enclosure_in_met3_um:  0.01   # V2.3 — Metal3 min enc of Via2
+
+  met3:
+    width_min_um:   0.28   # M3.1  — Metal3 min width
+    spacing_min_um: 0.28   # M3.2  — Metal3 min spacing
+    area_min_um2:   0.1444 # M3.4  — Metal3 min area
+    enclosure_of_via2_um:      0.01  # V2.3  — Metal3 enc of Via2
+    enclosure_of_via2_2adj_um: 0.06  # V2.3a — Metal3 end-of-line enc of Via2
+
+  mcon:                            # GF180 has no li1; mcon = contact → met1
+    size_um:               0.22   # CT.1
+    spacing_um:            0.25   # CT.2
+    enclosure_in_li1_um:   0.005  # CO.5
+    enclosure_in_met1_um:  0.005  # CO.5
+    enclosure_in_met1_2adj_um: 0.055  # CO.6
+
+  li1:
+    width_min_um:   0.23   # Metal1 width (GF180 has no separate li1 layer)
+    spacing_min_um: 0.23   # Metal1 spacing
+    area_min_um2:   0.1444 # Metal1 area
+
+  implant:
+    enclosure_of_diff_um: 0.16    # PP.3 / NP.3 — implant encloses COMP
+    spacing_min_um:       0.40    # PP.1 / NP.1 — min implant spacing
+
+  nwell:
+    width_min_um:          0.86   # NW.1a — min Nwell width
+    spacing_min_um:        0.60   # NW.2a — Nwell spacing (same net)
+    enclosure_of_pdiff_um: 0.43   # DF.7 — Nwell overlap of PMOS COMP
+
+  tap:
+    enclosure_of_licon_um: 0.07   # CT.3 — COMP enclosure of contact
+    spacing_to_diff_um:    0.28   # CO.2 — tap COMP to gate COMP spacing
+    ndiff_to_nwell_um:     0.43   # NW.5 — N-diff spacing to Nwell edge
+    ptap_to_nwell_um:      0.23   # NW.3 — Nwell enclosure margin for P-tap
+
+# ── DRC decks ────────────────────────────────────────────────────────────────
+drc:
+  magic: "/usr/local/share/pdk/gf180mcuD/libs.tech/magic/gf180mcuD.magicrc"
+
+# ── Per-device rules ──────────────────────────────────────────────────────────
+devices:
+  nmos:
+    diff_layer:       diff
+    gate_layer:       poly
+    implant_layer:    nsdm
+    bulk_layer:       psdm
+    nwell:            false
+    w_finger_max_um:  4.0
+    sd_length_min_um: 0.52    # CT.1 + 2*CO.7_eff = 0.22 + 2*0.15
+
+  pmos:
+    diff_layer:       diff
+    gate_layer:       poly
+    implant_layer:    psdm
+    bulk_layer:       nsdm
+    nwell:            true
+    w_finger_max_um:  4.0
+    sd_length_min_um: 0.52    # CT.1 + 2*CO.7_eff = 0.22 + 2*0.15
+
+# ── Metal stack ──────────────────────────────────────────────────────────────
+#
+# GF180 has no separate li1 layer — li1 maps to Metal1.  mcon is therefore
+# a no-op (same-layer connection).  The stack starts at met1.
+metal_stack:
+  - metal: met1                       # li1 aliases here
+  - metal: met2
+    via: via1
+    via_rules: via1
+    lower_enc: {section: via1,  key: enclosure_in_met1_2adj_um}
+    upper_enc: {section: met2,  key: enclosure_of_via1_2adj_um}
+  - metal: met3
+    via: via2
+    via_rules: via2
+    lower_enc: {section: via2, key: enclosure_in_met2_um}
+    upper_enc: {section: met3, key: enclosure_of_via2_um}
+  - metal: met4
+    via: via3
+    via_rules: via3
+    lower_enc: {section: via3, key: enclosure_in_met3_um}
+    upper_enc: {section: met4, key: enclosure_of_via3_um}
+  - metal: met5
+    via: via4
+    via_rules: via4
+    lower_enc: {section: via4, key: enclosure_in_met4_um}
+    upper_enc: {section: met5, key: enclosure_of_via4_um}

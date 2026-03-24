@@ -28,6 +28,7 @@ layers:
   via3:   {layer: 70,  datatype: 44}
   met4:   {layer: 71,  datatype: 20}
   via4:   {layer: 71,  datatype: 44}
+  npc:    {layer: 95,  datatype: 20}   # nitride poly cut (prevents silicide on poly stubs)
   met5:   {layer: 72,  datatype: 20}
 
 # ── Layer display colours (SVG fill hex, opacity 0–1) ────────────────────────
@@ -52,40 +53,75 @@ colors:
   via3:   {fill: "#303030", opacity: 0.85}
   met4:   {fill: "#00a0a0", opacity: 0.50}   # teal
   via4:   {fill: "#303030", opacity: 0.85}
+  npc:    {fill: "#a08060", opacity: 0.40}   # brown (poly cut overlay)
   met5:   {fill: "#a0a000", opacity: 0.50}   # olive
+
+# ── Grid and global routing policies ──────────────────────────────────────────
+#
+# manufacturing_grid: the smallest coordinate quantum the fab supports.
+# All polygon edges must land on this grid.
+#
+# preferred_direction: canonical routing direction per metal layer.
+# "horizontal" or "vertical".  The auto-router and DRC-aware placer
+# use this to choose layers and orient wires.  An empty string means
+# the layer has no preferred direction (e.g. li1).
+grid:
+  manufacturing_um: 0.005    # 5 nm manufacturing grid
+  routing_um:       0.005    # routing grid (= mfg grid for sky130)
+
+preferred_direction:
+  li1:  ""            # local interconnect — no preferred direction
+  met1: horizontal    # M1 runs horizontally (power rails, WL)
+  met2: vertical      # M2 runs vertically (bitlines, signal buses)
+  met3: horizontal
+  met4: vertical
+  met5: horizontal
 
 # ── Design rules ──────────────────────────────────────────────────────────────
 rules:
   poly:
-    width_min_um:        0.15   # poly.1
-    spacing_min_um:      0.21   # poly.2
-    endcap_over_diff_um: 0.13   # poly.4 — poly must extend this far past diff edge
+    width_min_um:            0.15   # poly.1a — min poly width
+    spacing_min_um:          0.21   # poly.2 — poly to poly spacing
+    spacing_to_diff_um:      0.075  # poly.4 — poly on field to diff (parallel edges)
+    spacing_to_tap_um:       0.055  # poly.5 — poly on field to tap
+    endcap_over_diff_um:     0.13   # poly.8 — poly extension past diff edge (endcap)
+    extension_of_diff_um:    0.25   # poly.7 — diff extension beyond poly (min S/D)
 
   diff:
-    width_min_um:            0.15   # diff.1
-    spacing_min_um:          0.27   # diff.2
-    extension_past_poly_um:  0.06   # diff.3 — diff must extend past poly in width dir
+    width_min_um:            0.15   # difftap.1 — min diff/tap width
+    spacing_min_um:          0.27   # difftap.3 — diff-to-diff / tap-to-tap spacing
+    extension_past_poly_um:  0.06   # diff extension past gate in channel-width direction
+    channel_width_min_um:    0.42   # difftap.2 — min channel width (diff AND poly)
+    enclosure_of_pdiff_by_nwell_um: 0.18  # difftap.8 — nwell enc of p+ diff
+    ndiff_spacing_to_nwell_um: 0.34 # difftap.9 — n+ diff spacing to nwell
 
   contacts:                         # licon1 rules
     size_um:               0.17   # licon.1 — square contact cut
     spacing_um:            0.17   # licon.2 — contact-to-contact spacing
-    enclosure_in_diff_um:  0.04   # licon.5a — diff must enclose contact on each side
-    enclosure_in_li1_um:   0.00   # licon.3 — li1 enclosure of contact (min, all sides)
+    enclosure_in_diff_um:  0.04   # licon.5a — diff must enclose licon (all sides)
+    enclosure_in_diff_2adj_um: 0.06  # licon.5c — diff enc of licon on one of 2 adjacent sides
+    enclosure_in_li1_um:   0.00   # li1 enc of licon (all sides / opp when 2adj)
     enclosure_in_li1_2adj_um: 0.08  # li.5 — li1 enc of licon on 2 adjacent edges
-    space_to_poly_um:      0.05   # licon.7 — contact must clear poly edge by this
-    poly_enclosure_um:     0.05   # licon.10 — poly enclosure of polycontact licon1
+    poly_enclosure_um:     0.05   # licon.8 — poly enc of polycontact (all sides min)
+    poly_enclosure_2adj_um: 0.08  # licon.8a — poly enc of polycontact on one of 2 adjacent sides
+    space_to_poly_um:      0.05   # licon.11a — licon on diff/tap spacing to gate (areaid.sc)
+    space_to_gate_um:      0.055  # licon.11 — licon on diff/tap spacing to gate (general)
+    polylicon_to_difftap_um: 0.19 # licon.14 — poly_licon spacing to diff or tap
 
   met1:
-    width_min_um:   0.14   # met1.1
-    spacing_min_um: 0.14   # met1.2
-    area_min_um2:   0.083  # m1.6 — minimum met1 area
+    width_min_um:   0.14   # m1.1 — min met1 width
+    spacing_min_um: 0.14   # m1.2 — min met1 spacing
+    area_min_um2:   0.083  # m1.6 — min met1 area
+    enclosure_of_mcon_um:      0.03  # m1.4 — met1 enc of mcon (all sides)
     enclosure_of_mcon_2adj_um: 0.06  # m1.5 — met1 enc of mcon on 2 adjacent edges
+    hole_area_min_um2: 0.14 # m1.7 — min met1 hole area
 
   met2:
     width_min_um:   0.14   # met2.1
     spacing_min_um: 0.14   # met2.2
     area_min_um2:   0.0676 # m2.6 — minimum met2 area
-    enclosure_of_via1_2adj_um: 0.085  # m2.5 — met2 enc of via1 on 2 adjacent edges
+    enclosure_of_via1_um:      0.055 # m2.4 — met2 enc of via1 (opp when 2adj met)
+    enclosure_of_via1_2adj_um: 0.085 # m2.5 — met2 enc of via1 on 2 adjacent edges
 
   via1:                            # met1 → met2 via rules
     size_um:               0.15   # via.1a — square via cut
@@ -105,14 +141,32 @@ rules:
     spacing_min_um: 0.17   # li1.2
     area_min_um2:   0.0561 # li.6 — minimum li1 area
 
+  tap:                              # well/substrate tap contact rules
+    enclosure_of_licon_um: 0.12   # licon.7 — tap must enclose licon on one of 2 adjacent sides
+    min_area_um2:          0.07011 # psd.10b / nsd.10b — minimum tap diffusion area
+    spacing_to_diff_um:    0.27   # difftap.3 — tap diffusion spacing to gate diffusion
+    ndiff_to_nwell_um:     0.34   # N-diff (P-sub tap) spacing to N-well edge
+    ptap_to_nwell_um:      0.13   # difftap.11 — P-tap spacing to N-well
+    ntap_enc_by_nwell_um:  0.18   # difftap.10 — N-well must enclose (n+) tap
+
   implant:
-    enclosure_of_diff_um: 0.125   # nsdm.3 / psdm.3 — implant encloses active region
-    spacing_min_um:       0.38    # nsdm.1 / psdm.1 — min implant spacing (periphery)
+    width_min_um:          0.38   # nsd.1 / psd.1 — min implant width
+    spacing_min_um:        0.38   # nsd.2 / psd.2 — min implant spacing
+    enclosure_of_diff_um:  0.125  # nsd.5a / psd.5a — implant enc of diff
+    enclosure_of_tap_um:   0.125  # nsd.5b / psd.5b — implant enc of tap
+    spacing_to_opposite_um: 0.13  # nsd.7 / psd.7 — spacing to opposite implant
+    min_area_nsdm_um2:     0.265  # nsd.10a — min nsdm area
+    min_area_psdm_um2:     0.255  # psd.10b — min psdm area
 
   nwell:
     width_min_um:          0.84   # nwell.1
     spacing_min_um:        1.27   # nwell.2
     enclosure_of_pdiff_um: 0.18   # nwell.5 — nwell must enclose PMOS diff
+
+  npc:                             # nitride poly cut (prevents silicide on poly stubs)
+    spacing_to_gate_um:    0.09   # npc.4 — NPC spacing to gate (poly on diff)
+    enclosure_of_polylicon_um: 0.10  # licon.15 — NPC must enclose poly_licon
+    enclosure_of_poly_um:  0.10   # NPC enclosure of poly endcap stub (conservative)
 
 # ── DRC decks ────────────────────────────────────────────────────────────────
 #
@@ -150,3 +204,25 @@ devices:
     nwell:            true
     w_finger_max_um:  2.0
     sd_length_min_um: 0.29
+
+# ── Metal stack ──────────────────────────────────────────────────────────────
+#
+# Ordered bottom-to-top.  Each entry names a routing metal and the via
+# that connects it to the metal immediately below.  The router uses this
+# to figure out which vias to insert between any two layers.
+#
+# via_rules names the YAML rules section that holds size_um / enclosure
+# values for the via cut.  lower_enc / upper_enc name the enclosure keys
+# in the *metal* rules sections (2-adj-edge values used for landing pads).
+metal_stack:
+  - metal: li1
+  - metal: met1
+    via: mcon
+    via_rules: mcon
+    lower_enc: {section: mcon,  key: enclosure_in_li1_um}
+    upper_enc: {section: met1,  key: enclosure_of_mcon_2adj_um}
+  - metal: met2
+    via: via1
+    via_rules: via1
+    lower_enc: {section: via1,  key: enclosure_in_met1_2adj_um}
+    upper_enc: {section: met2,  key: enclosure_of_via1_2adj_um}

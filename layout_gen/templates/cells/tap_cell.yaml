@@ -1,0 +1,36 @@
+# layout_gen cell topology template — standalone well/substrate tap cell
+#
+# Provides P+ substrate tap (VSS bias) and N+ nwell tap (VDD bias).
+# Tiled alongside logic cells at regular intervals for latch-up prevention.
+# All dimensions derived from PDK rules — no hardcoded values.
+
+name: tap_cell
+description: Substrate and N-well tap cell for well biasing
+
+# Tap configuration — which taps to generate
+taps:
+  ptap:                       # P+ substrate tap (VSS / GND bias)
+    implant: psdm
+    rail: bottom
+    net: GND
+  ntap:                       # N+ nwell tap (VDD bias, inside nwell)
+    implant: nsdm
+    rail: top
+    net: VDD
+
+# Contact stack layers (bottom to top)
+# Each tap draws: tap diffusion → licon → li1 → mcon → met1
+stack:
+  diffusion: tap              # tap diffusion layer
+  contact:   licon1           # contact cut
+  li:        li1              # local interconnect
+  via:       mcon             # li1 → met1 via
+  metal:     met1             # power rail metal
+
+nets:
+  VDD: {type: power, rail: top}
+  GND: {type: power, rail: bottom}
+
+ports:
+  GND: {side: south}
+  VDD: {side: north}

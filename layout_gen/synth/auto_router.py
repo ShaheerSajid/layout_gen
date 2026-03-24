@@ -23,7 +23,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from layout_gen.pdk import PDKRules
-from layout_gen.synth.loader import CellTemplate, RoutingSpec
+from layout_gen.synth.loader import CellTemplate, RoutingHint, RoutingSpec
 from layout_gen.synth.placer import PlacedDevice, resolve_terminal
 from layout_gen.synth.netlist import NetGraph, NetInfo, TerminalRef
 
@@ -54,6 +54,7 @@ class AutoRouter:
         directly to :meth:`Router.route`.
         """
         specs: list[RoutingSpec] = []
+        hints = template.routing_hints   # dict[str, RoutingHint]
 
         # Build lookup: row_pair_id → set of device names
         row_devices = _build_row_device_map(placed)
@@ -65,10 +66,13 @@ class AutoRouter:
         specs.extend(self._phase_b_inter_pair(net_graph, placed, row_devices))
 
         # Phase C: vertical buses (multi-row S/D)
-        specs.extend(self._phase_c_vertical_buses(net_graph, placed, row_devices))
+        specs.extend(self._phase_c_vertical_buses(net_graph, placed, row_devices, hints))
 
         # Phase D: power rails
-        specs.extend(self._phase_d_power_rails(net_graph))
+        specs.extend(self._phase_d_power_rails(net_graph, placed, template))
+
+        # Phase H: hint-driven routing (full_width WL, full_height BL, etc.)
+        specs.extend(self._phase_h_hint_routing(net_graph, placed, template, hints))
 
         # Phase E: terminal exposure (handled by port_resolver, not here)
         # Port exposure specs are generated separately in port_resolver.py
@@ -325,6 +329,7 @@ class AutoRouter:
         ng:          NetGraph,
         placed:      dict[str, PlacedDevice],
         row_devices: dict[int, set[str]],
+        hints:       dict[str, RoutingHint] | None = None,
     ) -> list[RoutingSpec]:
         """Generate vertical_bus specs for S/D nets spanning 3+ row pairs.
 
@@ -366,13 +371,20 @@ class AutoRouter:
             tap_xs = [_terminal_cx(t, placed, self.rules) for t in sd_terms]
             bus_x = sum(tap_xs) / len(tap_xs)
 
-            met1_w = self.rules.met1.get("width_min_um", 0.14)
             extra: dict = {"bus_x": round(bus_x, 3)}
+
+            # Use routing hint layer preference if available
+            hint = (hints or {}).get(net_name)
+            bus_layer = "met1"
+            if hint and hint.layer:
+                bus_layer = hint.layer
+                if bus_layer in ("met2",):
+                    extra["via_level"] = 2
 
             specs.append(RoutingSpec(
                 net=net_name,
                 style="vertical_bus",
-                layer="met1",
+                layer=bus_layer,
                 path=path,
                 extra=extra,
             ))
@@ -381,10 +393,65 @@ class AutoRouter:
 
     # ── Phase D: power rails ──────────────────────────────────────────────
 
-    def _phase_d_power_rails(self, ng: NetGraph) -> list[RoutingSpec]:
-        """Generate horizontal_power_rail specs for power nets."""
-        specs: list[RoutingSpec] = []
+    def _phase_d_power_rails(
+        self,
+        ng:       NetGraph,
+        placed:   dict[str, PlacedDevice],
+        template: CellTemplate,
+    ) -> list[RoutingSpec]:
+        """Generate horizontal_power_rail specs for power nets.
 
+        For stacked layouts with ``rail_top``/``rail_bottom`` on row pairs,
+        emits intermediate rails at the computed Y boundaries between pairs.
+        """
+        specs: list[RoutingSpec] = []
+        emitted_edges: set[str] = set()  # track top/bottom to avoid duplicates
+
+        # ── Fixed cell width (if specified in template) ───────────────
+        cell_width = template.cell_dimensions.width if template.cell_dimensions.width > 0 else 0.0
+
+        # ── Intermediate rails from row pair declarations ──────────────
+        if template.layout_mode == "stacked" and template.row_pairs:
+            # Compute Y-extent of each row pair from placed devices
+            rp_bounds: dict[int, tuple[float, float]] = {}  # id → (y_min, y_max)
+            for rp in template.row_pairs:
+                all_devs = rp.nmos_devices + rp.pmos_devices
+                ys = []
+                for dname in all_devs:
+                    if dname in placed:
+                        d = placed[dname]
+                        ys.extend([d.y, d.y + d.geom.total_y_um])
+                if ys:
+                    rp_bounds[rp.id] = (min(ys), max(ys))
+
+            extra_base: dict = {}
+            if cell_width > 0:
+                extra_base["cell_width"] = cell_width
+
+            for rp in template.row_pairs:
+                if rp.id not in rp_bounds:
+                    continue
+                rp_ymin, rp_ymax = rp_bounds[rp.id]
+
+                if rp.rail_top:
+                    specs.append(RoutingSpec(
+                        net=rp.rail_top,
+                        style="horizontal_power_rail",
+                        layer="met1",
+                        extra={**extra_base, "y_pos": rp_ymax},
+                    ))
+                    emitted_edges.add(f"{rp.rail_top}_top_{rp.id}")
+
+                if rp.rail_bottom:
+                    specs.append(RoutingSpec(
+                        net=rp.rail_bottom,
+                        style="horizontal_power_rail",
+                        layer="met1",
+                        extra={**extra_base, "y_pos": rp_ymin},
+                    ))
+                    emitted_edges.add(f"{rp.rail_bottom}_bottom_{rp.id}")
+
+        # ── Outer edge rails (default behaviour) ──────────────────────
         for net_name, info in ng.nets.items():
             if not info.is_power:
                 continue
@@ -399,14 +466,100 @@ class AutoRouter:
             elif net_name in ("VSS", "GND"):
                 edge = "bottom"
             else:
-                continue  # unknown power net without rail spec
+                continue
 
+            extra_edge: dict = {}
+            if cell_width > 0:
+                extra_edge["cell_width"] = cell_width
             specs.append(RoutingSpec(
                 net=net_name,
                 style="horizontal_power_rail",
                 layer="met1",
                 edge=edge,
+                extra=extra_edge,
             ))
+
+            # Connect device source terminals to the rail
+            terminals = [t.ref for t in info.terminals if t.terminal == "S"]
+            if terminals:
+                specs.append(RoutingSpec(
+                    net=net_name,
+                    style="source_to_rail",
+                    path=terminals,
+                    layer="li1",
+                    edge=edge,
+                ))
+
+        return specs
+
+
+    # ── Phase H: hint-driven routing ─────────────────────────────────────
+
+    def _phase_h_hint_routing(
+        self,
+        ng:       NetGraph,
+        placed:   dict[str, PlacedDevice],
+        template: CellTemplate,
+        hints:    dict[str, RoutingHint],
+    ) -> list[RoutingSpec]:
+        """Generate routing specs from explicit per-net hints in the template.
+
+        Handles:
+        - ``style: full_width`` → WL-style met1 bus spanning cell width
+          (via ``poly_stub_met1_bus`` style handler)
+        - ``style: full_height`` → BL-style met2 bus spanning cell height
+          (via ``expose_terminal`` + vertical bus on specified layer)
+        """
+        if not hints:
+            return []
+
+        specs: list[RoutingSpec] = []
+
+        for net_name, hint in hints.items():
+            info = ng.nets.get(net_name)
+            if info is None:
+                continue
+
+            # Cell bounds for full-span routing
+            cell_x0 = min(d.x for d in placed.values())
+            cell_x1 = max(d.x + d.geom.total_x_um for d in placed.values())
+            cell_y0 = min(d.y for d in placed.values())
+            cell_y1 = max(d.y + d.geom.total_y_um for d in placed.values())
+            cell_w  = template.cell_dimensions.width if template.cell_dimensions.width else 0
+            if cell_w > 0:
+                cx = (cell_x0 + cell_x1) / 2
+                cell_x0 = cx - cell_w / 2
+                cell_x1 = cx + cell_w / 2
+
+            if hint.style == "full_width":
+                # WL-style: poly-contact stub + met1 horizontal bus
+                # Find gate terminals on this net
+                gate_refs = [t.ref for t in info.gate_terminals
+                             if t.device in placed]
+                if gate_refs:
+                    specs.append(RoutingSpec(
+                        net=net_name,
+                        style="poly_stub_met1_bus",
+                        layer=hint.layer or "met1",
+                        path=gate_refs,
+                        extra={"cell_x0": cell_x0, "cell_x1": cell_x1},
+                    ))
+
+            elif hint.style == "full_height":
+                # BL-style: full-height met2 stripe at S/D terminal
+                sd_refs = [t.ref for t in info.sd_terminals
+                           if t.device in placed]
+                for ref in sd_refs:
+                    layer = hint.layer or "met2"
+                    specs.append(RoutingSpec(
+                        net=net_name,
+                        style="vertical_met2_bus",
+                        layer=layer,
+                        path=[ref],
+                        extra={
+                            "cell_y0": cell_y0, "cell_y1": cell_y1,
+                        },
+                    ))
 
         return specs
 

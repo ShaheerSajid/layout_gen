@@ -163,6 +163,28 @@ class LayerPromote:
 
 
 @dataclass
+class MoveGroup:
+    """Translate all shapes in a via/contact group by ``(dx, dy)`` µm.
+
+    Via stacks (poly pad + licon + li1 + mcon + met1) must move as a unit.
+    Individual MoveShape on a group member would break internal alignment.
+
+    Parameters
+    ----------
+    group_id : int
+        The group ID (assigned by :meth:`LayoutState.tag_via_groups`).
+    dx, dy : float
+        Translation in µm.
+    """
+    group_id: int
+    dx:       float
+    dy:       float
+
+    def describe(self) -> str:
+        return f"Move group {self.group_id} by ({self.dx:.3f}, {self.dy:.3f}) µm"
+
+
+@dataclass
 class SnapToGrid:
     """Snap all edges of a rectangle to the manufacturing grid.
 
@@ -188,7 +210,7 @@ class SnapToGrid:
 # Union of all action types (for type annotations)
 Action = Union[
     StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes,
-    ResizeContact, LayerPromote, SnapToGrid,
+    ResizeContact, LayerPromote, MoveGroup, SnapToGrid,
 ]
 
 
@@ -279,6 +301,11 @@ def apply_action(state: LayoutState, action: Action) -> Rect | None:
         state.remove(action.rid)
         return state.add(action.to_layer, r.x0, r.y0, r.x1, r.y1,
                          net=r.net, shape_type="wire")
+
+    elif isinstance(action, MoveGroup):
+        state.move_group(action.group_id, action.dx, action.dy)
+        members = state.group_members(action.group_id)
+        return members[0] if members else None
 
     elif isinstance(action, SnapToGrid):
         g = action.grid
