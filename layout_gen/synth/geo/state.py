@@ -39,13 +39,20 @@ class Rect:
         Logical layer name (e.g. ``"met1"``).
     x0, y0, x1, y1 : float
         Bounding box in µm.  ``x0 < x1``, ``y0 < y1``.
+    net : str
+        Net name this shape belongs to (empty if unknown).
+    shape_type : str
+        Semantic type: ``"wire"``, ``"contact"``, ``"via"``, ``"gate"``,
+        ``"diffusion"``, ``"implant"``, ``"rail"``, or ``""`` (unknown).
     """
-    rid:   int
-    layer: str
-    x0:    float
-    y0:    float
-    x1:    float
-    y1:    float
+    rid:        int
+    layer:      str
+    x0:         float
+    y0:         float
+    x1:         float
+    y1:         float
+    net:        str = ""
+    shape_type: str = ""
 
     @property
     def width(self) -> float:
@@ -84,8 +91,14 @@ class Rect:
         return (self.x0 - tol <= x <= self.x1 + tol and
                 self.y0 - tol <= y <= self.y1 + tol)
 
+    @property
+    def is_contact(self) -> bool:
+        """True if this shape is a contact or via."""
+        return self.shape_type in ("contact", "via")
+
     def copy(self) -> "Rect":
-        return Rect(self.rid, self.layer, self.x0, self.y0, self.x1, self.y1)
+        return Rect(self.rid, self.layer, self.x0, self.y0, self.x1, self.y1,
+                    self.net, self.shape_type)
 
 
 class LayoutState:
@@ -126,12 +139,13 @@ class LayoutState:
     # ── Mutation ─────────────────────────────────────────────────────────────
 
     def add(self, layer: str, x0: float, y0: float,
-            x1: float, y1: float) -> Rect:
+            x1: float, y1: float,
+            net: str = "", shape_type: str = "") -> Rect:
         """Add a rectangle and return it."""
         rid = self._next_rid
         self._next_rid += 1
         r = Rect(rid, layer, min(x0, x1), min(y0, y1),
-                 max(x0, x1), max(y0, y1))
+                 max(x0, x1), max(y0, y1), net, shape_type)
         self._rects[rid] = r
         return r
 
@@ -208,6 +222,43 @@ class LayoutState:
                     pairs.append((a, b, d))
         pairs.sort(key=lambda t: t[2])
         return pairs
+
+    # ── Connectivity queries ──────────────────────────────────────────────────
+
+    def on_net(self, net: str) -> list[Rect]:
+        """All rectangles belonging to *net*."""
+        return [r for r in self._rects.values() if r.net == net]
+
+    def contacts_near(self, x: float, y: float, radius: float,
+                      layer: str | None = None) -> list[Rect]:
+        """Contact/via shapes near ``(x, y)``."""
+        return [r for r in self.near(x, y, radius, layer=layer)
+                if r.is_contact]
+
+    def shapes_of_type(self, shape_type: str,
+                       layer: str | None = None) -> list[Rect]:
+        """All rectangles of a given shape_type, optionally filtered by layer."""
+        result = []
+        for r in self._rects.values():
+            if r.shape_type != shape_type:
+                continue
+            if layer and r.layer != layer:
+                continue
+            result.append(r)
+        return result
+
+    def connected_shapes(self, rid: int, max_dist: float = 0.01) -> list[Rect]:
+        """Shapes on any layer that overlap or touch rect *rid* (connectivity)."""
+        ref = self._rects.get(rid)
+        if ref is None:
+            return []
+        result = []
+        for r in self._rects.values():
+            if r.rid == rid:
+                continue
+            if ref.edge_dist(r) <= max_dist:
+                result.append(r)
+        return result
 
     # ── Import / Export ──────────────────────────────────────────────────────
 

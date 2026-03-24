@@ -105,6 +105,64 @@ class MergeShapes:
 
 
 @dataclass
+class ResizeContact:
+    """Resize a contact/via to its correct PDK dimensions.
+
+    Contacts and vias have fixed sizes — stretching them is wrong.
+    This action deletes the undersized contact and redraws it at the
+    correct size, centred on the original location.
+
+    Parameters
+    ----------
+    rid : int
+        Rectangle ID of the undersized contact.
+    target_size : float
+        Correct contact/via size in µm (e.g. 0.17 for sky130 licon1).
+    """
+    rid:         int
+    target_size: float   # µm — correct contact dimension
+
+    def describe(self) -> str:
+        return (f"Resize contact rect {self.rid} to "
+                f"{self.target_size:.3f}×{self.target_size:.3f} µm")
+
+
+@dataclass
+class LayerPromote:
+    """Move a wire segment from one metal layer to a higher one.
+
+    Inserts via stacks at both ends and redraws the wire on the
+    target layer.  Used when a met1 wire causes spacing violations
+    that can be resolved by routing on met2 instead.
+
+    Parameters
+    ----------
+    rid : int
+        Rectangle ID of the wire to promote.
+    from_layer : str
+        Current metal layer (e.g. ``"met1"``).
+    to_layer : str
+        Target metal layer (e.g. ``"met2"``).
+    via_layer : str
+        Via layer between them (e.g. ``"via1"``).
+    via_size : float
+        Via square dimension in µm.
+    via_enclosure : float
+        Metal enclosure of via on each side in µm.
+    """
+    rid:            int
+    from_layer:     str
+    to_layer:       str
+    via_layer:      str   = "via1"
+    via_size:       float = 0.15
+    via_enclosure:  float = 0.085
+
+    def describe(self) -> str:
+        return (f"Promote rect {self.rid} from {self.from_layer} to "
+                f"{self.to_layer} via {self.via_layer}")
+
+
+@dataclass
 class SnapToGrid:
     """Snap all edges of a rectangle to the manufacturing grid.
 
@@ -128,7 +186,10 @@ class SnapToGrid:
 
 
 # Union of all action types (for type annotations)
-Action = Union[StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes, SnapToGrid]
+Action = Union[
+    StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes,
+    ResizeContact, LayerPromote, SnapToGrid,
+]
 
 
 # ── Apply ────────────────────────────────────────────────────────────────────
@@ -177,6 +238,47 @@ def apply_action(state: LayoutState, action: Action) -> Rect | None:
         for r in rects:
             state.remove(r.rid)
         return state.add(layer, x0, y0, x1, y1)
+
+    elif isinstance(action, ResizeContact):
+        r = state[action.rid]
+        cx, cy = r.cx, r.cy
+        half = action.target_size / 2
+        # Preserve layer, net, and shape_type metadata
+        state.remove(action.rid)
+        return state.add(r.layer, cx - half, cy - half, cx + half, cy + half,
+                         net=r.net, shape_type=r.shape_type)
+
+    elif isinstance(action, LayerPromote):
+        r = state[action.rid]
+        vh = action.via_size / 2
+        enc = action.via_enclosure
+        # Add vias at both ends of the wire
+        if r.width >= r.height:
+            # Horizontal wire — vias at left and right ends
+            via_y0, via_y1 = r.cy - vh, r.cy + vh
+            state.add(action.via_layer,
+                      r.x0 + enc - vh, via_y0,
+                      r.x0 + enc + vh, via_y1,
+                      net=r.net, shape_type="via")
+            state.add(action.via_layer,
+                      r.x1 - enc - vh, via_y0,
+                      r.x1 - enc + vh, via_y1,
+                      net=r.net, shape_type="via")
+        else:
+            # Vertical wire — vias at top and bottom ends
+            via_x0, via_x1 = r.cx - vh, r.cx + vh
+            state.add(action.via_layer,
+                      via_x0, r.y0 + enc - vh,
+                      via_x1, r.y0 + enc + vh,
+                      net=r.net, shape_type="via")
+            state.add(action.via_layer,
+                      via_x0, r.y1 - enc - vh,
+                      via_x1, r.y1 - enc + vh,
+                      net=r.net, shape_type="via")
+        # Redraw wire on target layer
+        state.remove(action.rid)
+        return state.add(action.to_layer, r.x0, r.y0, r.x1, r.y1,
+                         net=r.net, shape_type="wire")
 
     elif isinstance(action, SnapToGrid):
         g = action.grid

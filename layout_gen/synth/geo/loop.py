@@ -140,6 +140,14 @@ class GeoFixLoop:
                 remaining=0,  # updated below after DRC
             ))
 
+            # Feed experience to learned agent if applicable
+            from layout_gen.synth.geo.learned_agent import LearnedGeoAgent
+            if isinstance(self.agent, LearnedGeoAgent):
+                # remaining will be updated after next DRC run
+                self.agent.record_outcome(
+                    state, parsed, actions, len(parsed),
+                )
+
         # Final DRC check
         violations = self._run_drc(state)
         if history:

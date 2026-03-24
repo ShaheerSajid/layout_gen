@@ -31,17 +31,22 @@ Usage::
 from layout_gen.synth.geo.state      import LayoutState, Rect
 from layout_gen.synth.geo.actions    import (
     Action, StretchEdge, MoveShape, AddRect, RemoveShape, MergeShapes,
-    SnapToGrid, apply_action,
+    ResizeContact, LayerPromote, SnapToGrid, apply_action,
 )
 from layout_gen.synth.geo.violations import ViolationInfo, parse_violation
 from layout_gen.synth.geo.agent      import GeoFixAgent, RuleGeoAgent
 from layout_gen.synth.geo.loop       import GeoFixLoop
+from layout_gen.synth.geo.learned_agent import (
+    LearnedGeoAgent, ExperienceBuffer, Experience,
+)
 
 __all__ = [
     "LayoutState", "Rect",
-    "Action", "StretchEdge", "MoveShape", "AddRect", "RemoveShape", "MergeShapes", "SnapToGrid",
+    "Action", "StretchEdge", "MoveShape", "AddRect", "RemoveShape", "MergeShapes",
+    "ResizeContact", "LayerPromote", "SnapToGrid",
     "apply_action",
     "ViolationInfo", "parse_violation",
     "GeoFixAgent", "RuleGeoAgent",
+    "LearnedGeoAgent", "ExperienceBuffer", "Experience",
     "GeoFixLoop",
 ]

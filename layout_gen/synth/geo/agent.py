@@ -39,6 +39,7 @@ from typing import Any
 from layout_gen.synth.geo.state      import LayoutState, Rect
 from layout_gen.synth.geo.actions    import (
     Action, StretchEdge, MoveShape, AddRect, MergeShapes, SnapToGrid,
+    ResizeContact, LayerPromote,
 )
 from layout_gen.synth.geo.violations import ViolationInfo
 
@@ -101,8 +102,14 @@ class RuleGeoAgent(GeoFixAgent):
         violation: ViolationInfo,
     ) -> list[Action]:
         cat = violation.category
+
+        # Detect contact/via size violations by rule name pattern
+        if self._is_contact_size_violation(violation):
+            return self._fix_contact_size(state, violation)
+
         if cat == "spacing":
-            return self._fix_spacing(state, violation)
+            actions = self._fix_spacing(state, violation)
+            return self._check_connectivity(state, actions)
         elif cat == "width":
             return self._fix_width(state, violation)
         elif cat == "enclosure" or cat == "extension":
@@ -115,6 +122,95 @@ class RuleGeoAgent(GeoFixAgent):
             return self._fix_offgrid(state, violation)
         else:
             return self._fix_unknown(state, violation)
+
+    # ── Contact/via size detection ───────────────────────────────────────────
+
+    @staticmethod
+    def _is_contact_size_violation(v: ViolationInfo) -> bool:
+        """True if this violation is about a contact/via being the wrong size."""
+        rule_lower = v.rule.lower()
+        desc_lower = (v.raw.description or "").lower() if v.raw else ""
+        # sky130: licon.1, mcon.1;  TSMC: CO.W.1, VIA.W.1, etc.
+        size_keywords = ("size", "licon.1", "mcon.1", "co.w", "via.w")
+        if any(kw in rule_lower for kw in size_keywords):
+            return True
+        if v.category == "width" and v.layer in ("licon1", "mcon", "via1", "via2"):
+            return True
+        if "size" in desc_lower and any(
+            cl in v.layer for cl in ("licon", "mcon", "via", "contact")
+        ):
+            return True
+        return False
+
+    # ── Contact size fix ────────────────────────────────────────────────────
+
+    def _fix_contact_size(
+        self, state: LayoutState, v: ViolationInfo,
+    ) -> list[Action]:
+        """Fix contact/via size violation by resizing to correct PDK dimension.
+
+        Contacts have fixed sizes — stretching them is wrong.  Instead, we
+        delete and redraw at the correct size, centred on the same location.
+        """
+        # Determine correct contact size from PDK rules
+        target_size = v.required
+        if target_size <= 0 and self.rules is not None:
+            target_size = self.rules.contacts.get("size_um", 0.17)
+        if target_size <= 0:
+            target_size = 0.17  # safe fallback
+
+        # Find the undersized contact(s) near the violation
+        shapes = state.near(v.x, v.y, self.search_radius, layer=v.layer)
+        if not shapes:
+            shapes = state.on_layer(v.layer)
+
+        actions: list[Action] = []
+        for s in shapes:
+            dim = min(s.width, s.height)
+            if dim < target_size - _EPS:
+                actions.append(ResizeContact(rid=s.rid,
+                                             target_size=target_size))
+        return actions
+
+    # ── Connectivity-aware action filter ──────────────────────────────────
+
+    def _check_connectivity(
+        self, state: LayoutState, actions: list[Action],
+    ) -> list[Action]:
+        """Filter out MoveShape actions that would disconnect a net.
+
+        If moving a shape would break all connections to shapes on the same
+        net, fall back to StretchEdge on the facing edge instead.
+        """
+        safe_actions: list[Action] = []
+        for action in actions:
+            if not isinstance(action, MoveShape):
+                safe_actions.append(action)
+                continue
+
+            r = state[action.rid]
+            if not r.net:
+                # No net info — can't check connectivity, allow the move
+                safe_actions.append(action)
+                continue
+
+            # Check how many same-net shapes this rect touches
+            connected = [s for s in state.connected_shapes(r.rid)
+                         if s.net == r.net]
+            if len(connected) <= 1:
+                # Only one connection — moving would isolate it.
+                # Fall back to StretchEdge: shrink the facing edge instead.
+                # Determine which edge faces the conflict direction
+                if abs(action.dx) >= abs(action.dy):
+                    edge = "right" if action.dx < 0 else "left"
+                    delta = abs(action.dx)
+                else:
+                    edge = "top" if action.dy < 0 else "bottom"
+                    delta = abs(action.dy)
+                safe_actions.append(StretchEdge(r.rid, edge, -delta))
+            else:
+                safe_actions.append(action)
+        return safe_actions
 
     # ── Spacing ──────────────────────────────────────────────────────────────
 
@@ -405,14 +501,57 @@ class RuleGeoAgent(GeoFixAgent):
             return [SnapToGrid(rid=-1)]
         return [SnapToGrid(rid=s.rid) for s in shapes]
 
+    # ── Layer promotion for persistent spacing violations ───────────────────
+
+    def _try_layer_promote(
+        self, state: LayoutState, v: ViolationInfo,
+    ) -> list[Action]:
+        """Suggest promoting a met1 wire to met2 if spacing can't be fixed.
+
+        Only applies to met1 spacing violations where StretchEdge/MoveShape
+        have already been tried (caller should check).
+        """
+        if v.layer not in ("met1", "m1", "metal1"):
+            return []
+
+        shapes = state.near(v.x, v.y, self.search_radius, layer=v.layer)
+        wires = [s for s in shapes if s.shape_type == "wire"]
+        if not wires:
+            wires = shapes  # fall back to any shape
+
+        if len(wires) < 2:
+            return []
+
+        # Promote the smaller wire
+        target = min(wires, key=lambda s: s.area)
+
+        via_size = 0.15
+        via_enc  = 0.085
+        if self.rules is not None:
+            via_size = self.rules.contacts.get("via1_size_um",
+                       self.rules.contacts.get("size_um", 0.15))
+            via_enc  = self.rules.contacts.get("via1_enclosure_um", 0.085)
+
+        return [LayerPromote(
+            rid=target.rid,
+            from_layer="met1",
+            to_layer="met2",
+            via_layer="via1",
+            via_size=via_size,
+            via_enclosure=via_enc,
+        )]
+
     # ── Unknown ──────────────────────────────────────────────────────────────
 
     def _fix_unknown(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
-        """Fallback: try spacing fix, then width fix."""
+        """Fallback: try spacing fix, then width fix, then layer promote."""
         actions = self._fix_spacing(state, v)
         if actions:
             return actions
-        return self._fix_width(state, v)
+        actions = self._fix_width(state, v)
+        if actions:
+            return actions
+        return self._try_layer_promote(state, v)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

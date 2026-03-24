@@ -46,6 +46,7 @@ from layout_gen.synth.auto_router import AutoRouter
 from layout_gen.synth.port_resolver import resolve_ports, generate_expose_specs
 from layout_gen.synth.geo.agent   import GeoFixAgent
 from layout_gen.synth.geo.loop    import GeoFixLoop
+from layout_gen.synth.ml.fix_policy import DRCFixPredictor
 
 
 # ── Public types ──────────────────────────────────────────────────────────────
@@ -108,19 +109,21 @@ class Synthesizer:
 
     def __init__(
         self,
-        rules:      PDKRules,
-        drc_runner: Any | None          = None,
-        ml_model:   MLModel | None      = None,
-        max_iter:   int                 = 10,
-        geo_agent:  GeoFixAgent | None  = None,
-        geo_max_iter: int               = 10,
+        rules:          PDKRules,
+        drc_runner:     Any | None              = None,
+        ml_model:       MLModel | None          = None,
+        fix_predictor:  DRCFixPredictor | None  = None,
+        max_iter:       int                     = 10,
+        geo_agent:      GeoFixAgent | None      = None,
+        geo_max_iter:   int                     = 10,
     ):
-        self.rules        = rules
-        self.drc_runner   = drc_runner
-        self.ml_model     = ml_model or _heuristic_ml_model
-        self.max_iter     = max_iter
-        self.geo_agent    = geo_agent
-        self.geo_max_iter = geo_max_iter
+        self.rules          = rules
+        self.drc_runner     = drc_runner
+        self.ml_model       = ml_model or _heuristic_ml_model
+        self.fix_predictor  = fix_predictor
+        self.max_iter       = max_iter
+        self.geo_agent      = geo_agent
+        self.geo_max_iter   = geo_max_iter
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -201,10 +204,20 @@ class Synthesizer:
                 return SynthResult(comp, placed, current_params,
                                    [], iteration, True)
 
-            # ── ML model adjusts params for next iteration ─────────────────
-            new_params = self.ml_model(
-                template, self.rules, violations, current_params
-            )
+            # ── ML-guided param adjustment for next iteration ────────────
+            if self.fix_predictor is not None and self.fix_predictor.is_trained:
+                delta = self.fix_predictor.predict(
+                    violations, current_params, self.rules)
+                new_params = {
+                    k: current_params.get(k, 0) + delta.get(k, 0)
+                    for k in set(current_params) | set(delta)
+                }
+                # Clamp to PDK minimums
+                new_params = _clamp_params(new_params, self.rules)
+            else:
+                new_params = self.ml_model(
+                    template, self.rules, violations, current_params
+                )
             if new_params == current_params:
                 # Model proposed no change — avoid spinning
                 break
@@ -357,6 +370,27 @@ def _merge_nwells_stacked(
             [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
             layer=lyr,
         )
+
+
+# ── Parameter clamping ─────────────────────────────────────────────────────────
+
+def _clamp_params(params: dict, rules: PDKRules) -> dict:
+    """Clamp synthesis params to PDK minimum values."""
+    clamped = dict(params)
+    poly_min = rules.poly.get("width_min_um", 0.15)
+    diff_min = rules.diff.get("width_min_um", 0.15)
+    if "l" in clamped:
+        clamped["l"] = max(float(clamped["l"]), poly_min)
+    if "w_N" in clamped:
+        clamped["w_N"] = max(float(clamped["w_N"]), diff_min)
+    if "w_P" in clamped:
+        clamped["w_P"] = max(float(clamped["w_P"]), diff_min)
+    if "gap_y" in clamped:
+        clamped["gap_y"] = max(float(clamped["gap_y"]), 0.0)
+    for k in ("finger_N", "finger_P"):
+        if k in clamped:
+            clamped[k] = max(1, int(round(float(clamped[k]))))
+    return clamped
 
 
 # ── DRC helper ────────────────────────────────────────────────────────────────
