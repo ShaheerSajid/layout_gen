@@ -46,7 +46,6 @@ from layout_gen.synth.auto_router import AutoRouter
 from layout_gen.synth.port_resolver import resolve_ports, generate_expose_specs
 from layout_gen.synth.geo.agent   import GeoFixAgent
 from layout_gen.synth.geo.loop    import GeoFixLoop
-from layout_gen.synth.ml.fix_policy import DRCFixPredictor
 
 
 # ── Public types ──────────────────────────────────────────────────────────────
@@ -112,7 +111,6 @@ class Synthesizer:
         rules:          PDKRules,
         drc_runner:     Any | None              = None,
         ml_model:       MLModel | None          = None,
-        fix_predictor:  DRCFixPredictor | None  = None,
         max_iter:       int                     = 10,
         geo_agent:      GeoFixAgent | None      = None,
         geo_max_iter:   int                     = 10,
@@ -120,7 +118,6 @@ class Synthesizer:
         self.rules          = rules
         self.drc_runner     = drc_runner
         self.ml_model       = ml_model or _heuristic_ml_model
-        self.fix_predictor  = fix_predictor
         self.max_iter       = max_iter
         self.geo_agent      = geo_agent
         self.geo_max_iter   = geo_max_iter
@@ -213,19 +210,9 @@ class Synthesizer:
                                    [], iteration, True)
 
             # ── ML-guided param adjustment for next iteration ────────────
-            if self.fix_predictor is not None and self.fix_predictor.is_trained:
-                delta = self.fix_predictor.predict(
-                    violations, current_params, self.rules)
-                new_params = {
-                    k: current_params.get(k, 0) + delta.get(k, 0)
-                    for k in set(current_params) | set(delta)
-                }
-                # Clamp to PDK minimums
-                new_params = _clamp_params(new_params, self.rules)
-            else:
-                new_params = self.ml_model(
-                    template, self.rules, violations, current_params
-                )
+            new_params = self.ml_model(
+                template, self.rules, violations, current_params
+            )
             if new_params == current_params:
                 # Model proposed no change — avoid spinning
                 break

@@ -8,7 +8,7 @@ template and synthesizes a DRC-clean GDS layout by:
 2. Resolving symbolic constraints using PDK rules
 3. Placing transistor primitives at computed coordinates
 4. Routing nets using registered style handlers
-5. Iterating with DRC feedback (optional ML model or built-in heuristic)
+5. Iterating with DRC feedback (built-in heuristic or custom callable)
 
 Quick start
 -----------
@@ -28,17 +28,6 @@ Quick start
     result.component.write_gds("inv.gds")
     print(f"Synthesized in {result.iterations} iteration(s); "
           f"DRC {'clean' if result.converged else f'{len(result.violations)} violations'}")
-
-ML-guided synthesis
--------------------
-::
-
-    def my_model(template, rules, violations, params):
-        # Analyse DRC violations → return updated params dict
-        return params
-
-    synth = Synthesizer(rules, drc_runner=runner, ml_model=my_model)
-    result = synth.synthesize(template, params, max_iter=20)
 
 Built-in templates
 ------------------
@@ -98,16 +87,6 @@ from layout_gen.synth.euler import (
     has_euler_path,
     euler_path,
 )
-from layout_gen.synth.ml import (
-    MLAgent,
-    ModelNotTrainedError,
-    MarginPredictor,
-    DRCFixPredictor,
-    ViolationEncoder,
-    generate_fix_dataset,
-    FixDataset,
-)
-
 __all__ = [
     # Template loading
     "load_template",
@@ -154,13 +133,4 @@ __all__ = [
     "build_diffusion_graph",
     "has_euler_path",
     "euler_path",
-    # ML agent
-    "MLAgent",
-    "ModelNotTrainedError",
-    "MarginPredictor",
-    # DRC fix policy
-    "DRCFixPredictor",
-    "ViolationEncoder",
-    "generate_fix_dataset",
-    "FixDataset",
 ]

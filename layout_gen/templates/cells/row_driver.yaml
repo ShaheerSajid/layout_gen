@@ -23,8 +23,8 @@ devices:
   P_WL:  {template: planar_mosfet, type: pmos, terminals: {G: WLEN, D: Y_nd, S: VDD}}
 
   # Output inverter stage (wider PMOS for drive strength)
-  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}, fingers: 1}
-  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, fingers: 1}
+  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}, w: 1.04,  fingers: 2}
+  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, w: 1.04,  fingers: 2}
 
 nets:
   VDD:  {type: power, rail: top}

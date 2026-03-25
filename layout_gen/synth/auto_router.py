@@ -72,7 +72,12 @@ class AutoRouter:
         specs.extend(self._phase_d_power_rails(net_graph, placed, template))
 
         # Phase F: gate-to-drain connections (cross-couple, stage-to-stage)
-        specs.extend(self._phase_f_gate_to_drain(net_graph, placed, template))
+        gtd_specs = self._phase_f_gate_to_drain(net_graph, placed, template)
+        gtd_nets = {s.net for s in gtd_specs}
+        # Suppress drain_bridge on nets that have gate_to_drain (they overlap)
+        specs = [s for s in specs
+                 if not (s.style == "drain_bridge" and s.net in gtd_nets)]
+        specs.extend(gtd_specs)
 
         # Phase H: hint-driven routing (full_width WL, full_height BL, etc.)
         specs.extend(self._phase_h_hint_routing(net_graph, placed, template, hints))
@@ -152,7 +157,7 @@ class AutoRouter:
                         specs.append(RoutingSpec(
                             net=net_name,
                             style="drain_bridge",
-                            layer="li1",
+                            layer=info.layer or "li1",
                             path=[nd.ref, pd.ref],
                         ))
 
@@ -194,7 +199,7 @@ class AutoRouter:
                         specs.append(RoutingSpec(
                             net=net_name,
                             style="li1_bridge",
-                            layer="li1",
+                            layer=info.layer or "li1",
                             path=[a.ref, b.ref],
                         ))
 
@@ -451,19 +456,21 @@ class AutoRouter:
                 rp_ymin, rp_ymax = rp_bounds[rp.id]
 
                 if rp.rail_top:
+                    top_net = ng.nets.get(rp.rail_top)
                     specs.append(RoutingSpec(
                         net=rp.rail_top,
                         style="horizontal_power_rail",
-                        layer="met1",
+                        layer=(top_net.layer if top_net and top_net.layer else "met1"),
                         extra={**extra_base, "y_pos": rp_ymax},
                     ))
                     emitted_edges.add(f"{rp.rail_top}_top_{rp.id}")
 
                 if rp.rail_bottom:
+                    bot_net = ng.nets.get(rp.rail_bottom)
                     specs.append(RoutingSpec(
                         net=rp.rail_bottom,
                         style="horizontal_power_rail",
-                        layer="met1",
+                        layer=(bot_net.layer if bot_net and bot_net.layer else "met1"),
                         extra={**extra_base, "y_pos": rp_ymin},
                     ))
                     emitted_edges.add(f"{rp.rail_bottom}_bottom_{rp.id}")
@@ -491,19 +498,21 @@ class AutoRouter:
             specs.append(RoutingSpec(
                 net=net_name,
                 style="horizontal_power_rail",
-                layer="met1",
+                layer=info.layer or "met1",
                 edge=edge,
                 extra=extra_edge,
             ))
 
             # Connect device source terminals to the rail
+            # source_to_rail needs the rail layer to drop vias from li1 up
+            rail_lyr = info.layer or "met1"
             terminals = [t.ref for t in info.terminals if t.terminal == "S"]
             if terminals:
                 specs.append(RoutingSpec(
                     net=net_name,
                     style="source_to_rail",
                     path=terminals,
-                    layer="li1",
+                    layer=rail_lyr,
                     edge=edge,
                 ))
 
@@ -606,6 +615,15 @@ class AutoRouter:
             })
 
         # Assign layers: check each pair of routes for crossing
+        # Build layer stack: li1 → met1 → met2 ...
+        layer_stack = ["li1"]
+        try:
+            transitions = self.rules.via_stack_between("li1", "met2")
+            for t in transitions:
+                layer_stack.append(t.upper_metal)
+        except (KeyError, IndexError, AttributeError):
+            layer_stack.append("met1")
+
         for i in range(len(routes)):
             for j in range(i + 1, len(routes)):
                 ri, rj = routes[i], routes[j]
@@ -617,14 +635,19 @@ class AutoRouter:
                 if dir_i * dir_j < 0:  # opposite directions = crossing
                     rj["layer_idx"] = max(rj["layer_idx"], ri["layer_idx"] + 1)
 
-        # Emit specs
+        # Emit specs — prefer net-level layer if set, else use crossing logic
         for r in routes:
+            net_layer = ng.nets[r["net"]].layer
+            if net_layer:
+                route_lyr = net_layer
+            else:
+                idx = min(r["layer_idx"], len(layer_stack) - 1)
+                route_lyr = layer_stack[idx]
             specs.append(RoutingSpec(
                 net=r["net"],
                 style="gate_to_drain",
-                layer="",  # handler will resolve from layer_idx
+                layer=route_lyr,
                 path=[r["gate"].ref, r["drain"].ref],
-                extra={"layer_idx": r["layer_idx"]},
             ))
 
         return specs

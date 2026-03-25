@@ -5,17 +5,10 @@ Technology-agnostic layout repair via polygon-level geometric operations.
 
 Architecture
 ------------
-Phase 1 (existing): ``fix_policy.DRCFixPredictor`` adjusts *parameters*
-    (w, l, gap) to avoid violations.  Works for initial layout generation.
-
-Phase 2 (this package): ``RuleGeoAgent`` applies *geometric actions*
-    (stretch edge, move shape, merge) directly on layout polygons.
-    It parses DRC violation descriptions to decide what to do — no
-    hardcoded rule→fix mapping per technology.
-
-Phase 3 (future): ``LearnedGeoAgent`` replaces rule-based heuristics
-    with a trained policy network (GNN/Transformer + RL).  Same action
-    space, same violation parser — just a learned decision function.
+``RuleGeoAgent`` applies *geometric actions* (stretch edge, move shape,
+    merge) directly on layout polygons.  It parses DRC violation
+    descriptions to decide what to do — no hardcoded rule→fix mapping
+    per technology.
 
 Usage::
 
@@ -36,10 +29,6 @@ from layout_gen.synth.geo.actions    import (
 from layout_gen.synth.geo.violations import ViolationInfo, parse_violation
 from layout_gen.synth.geo.agent      import GeoFixAgent, RuleGeoAgent
 from layout_gen.synth.geo.loop       import GeoFixLoop
-from layout_gen.synth.geo.learned_agent import (
-    LearnedGeoAgent, ExperienceBuffer, Experience,
-)
-
 __all__ = [
     "LayoutState", "Rect",
     "Action", "StretchEdge", "MoveShape", "AddRect", "RemoveShape", "MergeShapes",
@@ -47,6 +36,5 @@ __all__ = [
     "apply_action",
     "ViolationInfo", "parse_violation",
     "GeoFixAgent", "RuleGeoAgent",
-    "LearnedGeoAgent", "ExperienceBuffer", "Experience",
     "GeoFixLoop",
 ]

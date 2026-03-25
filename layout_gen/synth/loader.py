@@ -30,6 +30,7 @@ class NetSpec:
     name:     str
     net_type: str        # "power" | "signal" | "internal"
     rail:     str = ""   # "top" | "bottom" (power nets only)
+    layer:    str = ""   # optional routing layer ("li1", "met1", …)
 
 
 @dataclass
@@ -337,6 +338,7 @@ def _load_template(
                     name=name,
                     net_type=spec.get("type", "signal"),
                     rail=spec.get("rail", ""),
+                    layer=spec.get("layer", ""),
                 )
             else:
                 nets[name] = NetSpec(name=name, net_type="signal")

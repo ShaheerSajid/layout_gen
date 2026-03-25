@@ -47,9 +47,7 @@ from layout_gen.synth.placer   import (
 )
 
 
-# ── Drawing + corridor carving ───────────────────────────────────────────────
-
-_current_corridor = None   # CorridorMap | None
+# ── Drawing helpers ──────────────────────────────────────────────────────────
 
 # Track poly contacts already drawn so shared gates don't get duplicates.
 # Key: (gate_cx_snapped, gate_device_name), Value: (pc_x, pc_y)
@@ -57,14 +55,8 @@ _drawn_poly_contacts: dict[tuple[float, str], tuple[float, float]] = {}
 
 
 def _rect(c, x0, x1, y0, y1, layer, snap_grid=0.005):
-    """Draw a rectangle and carve it into the corridor map."""
+    """Draw a rectangle."""
     _rect_raw(c, x0, x1, y0, y1, layer, snap_grid)
-    if _current_corridor is not None:
-        _current_corridor.carve_gds(
-            layer,
-            min(x0, x1), min(y0, y1),
-            max(x0, x1), max(y0, y1),
-        )
 
 
 # ── PortCandidate ─────────────────────────────────────────────────────────────
@@ -117,15 +109,10 @@ class Router:
     ----------
     rules :
         PDK rules.
-    corridor :
-        Optional :class:`~layout_gen.synth.corridor.CorridorMap`.
-        When provided, every ``_rect`` call automatically carves the
-        corridor, and handlers can query it for valid routing regions.
     """
 
-    def __init__(self, rules: PDKRules, corridor: Any = None):
+    def __init__(self, rules: PDKRules):
         self.rules = rules
-        self.corridor = corridor
 
     def route(
         self,
@@ -134,26 +121,20 @@ class Router:
         placed:   dict[str, PlacedDevice],
     ) -> list[PortCandidate]:
         """Route all specs and return collected port candidates."""
-        global _current_corridor
         _drawn_poly_contacts.clear()
         candidates: list[PortCandidate] = []
-        _current_corridor = self.corridor
-        try:
-            for spec in routing:
-                handler = _REGISTRY.get(spec.style)
-                if handler is None:
-                    warnings.warn(
-                        f"No handler registered for routing style {spec.style!r} "
-                        f"(net={spec.net!r}); skipping.",
-                        stacklevel=2,
-                    )
-                    continue
-                result = handler(comp, spec, placed, self.rules,
-                                 corridor=self.corridor)
-                if result:
-                    candidates.extend(result)
-        finally:
-            _current_corridor = None
+        for spec in routing:
+            handler = _REGISTRY.get(spec.style)
+            if handler is None:
+                warnings.warn(
+                    f"No handler registered for routing style {spec.style!r} "
+                    f"(net={spec.net!r}); skipping.",
+                    stacklevel=2,
+                )
+                continue
+            result = handler(comp, spec, placed, self.rules)
+            if result:
+                candidates.extend(result)
         return candidates
 
 
@@ -409,7 +390,8 @@ def _drain_bridge(
     nd_y0, nd_y1 = global_diff_y(dev_n, rules)
     pd_y0, pd_y1 = global_diff_y(dev_p, rules)
 
-    lyr = rules.layer("li1")
+    route_layer = spec.layer or "li1"
+    lyr = rules.layer(route_layer)
 
     # Check if drains are aligned or offset
     n_cx = (ndx0 + ndx1) / 2
@@ -421,8 +403,8 @@ def _drain_bridge(
         if pd_y0 > nd_y1:
             _rect(comp, ndx0, ndx1, nd_y1, pd_y0, lyr)
     else:
-        # ── L-shaped bridge: vertical from NMOS drain, horizontal jog to PMOS drain ──
-        jog_y = (nd_y1 + pd_y0) / 2
+        # ── L-shaped bridge: horizontal jog at NMOS diff centre, vertical up to PMOS ──
+        jog_y = (nd_y0 + nd_y1) / 2
         hw = max(li1_w / 2, (ndx1 - ndx0) / 2)
 
         _rect(comp, ndx0, ndx1, nd_y1, jog_y + hw, lyr)
@@ -439,7 +421,7 @@ def _drain_bridge(
         net=spec.net,
         location_key="drain_bridge_right_edge_mid_y",
         x=max(ndx1, pdx1), y=out_mid_y,
-        layer="li1",
+        layer=route_layer,
         width=bridge_height,
         orientation=0,
     )]
@@ -552,28 +534,6 @@ def _gate_to_drain(
             pc_x = max(pc_x, min_pc_x)
             break
 
-    # ── Corridor check: constrain pad to free region on the far side ──
-    corridor = kwargs.get("corridor")
-    if corridor is not None:
-        pad_y0 = pc_y - li1_hy_val
-        pad_y1 = pc_y + li1_hy_val
-        if drain_is_left:
-            # Far side is right — find rightward limit
-            limit_x = corridor.max_extent(
-                "li1", pc_x + li1_hx_right, pad_y0, pad_y1, "right",
-            )
-            # limit_x is the first blocked cell; pad right edge must stay before it
-            max_pc_x = limit_x - li1_hx_right
-            pc_x = min(pc_x, max_pc_x)
-        else:
-            # Far side is left — find leftward limit
-            limit_x = corridor.max_extent(
-                "li1", pc_x - li1_hx_left, pad_y0, pad_y1, "left",
-            )
-            # limit_x is the first blocked cell; pad left edge must stay after it
-            min_pc_x = limit_x + li1_hx_left
-            pc_x = max(pc_x, min_pc_x)
-
     # ── Snap contact centre to mfg grid so all offsets stay on-grid ──────
     _grid = rules.mfg_grid
     if _grid > 0:
@@ -618,21 +578,7 @@ def _gate_to_drain(
         _rect(comp, gx0, gx1, pc_y - poly_pad_hy, poly_bot, lyr_poly)
 
     # ── Determine route layer ────────────────────────────────────────────
-    layer_idx = (spec.extra or {}).get("layer_idx", 0)
-
-    base_layer = "li1"
-    if layer_idx == 0:
-        route_layer = base_layer
-    else:
-        try:
-            transitions = rules.via_stack_between(base_layer, "met2")
-            if transitions:
-                route_layer = transitions[-1].upper_metal
-            else:
-                route_layer = "met1"
-        except (KeyError, IndexError):
-            route_layer = "met1"
-
+    route_layer = spec.layer or "li1"
     lyr_route = rules.layer(route_layer)
 
     # ── Route width ──────────────────────────────────────────────────────
@@ -643,33 +589,31 @@ def _gate_to_drain(
         route_w = li1_w_min
     rhw = route_w / 2
 
-    # ── Horizontal route from poly contact to drain ──────────────────────
+    # ── Route from poly contact to drain centre, then straight down ─────
     route_y  = pc_y
-    route_x0 = min(pc_x - li1_hx_left, dx0)
-    route_x1 = max(pc_x + li1_hx_right, dx1)
+    dd_y0, dd_y1 = global_diff_y(drain_dev, rules)
 
-    if layer_idx == 0:
-        # Direct route on li1
-        _rect(comp, route_x0, route_x1, route_y - rhw, route_y + rhw, lyr_route)
-        # Vertical li1 from route to drain S/D strip
-        dd_y0, dd_y1 = global_diff_y(drain_dev, rules)
-        if is_nmos_gate:
-            _rect(comp, dx0, dx1, dd_y1, route_y + rhw, lyr_li1)
-        else:
-            _rect(comp, dx0, dx1, route_y - rhw, dd_y0, lyr_li1)
-    else:
-        # Via up at poly contact
+    # Via stack at poly contact end (li1 → route_layer) if needed
+    if route_layer != "li1":
         draw_via_stack(comp, rules, pc_x, pc_y, "li1", route_layer)
-        # Horizontal route on higher layer
-        _rect(comp, route_x0, route_x1, route_y - rhw, route_y + rhw, lyr_route)
-        # Via down at drain end
-        draw_via_stack(comp, rules, drain_cx, route_y, route_layer, "li1")
-        # Vertical li1 from via to drain S/D strip
-        dd_y0, dd_y1 = global_diff_y(drain_dev, rules)
-        if is_nmos_gate:
-            _rect(comp, dx0, dx1, dd_y1, route_y + rhw, lyr_li1)
-        else:
-            _rect(comp, dx0, dx1, route_y - rhw, dd_y0, lyr_li1)
+
+    # 1. Horizontal from poly contact to drain centre at route_y
+    _rect(comp, min(pc_x - li1_hx_left, drain_cx - rhw),
+                max(pc_x + li1_hx_right, drain_cx + rhw),
+                route_y - rhw, route_y + rhw, lyr_route)
+
+    # 2. Vertical from route down/up to drain S/D strip (same layer)
+    if is_nmos_gate:
+        _rect(comp, drain_cx - rhw, drain_cx + rhw,
+                    dd_y1, route_y + rhw, lyr_route)
+    else:
+        _rect(comp, drain_cx - rhw, drain_cx + rhw,
+                    route_y - rhw, dd_y0, lyr_route)
+
+    # Via stack at drain end (route_layer → li1) if needed
+    if route_layer != "li1":
+        draw_via_stack(comp, rules, drain_cx, dd_y1 if is_nmos_gate else dd_y0,
+                       route_layer, "li1")
 
     return []
 
@@ -691,11 +635,15 @@ def _horizontal_power_rail(
     if not placed:
         return []
 
+    route_layer = spec.layer or "met1"
+    route_rules_d = getattr(rules, route_layer, None) or {}
+    if not isinstance(route_rules_d, dict):
+        route_rules_d = {}
     rail_h = max(
-        (rules.met1 or {}).get("width_min_um", 0.14),
+        route_rules_d.get("width_min_um", 0.14),
         rules.li1.get("width_min_um", 0.17),
     )
-    lyr    = rules.layer("met1")
+    lyr    = rules.layer(route_layer)
 
     dev_x0  = min(dev.x for dev in placed.values())
     dev_x1  = max(dev.x + dev.geom.total_x_um for dev in placed.values())
@@ -724,7 +672,7 @@ def _horizontal_power_rail(
             net=spec.net,
             location_key=f"rail_{spec.net}_{y_center:.3f}",
             x=cell_cx, y=(y0 + y1) / 2,
-            layer="met1",
+            layer=route_layer,
             width=cell_w,
             orientation=90,
         )]
@@ -740,7 +688,7 @@ def _horizontal_power_rail(
             net=spec.net,
             location_key="bottom_rail_center",
             x=cell_cx, y=(y0 + y1) / 2,
-            layer="met1",
+            layer=route_layer,
             width=cell_w,
             orientation=270,
         )]
@@ -751,7 +699,7 @@ def _horizontal_power_rail(
             net=spec.net,
             location_key="top_rail_center",
             x=cell_cx, y=(y0 + y1) / 2,
-            layer="met1",
+            layer=route_layer,
             width=cell_w,
             orientation=90,
         )]
@@ -778,20 +726,15 @@ def _source_to_rail(
         return []
 
     edge = spec.edge or "bottom"
+    rail_layer = spec.layer or "met1"
 
-    c_size = rules.contacts.get("size_um", 0.17)
-    ch     = c_size / 2
-    mcon_rules = rules.mcon or {}
-    mcon_sz = mcon_rules.get("size_um", c_size)
-    mch    = mcon_sz / 2
-    enc_m1_2adj, _ = rules.enclosure("met1", "enclosure_of_mcon")
-    m1_land = mch + enc_m1_2adj    # met1 landing half-extent around mcon
     li1_w  = rules.li1.get("width_min_um", 0.17)
-    rail_h = max(rules.met1.get("width_min_um", 0.14), li1_w)
+    rail_rules_d = getattr(rules, rail_layer, None) or {}
+    if not isinstance(rail_rules_d, dict):
+        rail_rules_d = {}
+    rail_h = max(rail_rules_d.get("width_min_um", 0.14), li1_w)
 
     lyr_li1  = rules.layer("li1")
-    lyr_mcon = rules.layer("mcon")
-    lyr_m1   = rules.layer("met1")
 
     # Rail Y boundaries (shifted by gap when li1=met1)
     gap = _power_rail_gap(rules)
@@ -808,7 +751,6 @@ def _source_to_rail(
             continue
 
         tx_mid = (t.x0 + t.x1) / 2
-        ty_mid = (t.y0 + t.y1) / 2
 
         # Li1 strap: extend from terminal toward rail
         li1_hx = max(li1_w / 2, (t.x1 - t.x0) / 2)
@@ -821,13 +763,10 @@ def _source_to_rail(
         _rect(comp, tx_mid - li1_hx, tx_mid + li1_hx,
                     li1_y0, li1_y1, lyr_li1)
 
-        # Via + landing only when li1 and met1 are different layers
-        if not rules.li1_is_met1:
-            mcon_cy = (rail_y0 + rail_y1) / 2
-            _rect(comp, tx_mid - mch, tx_mid + mch,
-                        mcon_cy - mch, mcon_cy + mch, lyr_mcon)
-            _rect(comp, tx_mid - m1_land, tx_mid + m1_land,
-                        mcon_cy - m1_land, mcon_cy + m1_land, lyr_m1)
+        # Via stack from li1 up to rail layer
+        if rail_layer != "li1":
+            via_cy = (rail_y0 + rail_y1) / 2
+            draw_via_stack(comp, rules, tx_mid, via_cy, "li1", rail_layer)
 
     return []
 
@@ -851,17 +790,21 @@ def _li1_bridge(
     t0 = resolve_terminal(spec.path[0], placed, rules)
     t1 = resolve_terminal(spec.path[1], placed, rules)
 
-    lyr    = rules.layer("li1")
-    li1_w  = rules.li1.get("width_min_um", 0.17)
+    route_layer = spec.layer or "li1"
+    lyr    = rules.layer(route_layer)
+    route_rules_d = getattr(rules, route_layer, None) or {}
+    if not isinstance(route_rules_d, dict):
+        route_rules_d = {}
+    route_w = route_rules_d.get("width_min_um", 0.17)
 
     # Bridge spans between the two terminals in X
     bridge_x0 = min(t0.x1, t1.x0) if t0.x1 < t1.x0 else min(t1.x1, t0.x0)
     bridge_x1 = max(t0.x1, t1.x0) if t0.x1 < t1.x0 else max(t1.x1, t0.x0)
 
-    # Narrow horizontal strip: li1_min_width in Y, centred on diff midpoint
+    # Narrow horizontal strip: min_width in Y, centred on diff midpoint
     y_mid = (max(t0.y0, t1.y0) + min(t0.y1, t1.y1)) / 2
-    y0 = y_mid - li1_w / 2
-    y1 = y_mid + li1_w / 2
+    y0 = y_mid - route_w / 2
+    y1 = y_mid + route_w / 2
 
     if bridge_x1 > bridge_x0:
         _rect(comp, bridge_x0, bridge_x1, y0, y1, lyr)
@@ -872,8 +815,8 @@ def _li1_bridge(
         net=spec.net,
         location_key=f"{spec.net}_bridge_center",
         x=mid_x, y=y_mid,
-        layer="li1",
-        width=li1_w,
+        layer=route_layer,
+        width=route_w,
         orientation=90,
     )]
 

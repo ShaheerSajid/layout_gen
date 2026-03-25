@@ -39,6 +39,7 @@ class NetInfo:
     name:       str
     net_type:   str                   # "power", "signal", "internal"
     rail:       str = ""              # "top" | "bottom" (power nets only)
+    layer:      str = ""              # preferred routing layer ("li1", "met1", …)
     terminals:  list[TerminalRef] = field(default_factory=list)
 
     @property
@@ -98,6 +99,7 @@ def build_net_graph(template: CellTemplate) -> NetGraph:
             name=name,
             net_type=nspec.net_type,
             rail=nspec.rail,
+            layer=getattr(nspec, "layer", ""),
         )
 
     # ── Walk device terminals to populate connectivity ────────────────────

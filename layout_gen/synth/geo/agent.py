@@ -2,8 +2,7 @@
 layout_gen.synth.geo.agent — Geometric DRC fix agents.
 
 :class:`GeoFixAgent` is the abstract base.  :class:`RuleGeoAgent`
-(Phase 2) uses deterministic heuristics.  :class:`LearnedGeoAgent`
-(Phase 3, in ``learned_agent.py``) will use a trained policy network.
+uses deterministic heuristics to fix DRC violations.
 
 Design principle
 ----------------
