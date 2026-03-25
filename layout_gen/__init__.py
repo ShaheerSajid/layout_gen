@@ -39,7 +39,7 @@ from layout_gen.transistor  import (
 from layout_gen.visualize   import write_svg
 from layout_gen.cells       import draw_tap_cell
 from layout_gen.drc         import run_drc, DRCViolation, available_tools
-from layout_gen.synth       import load_template, Synthesizer, SynthResult, MLAgent, ModelNotTrainedError
+from layout_gen.synth       import load_template, Synthesizer, SynthResult
 
 __all__ = [
     # PDK
@@ -60,10 +60,8 @@ __all__ = [
     "run_drc",
     "DRCViolation",
     "available_tools",
-    # ML synthesizer
+    # Synthesizer
     "load_template",
     "Synthesizer",
     "SynthResult",
-    "MLAgent",
-    "ModelNotTrainedError",
 ]

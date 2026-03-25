@@ -56,13 +56,21 @@ class ViaTransition:
         Enclosure of the via in the lower metal (2-adj-edge, µm).
     enc_upper :
         Enclosure of the via in the upper metal (2-adj-edge, µm).
+    enc_lower_opp :
+        Enclosure on the opposite 2 edges of the lower metal (µm).
+        Falls back to enc_lower when not available (symmetric).
+    enc_upper_opp :
+        Enclosure on the opposite 2 edges of the upper metal (µm).
+        Falls back to enc_upper when not available (symmetric).
     """
-    via_layer:    str
-    via_size:     float
-    lower_metal:  str
-    upper_metal:  str
-    enc_lower:    float
-    enc_upper:    float
+    via_layer:      str
+    via_size:       float
+    lower_metal:    str
+    upper_metal:    str
+    enc_lower:      float          # 2-adjacent-edge enclosure
+    enc_upper:      float          # 2-adjacent-edge enclosure
+    enc_lower_opp:  float = 0.0    # opposite-edge enclosure
+    enc_upper_opp:  float = 0.0    # opposite-edge enclosure
 
 
 # ── Rule container ─────────────────────────────────────────────────────────────
@@ -316,16 +324,40 @@ class PDKRules:
             via_sec = getattr(self, via_rules_section, None) or {}
             via_size = via_sec.get("size_um", self.contacts.get("size_um", 0.17))
 
-            # Read enclosures
+            # Read enclosures (2adj + opposite)
             lower_enc_spec = entry.get("lower_enc", {})
             upper_enc_spec = entry.get("upper_enc", {})
 
-            def _read_enc(spec: dict) -> float:
-                sec = getattr(self, spec.get("section", ""), None) or {}
-                return float(sec.get(spec.get("key", ""), 0.0))
+            def _read_enc_pair(spec: dict) -> tuple:
+                """Return (enc_2adj, enc_opp) from a PDK enclosure spec.
 
-            enc_lower = _read_enc(lower_enc_spec)
-            enc_upper = _read_enc(upper_enc_spec)
+                Both rules are cumulative:
+                - ``_2adj_um``: 2 adjacent sides must meet this
+                - ``_um``: all sides must meet this (= opp minimum)
+
+                When the key is ``_2adj_um``, derive opp from ``_um``.
+                When the key is ``_um`` (symmetric), check for a
+                ``_2adj_um`` variant in the same section.
+                """
+                sec_name = spec.get("section", "")
+                sec = getattr(self, sec_name, None) or {}
+                key = spec.get("key", "")
+                val = float(sec.get(key, 0.0))
+                if "_2adj_um" in key:
+                    # Key is 2adj — look for _um as the opp (all-sides) rule
+                    opp_key = key.replace("_2adj_um", "_um")
+                    opp_val = sec.get(opp_key, None)
+                    return val, float(opp_val) if opp_val is not None else val
+                else:
+                    # Key is _um (all-sides) — look for _2adj_um
+                    adj_key = key.replace("_um", "_2adj_um")
+                    adj_val = sec.get(adj_key, None)
+                    if adj_val is not None:
+                        return float(adj_val), val
+                    return val, val
+
+            enc_lower, enc_lower_opp = _read_enc_pair(lower_enc_spec)
+            enc_upper, enc_upper_opp = _read_enc_pair(upper_enc_spec)
 
             transitions.append(ViaTransition(
                 via_layer=via_name,
@@ -334,6 +366,8 @@ class PDKRules:
                 upper_metal=metals[i],
                 enc_lower=enc_lower,
                 enc_upper=enc_upper,
+                enc_lower_opp=enc_lower_opp,
+                enc_upper_opp=enc_upper_opp,
             ))
 
         return transitions

@@ -161,6 +161,35 @@ class AutoRouter:
                             path=[nd.ref, pd.ref],
                         ))
 
+                # ── Intra-device multi-finger S/D connections ──
+                # For devices with >1 finger, connect all same-terminal
+                # S/D strips (all drains together, all sources together).
+                # Skip drain terminals — drain_bridge already handles
+                # multi-finger drain interconnection via the N-P gap bus.
+                has_drain_bridge = any(
+                    s.style == "drain_bridge" and s.net == net_name
+                    for s in specs
+                )
+                for tref in trefs:
+                    dev = placed.get(tref.device)
+                    if dev is None or dev.geom.n_fingers < 2:
+                        continue
+                    if tref.terminal not in ("S", "D"):
+                        continue
+                    if tref.terminal == "D" and has_drain_bridge:
+                        continue
+                    key = (net_name, f"intra_sd_{tref.device}_{tref.terminal}")
+                    if key in handled_pairs:
+                        continue
+                    handled_pairs.add(key)
+                    specs.append(RoutingSpec(
+                        net=net_name,
+                        style="intra_device_sd",
+                        layer=info.layer or "li1",
+                        path=[tref.ref],
+                        extra={"terminal": tref.terminal},
+                    ))
+
                 # ── Li1 bridge (abutting S/D within same tier) ──
                 # Only bridge terminals that share diffusion at an
                 # abutment boundary (adjacent S/D strips).  Terminals
@@ -575,7 +604,7 @@ class AutoRouter:
                         continue
                     if gdev.spec.row_pair != ddev.spec.row_pair:
                         continue
-                    j_d = 0 if ddev.spec.sd_flip else ddev.geom.n_fingers
+                    j_d = 0 if ddev.spec.sd_flip else 1
                     dx0, dx1 = global_sd_x(ddev, j_d, self.rules)
                     d_cx = (dx0 + dx1) / 2
                     dist = abs(g_cx - d_cx)
@@ -604,7 +633,7 @@ class AutoRouter:
             ddev = placed[d.device]
             gx0, gx1 = global_gate_x(gdev, 0)
             gate_cx = (gx0 + gx1) / 2
-            j_d = 0 if ddev.spec.sd_flip else ddev.geom.n_fingers
+            j_d = 0 if ddev.spec.sd_flip else 1
             dx0, dx1 = global_sd_x(ddev, j_d, self.rules)
             drain_cx = (dx0 + dx1) / 2
             row_pair = gdev.spec.row_pair

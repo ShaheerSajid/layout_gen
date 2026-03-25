@@ -23,16 +23,16 @@ devices:
   P_WL:  {template: planar_mosfet, type: pmos, terminals: {G: WLEN, D: Y_nd, S: VDD}}
 
   # Output inverter stage (wider PMOS for drive strength)
-  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}, w: 1.04,  fingers: 2}
-  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, w: 1.04,  fingers: 2}
+  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}, w: 2.60,  fingers: 5}
+  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, w: 2.60,  fingers: 5}
 
 nets:
-  VDD:  {type: power, rail: top}
-  GND:  {type: power, rail: bottom}
+  VDD:  {type: power, rail: top, layer: met1}
+  GND:  {type: power, rail: bottom, layer: met1}
   A:    {type: signal}
   WLEN: {type: signal}
   B:    {type: signal}
-  Y_nd: {type: internal}
+  Y_nd: {type: internal, layer: met1}
   net1: {type: internal}
 
 # ── Placement: explicit per-device directives ──────────────────────────────

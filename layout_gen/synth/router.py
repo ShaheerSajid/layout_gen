@@ -245,7 +245,11 @@ def draw_via_stack(
     """Draw all vias and metal landings needed to connect *from_layer* to *to_layer*.
 
     Uses the PDK ``metal_stack`` to determine which vias to insert.
-    Returns the half-extent of the topmost landing pad (for wire sizing).
+    Each landing pad is rectangular: 2-adjacent-edge enclosure on one
+    axis, opposite-edge enclosure on the other (per PDK rules).  The
+    2adj enclosure is applied on the X axis by default (wider pads in X).
+
+    Returns the half-extent of the topmost landing pad (max of both axes).
     If the layers resolve to the same physical layer, nothing is drawn and
     0.0 is returned.
     """
@@ -253,37 +257,37 @@ def draw_via_stack(
     if not transitions:
         return 0.0
 
+    def _metal_w_min(metal_name: str) -> float:
+        sec = getattr(rules, metal_name, {})
+        if isinstance(sec, dict):
+            return sec.get("width_min_um", 0.0)
+        return 0.0
+
     top_half = 0.0
     for t in transitions:
         vh = t.via_size / 2
 
-        # Lower metal landing
-        lower_w_min = getattr(rules, t.lower_metal, {})
-        if isinstance(lower_w_min, dict):
-            lower_w_min = lower_w_min.get("width_min_um", 0.0)
-        else:
-            lower_w_min = 0.0
-        lower_lh = max(vh + t.enc_lower, lower_w_min / 2)
+        # Lower metal landing — 2adj on X, opp on Y
+        lower_w = _metal_w_min(t.lower_metal)
+        lower_hx = max(vh + t.enc_lower, lower_w / 2)
+        lower_hy = max(vh + t.enc_lower_opp, lower_w / 2)
 
-        # Upper metal landing
-        upper_w_min = getattr(rules, t.upper_metal, {})
-        if isinstance(upper_w_min, dict):
-            upper_w_min = upper_w_min.get("width_min_um", 0.0)
-        else:
-            upper_w_min = 0.0
-        upper_lh = max(vh + t.enc_upper, upper_w_min / 2)
+        # Upper metal landing — 2adj on X, opp on Y
+        upper_w = _metal_w_min(t.upper_metal)
+        upper_hx = max(vh + t.enc_upper, upper_w / 2)
+        upper_hy = max(vh + t.enc_upper_opp, upper_w / 2)
 
         lyr_via   = rules.layer(t.via_layer)
         lyr_lower = rules.layer(t.lower_metal)
         lyr_upper = rules.layer(t.upper_metal)
 
         _rect(comp, cx - vh, cx + vh, cy - vh, cy + vh, lyr_via)
-        _rect(comp, cx - lower_lh, cx + lower_lh,
-                    cy - lower_lh, cy + lower_lh, lyr_lower)
-        _rect(comp, cx - upper_lh, cx + upper_lh,
-                    cy - upper_lh, cy + upper_lh, lyr_upper)
+        _rect(comp, cx - lower_hx, cx + lower_hx,
+                    cy - lower_hy, cy + lower_hy, lyr_lower)
+        _rect(comp, cx - upper_hx, cx + upper_hx,
+                    cy - upper_hy, cy + upper_hy, lyr_upper)
 
-        top_half = upper_lh
+        top_half = max(upper_hx, upper_hy)
 
     return top_half
 
@@ -301,6 +305,9 @@ def _shared_gate_poly(
     """Vertical poly bridge from NMOS gate top to PMOS gate bottom.
 
     Expected path: ``[N.G, P.G]``
+
+    For multi-finger devices, bridges ALL gate fingers and connects
+    them with a horizontal poly strap in the N-P gap.
     """
     if len(spec.path) < 2:
         return []
@@ -309,21 +316,44 @@ def _shared_gate_poly(
     dev_n = placed[n_name]
     dev_p = placed[p_name]
 
-    gx0, gx1 = global_gate_x(dev_n, 0)
+    lyr = rules.layer("poly")
+    n_fingers = max(dev_n.geom.n_fingers, dev_p.geom.n_fingers)
+
     y_bot = global_poly_top(dev_n)
     y_top = global_poly_bottom(dev_p)
-
-    lyr = rules.layer("poly")
-    if y_top > y_bot:
-        _rect(comp, gx0, gx1, y_bot, y_top, lyr)
-
     gap = max(y_top - y_bot, rules.poly.get("width_min_um", 0.15))
     gate_mid_y = (y_bot + y_top) / 2
+    poly_w = rules.poly.get("width_min_um", 0.15)
+    strap_hy = poly_w / 2
 
-    # Emit both a net-specific key (e.g. "A_gate_left_edge_mid_y") and the
-    # generic key ("gate_left_edge_mid_y") so that single-gate cells (inverter)
-    # still resolve with the old location string and multi-gate cells (NAND2)
-    # can address each gate individually.
+    # Bridge each finger pair vertically
+    leftmost_x0 = None
+    rightmost_x1 = None
+    for i in range(n_fingers):
+        # NMOS finger
+        if i < dev_n.geom.n_fingers:
+            ngx0, ngx1 = global_gate_x(dev_n, i)
+            if y_top > y_bot:
+                _rect(comp, ngx0, ngx1, y_bot, y_top, lyr)
+            if leftmost_x0 is None:
+                leftmost_x0 = ngx0
+            rightmost_x1 = ngx1
+
+        # PMOS finger (may have different count)
+        if i < dev_p.geom.n_fingers:
+            pgx0, pgx1 = global_gate_x(dev_p, i)
+            if y_top > y_bot:
+                _rect(comp, pgx0, pgx1, y_bot, y_top, lyr)
+            if leftmost_x0 is None:
+                leftmost_x0 = pgx0
+            rightmost_x1 = max(rightmost_x1 or pgx1, pgx1)
+
+    # Horizontal poly strap connecting all fingers in the N-P gap
+    if n_fingers > 1 and leftmost_x0 is not None:
+        _rect(comp, leftmost_x0, rightmost_x1,
+                    gate_mid_y - strap_hy, gate_mid_y + strap_hy, lyr)
+
+    gx0, _ = global_gate_x(dev_n, 0)
     net_key = f"{spec.net}_gate_left_edge_mid_y"
     return [
         PortCandidate(
@@ -347,14 +377,14 @@ def _drain_bridge(
     rules:  PDKRules,
     **kwargs,
 ) -> list[PortCandidate]:
-    """Li1 bridge from NMOS drain to PMOS drain.
+    """Bridge NMOS drain(s) to PMOS drain(s) via the N-P gap.
 
     Expected path: ``[N.D, P.D]``
 
-    When the drains are vertically aligned (same X), draws a straight
-    vertical bridge.  When they are offset (e.g. mirrored PMOS), draws
-    an L-shaped route: vertical at NMOS drain X, horizontal jog to PMOS
-    drain X at the gap between NMOS and PMOS diff.
+    For multi-finger devices, connects ALL drain S/D strips:
+    - Horizontal bus centred in the N-P gap
+    - Vertical stubs from the bus down to each NMOS drain
+    - Vertical stubs from the bus up to each PMOS drain
     """
     if len(spec.path) < 2:
         return []
@@ -363,15 +393,34 @@ def _drain_bridge(
     dev_n = placed[n_name]
     dev_p = placed[p_name]
 
-    # NMOS drain position
-    j_n = 0 if dev_n.spec.sd_flip else dev_n.geom.n_fingers
-    ndx0, ndx1 = global_sd_x(dev_n, j_n, rules)
-
-    # PMOS drain position
-    j_p = 0 if dev_p.spec.sd_flip else dev_p.geom.n_fingers
-    pdx0, pdx1 = global_sd_x(dev_p, j_p, rules)
-
     li1_w = rules.li1.get("width_min_um", 0.17)
+    route_layer = spec.layer or "li1"
+    lyr = rules.layer(route_layer)
+    route_rules_d = getattr(rules, route_layer, None) or {}
+    if not isinstance(route_rules_d, dict):
+        route_rules_d = {}
+    route_w = route_rules_d.get("width_min_um", li1_w)
+    rhw = route_w / 2
+
+    nd_y0, nd_y1 = global_diff_y(dev_n, rules)
+    pd_y0, pd_y1 = global_diff_y(dev_p, rules)
+    nd_cy = (nd_y0 + nd_y1) / 2
+    pd_cy = (pd_y0 + pd_y1) / 2
+
+    # Horizontal bus Y — centred in the N-P gap
+    bus_y = (nd_y1 + pd_y0) / 2
+
+    # Collect all drain S/D indices for both devices
+    def _drain_indices(dev):
+        indices = []
+        for j in range(dev.geom.n_fingers + 1):
+            j_is_drain = (j % 2 == 0) if dev.spec.sd_flip else (j % 2 == 1)
+            if j_is_drain:
+                indices.append(j)
+        return indices
+
+    n_drains = _drain_indices(dev_n)
+    p_drains = _drain_indices(dev_p)
 
     # When li1=met1, ensure bridge meets met1 min width
     def _enforce_min_w(x0, x1):
@@ -384,47 +433,119 @@ def _drain_bridge(
                 x1 = cx + met1_w / 2
         return x0, x1
 
-    ndx0, ndx1 = _enforce_min_w(ndx0, ndx1)
-    pdx0, pdx1 = _enforce_min_w(pdx0, pdx1)
+    # Collect all drain X positions for the horizontal bus extent
+    all_x0 = []
+    all_x1 = []
 
-    nd_y0, nd_y1 = global_diff_y(dev_n, rules)
-    pd_y0, pd_y1 = global_diff_y(dev_p, rules)
+    # NMOS vertical stubs: from nd_y1 up to bus
+    for j in n_drains:
+        sx0, sx1 = global_sd_x(dev_n, j, rules)
+        sx0, sx1 = _enforce_min_w(sx0, sx1)
+        s_cx = (sx0 + sx1) / 2
+        all_x0.append(sx0)
+        all_x1.append(sx1)
+        _rect(comp, sx0, sx1, nd_y1, bus_y + rhw, lyr)
+        if route_layer != "li1":
+            draw_via_stack(comp, rules, s_cx, nd_cy, "li1", route_layer)
 
-    route_layer = spec.layer or "li1"
-    lyr = rules.layer(route_layer)
+    # PMOS vertical stubs: from bus up to pd_y0
+    for j in p_drains:
+        sx0, sx1 = global_sd_x(dev_p, j, rules)
+        sx0, sx1 = _enforce_min_w(sx0, sx1)
+        s_cx = (sx0 + sx1) / 2
+        all_x0.append(sx0)
+        all_x1.append(sx1)
+        _rect(comp, sx0, sx1, bus_y - rhw, pd_y0, lyr)
+        if route_layer != "li1":
+            draw_via_stack(comp, rules, s_cx, pd_cy, "li1", route_layer)
 
-    # Check if drains are aligned or offset
-    n_cx = (ndx0 + ndx1) / 2
-    p_cx = (pdx0 + pdx1) / 2
-    offset = abs(n_cx - p_cx)
-
-    if offset < 0.01:
-        # ── Straight vertical bridge ──
-        if pd_y0 > nd_y1:
-            _rect(comp, ndx0, ndx1, nd_y1, pd_y0, lyr)
-    else:
-        # ── L-shaped bridge: horizontal jog at NMOS diff centre, vertical up to PMOS ──
-        jog_y = (nd_y0 + nd_y1) / 2
-        hw = max(li1_w / 2, (ndx1 - ndx0) / 2)
-
-        _rect(comp, ndx0, ndx1, nd_y1, jog_y + hw, lyr)
-        _rect(comp, pdx0, pdx1, jog_y - hw, pd_y0, lyr)
-
-        jog_x0 = min(ndx0, pdx0)
-        jog_x1 = max(ndx1, pdx1)
-        _rect(comp, jog_x0, jog_x1, jog_y - hw, jog_y + hw, lyr)
+    # Horizontal bus spanning all drains
+    if all_x0:
+        bus_x0 = min(all_x0)
+        bus_x1 = max(all_x1)
+        _rect(comp, bus_x0, bus_x1, bus_y - rhw, bus_y + rhw, lyr)
 
     bridge_height = max(pd_y0 - nd_y1, dev_n.geom.l_um)
-    out_mid_y = (nd_y1 + pd_y0) / 2
+    out_mid_y = bus_y
+    rightmost_x = max(all_x1) if all_x1 else 0.0
 
     return [PortCandidate(
         net=spec.net,
         location_key="drain_bridge_right_edge_mid_y",
-        x=max(ndx1, pdx1), y=out_mid_y,
+        x=rightmost_x, y=out_mid_y,
         layer=route_layer,
         width=bridge_height,
         orientation=0,
     )]
+
+
+@_style("intra_device_sd")
+def _intra_device_sd(
+    comp:   Any,
+    spec:   RoutingSpec,
+    placed: dict[str, PlacedDevice],
+    rules:  PDKRules,
+    **kwargs,
+) -> list[PortCandidate]:
+    """Connect all same-type S/D strips within a multi-finger device.
+
+    Expected path: ``[Dev.D]`` or ``[Dev.S]``
+    ``spec.extra["terminal"]`` = ``"D"`` or ``"S"``
+
+    For drains (j=1,3,5,...) or sources (j=0,2,4,...), draws a horizontal
+    strap on ``spec.layer`` connecting all strips at the diffusion centre.
+    Drops vias at each strip if routing above li1.
+    """
+    if not spec.path:
+        return []
+
+    dev_name = spec.path[0].split(".")[0]
+    term = (spec.extra or {}).get("terminal", "D")
+    dev = placed[dev_name]
+    n_fingers = dev.geom.n_fingers
+
+    # Determine which S/D indices are drains vs sources
+    # j=0 is source, j=1 is drain, j=2 is source, ... (standard)
+    # sd_flip reverses this
+    is_drain = (term == "D")
+    sd_indices = []
+    for j in range(n_fingers + 1):
+        j_is_drain = (j % 2 == 1) if not dev.spec.sd_flip else (j % 2 == 0)
+        if j_is_drain == is_drain:
+            sd_indices.append(j)
+
+    if len(sd_indices) < 2:
+        return []
+
+    route_layer = spec.layer or "li1"
+    lyr = rules.layer(route_layer)
+    route_rules_d = getattr(rules, route_layer, None) or {}
+    if not isinstance(route_rules_d, dict):
+        route_rules_d = {}
+    route_w = route_rules_d.get("width_min_um", rules.li1.get("width_min_um", 0.17))
+    rhw = route_w / 2
+
+    dy0, dy1 = global_diff_y(dev, rules)
+    d_cy = (dy0 + dy1) / 2
+
+    # Get X bounds for all relevant S/D strips
+    all_x0 = []
+    all_x1 = []
+    for j in sd_indices:
+        sx0, sx1 = global_sd_x(dev, j, rules)
+        all_x0.append(sx0)
+        all_x1.append(sx1)
+        # Via at each strip's contact centre
+        if route_layer != "li1":
+            s_cx = (sx0 + sx1) / 2
+            draw_via_stack(comp, rules, s_cx, d_cy, "li1", route_layer)
+
+    # Horizontal strap connecting all strips at diff centre
+    strap_x0 = min(all_x0)
+    strap_x1 = max(all_x1)
+    _rect(comp, strap_x0, strap_x1, d_cy - rhw, d_cy + rhw, lyr)
+
+    return []
 
 
 @_style("gate_to_drain")
@@ -466,7 +587,7 @@ def _gate_to_drain(
     gate_w  = gx1 - gx0   # poly gate width (= l_um)
 
     # ── Drain S/D position ───────────────────────────────────────────────
-    j_d = 0 if drain_dev.spec.sd_flip else drain_dev.geom.n_fingers
+    j_d = 0 if drain_dev.spec.sd_flip else 1
     dx0, dx1 = global_sd_x(drain_dev, j_d, rules)
     drain_cx = (dx0 + dx1) / 2
 
@@ -592,6 +713,7 @@ def _gate_to_drain(
     # ── Route from poly contact to drain centre, then straight down ─────
     route_y  = pc_y
     dd_y0, dd_y1 = global_diff_y(drain_dev, rules)
+    dd_cy = (dd_y0 + dd_y1) / 2   # S/D contact centre Y
 
     # Via stack at poly contact end (li1 → route_layer) if needed
     if route_layer != "li1":
@@ -602,18 +724,17 @@ def _gate_to_drain(
                 max(pc_x + li1_hx_right, drain_cx + rhw),
                 route_y - rhw, route_y + rhw, lyr_route)
 
-    # 2. Vertical from route down/up to drain S/D strip (same layer)
+    # 2. Vertical from route down/up to drain S/D contact centre
     if is_nmos_gate:
         _rect(comp, drain_cx - rhw, drain_cx + rhw,
-                    dd_y1, route_y + rhw, lyr_route)
+                    dd_cy, route_y + rhw, lyr_route)
     else:
         _rect(comp, drain_cx - rhw, drain_cx + rhw,
-                    route_y - rhw, dd_y0, lyr_route)
+                    route_y - rhw, dd_cy, lyr_route)
 
-    # Via stack at drain end (route_layer → li1) if needed
+    # Via stack at drain S/D contact centre (stacks on existing licon)
     if route_layer != "li1":
-        draw_via_stack(comp, rules, drain_cx, dd_y1 if is_nmos_gate else dd_y0,
-                       route_layer, "li1")
+        draw_via_stack(comp, rules, drain_cx, dd_cy, route_layer, "li1")
 
     return []
 
@@ -744,29 +865,56 @@ def _source_to_rail(
         cell_ytop = max(d.y + d.geom.total_y_um for d in placed.values())
         rail_y0, rail_y1 = cell_ytop + gap, cell_ytop + gap + rail_h
 
+    from layout_gen.synth.placer import global_sd_x, global_diff_y
+
     for ref in spec.path:
-        try:
-            t = resolve_terminal(ref, placed, rules)
-        except (KeyError, ValueError):
+        parts = ref.split(".", 1)
+        if len(parts) != 2:
+            continue
+        dev_name, term = parts
+        dev = placed.get(dev_name)
+        if dev is None:
             continue
 
-        tx_mid = (t.x0 + t.x1) / 2
+        # Collect all S/D indices for this terminal type
+        n_fingers = dev.geom.n_fingers
+        is_source = (term == "S")
+        sd_indices = []
+        for j in range(n_fingers + 1):
+            j_is_source = (j % 2 == 0) if not dev.spec.sd_flip else (j % 2 == 1)
+            if j_is_source == is_source:
+                sd_indices.append(j)
 
-        # Li1 strap: extend from terminal toward rail
-        li1_hx = max(li1_w / 2, (t.x1 - t.x0) / 2)
-        if edge == "bottom":
-            li1_y0 = rail_y0
-            li1_y1 = t.y1
-        else:
-            li1_y0 = t.y0
-            li1_y1 = rail_y1
-        _rect(comp, tx_mid - li1_hx, tx_mid + li1_hx,
-                    li1_y0, li1_y1, lyr_li1)
+        dy0, dy1 = global_diff_y(dev, rules)
+        d_cy = (dy0 + dy1) / 2
 
-        # Via stack from li1 up to rail layer
-        if rail_layer != "li1":
-            via_cy = (rail_y0 + rail_y1) / 2
-            draw_via_stack(comp, rules, tx_mid, via_cy, "li1", rail_layer)
+        for j in sd_indices:
+            sx0, sx1 = global_sd_x(dev, j, rules)
+            tx_mid = (sx0 + sx1) / 2
+            li1_hx = max(li1_w / 2, (sx1 - sx0) / 2)
+
+            if rail_layer != "li1":
+                # Via stack at S/D contact centre (stacks on existing licon)
+                draw_via_stack(comp, rules, tx_mid, d_cy, "li1", rail_layer)
+
+                # Rail-layer strap from via to rail
+                lyr_rail = rules.layer(rail_layer)
+                rail_w = rail_rules_d.get("width_min_um", li1_w)
+                rail_hx = max(rail_w / 2, li1_hx)
+                if edge == "bottom":
+                    _rect(comp, tx_mid - rail_hx, tx_mid + rail_hx,
+                                rail_y0, d_cy, lyr_rail)
+                else:
+                    _rect(comp, tx_mid - rail_hx, tx_mid + rail_hx,
+                                d_cy, rail_y1, lyr_rail)
+            else:
+                # Same layer — single li1 strap from terminal to rail
+                if edge == "bottom":
+                    _rect(comp, tx_mid - li1_hx, tx_mid + li1_hx,
+                                rail_y0, dy1, lyr_li1)
+                else:
+                    _rect(comp, tx_mid - li1_hx, tx_mid + li1_hx,
+                                dy0, rail_y1, lyr_li1)
 
     return []
 
