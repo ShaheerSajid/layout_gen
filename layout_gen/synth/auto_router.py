@@ -71,6 +71,9 @@ class AutoRouter:
         # Phase D: power rails
         specs.extend(self._phase_d_power_rails(net_graph, placed, template))
 
+        # Phase F: gate-to-drain connections (cross-couple, stage-to-stage)
+        specs.extend(self._phase_f_gate_to_drain(net_graph, placed, template))
+
         # Phase H: hint-driven routing (full_width WL, full_height BL, etc.)
         specs.extend(self._phase_h_hint_routing(net_graph, placed, template, hints))
 
@@ -136,50 +139,64 @@ class AutoRouter:
                 nmos_drains = [t for t in nmos_terms if t.terminal == "D"]
                 pmos_drains = [t for t in pmos_terms if t.terminal == "D"]
 
+                # Pair each NMOS drain with each PMOS drain on the
+                # same net.  Gate-aligned pairs produce straight
+                # vertical bridges; offset pairs (e.g. mirrored PMOS)
+                # produce L-shapes routed through the NMOS-PMOS gap.
                 for nd in nmos_drains:
                     for pd in pmos_drains:
-                        # Only bridge if gates are column-aligned
-                        # (same device X position implies vertical alignment)
-                        nd_dev = placed[nd.device]
-                        pd_dev = placed[pd.device]
-                        if abs(nd_dev.x - pd_dev.x) < 0.01:
-                            key = (net_name, f"drain_{nd.device}_{pd.device}")
-                            if key in handled_pairs:
-                                continue
-                            handled_pairs.add(key)
-                            specs.append(RoutingSpec(
-                                net=net_name,
-                                style="drain_bridge",
-                                layer="li1",
-                                path=[nd.ref, pd.ref],
-                            ))
+                        key = (net_name, f"drain_{nd.device}_{pd.device}")
+                        if key in handled_pairs:
+                            continue
+                        handled_pairs.add(key)
+                        specs.append(RoutingSpec(
+                            net=net_name,
+                            style="drain_bridge",
+                            layer="li1",
+                            path=[nd.ref, pd.ref],
+                        ))
 
                 # ── Li1 bridge (abutting S/D within same tier) ──
-                # Find pairs of terminals on same net in same row pair
-                # where both are S/D and on the same device type
+                # Only bridge terminals that share diffusion at an
+                # abutment boundary (adjacent S/D strips).  Terminals
+                # separated by other devices with different-net S/D
+                # would short if bridged on li1 (e.g. PMOS drains
+                # separated by VDD sources in a NAND gate).
                 for dtype in ("nmos", "pmos"):
                     sd_terms = [t for t in trefs
                                 if ng.device_types[t.device] == dtype
                                 and t.terminal in ("S", "D")]
                     if len(sd_terms) < 2:
                         continue
-                    # Sort by device X to find adjacent pairs
-                    sd_terms.sort(key=lambda t: placed[t.device].x)
-                    for i in range(len(sd_terms)):
-                        for j in range(i + 1, len(sd_terms)):
-                            a, b = sd_terms[i], sd_terms[j]
-                            if a.device == b.device:
-                                continue  # skip same device
-                            key = (net_name, f"li1_{a.device}_{b.device}")
-                            if key in handled_pairs:
-                                continue
-                            handled_pairs.add(key)
-                            specs.append(RoutingSpec(
-                                net=net_name,
-                                style="li1_bridge",
-                                layer="li1",
-                                path=[a.ref, b.ref],
-                            ))
+                    # Sort by terminal X centre to find truly adjacent pairs
+                    sd_terms.sort(
+                        key=lambda t: _terminal_cx(t, placed, self.rules))
+                    for i in range(len(sd_terms) - 1):
+                        a, b = sd_terms[i], sd_terms[i + 1]
+                        if a.device == b.device:
+                            continue  # skip same device
+                        # Only bridge if terminal X centres are within
+                        # one S/D length — shared diffusion at abutment
+                        a_cx = _terminal_cx(a, placed, self.rules)
+                        b_cx = _terminal_cx(b, placed, self.rules)
+                        sd_len = placed[a.device].geom.sd_length_um
+                        if abs(a_cx - b_cx) > sd_len + 0.01:
+                            continue
+                        # Skip li1 bridge for shared-diffusion abutments:
+                        # terminals at the same X share continuous
+                        # diffusion, so no li1 or contacts are needed.
+                        if abs(a_cx - b_cx) < 0.05:
+                            continue
+                        key = (net_name, f"li1_{a.device}_{b.device}")
+                        if key in handled_pairs:
+                            continue
+                        handled_pairs.add(key)
+                        specs.append(RoutingSpec(
+                            net=net_name,
+                            style="li1_bridge",
+                            layer="li1",
+                            path=[a.ref, b.ref],
+                        ))
 
         return specs
 
@@ -489,6 +506,126 @@ class AutoRouter:
                     layer="li1",
                     edge=edge,
                 ))
+
+        return specs
+
+
+    # ── Phase F: gate-to-drain connections ───────────────────────────────
+
+    def _phase_f_gate_to_drain(
+        self,
+        ng:       NetGraph,
+        placed:   dict[str, PlacedDevice],
+        template: CellTemplate,
+    ) -> list[RoutingSpec]:
+        """Detect nets with both gate and drain terminals on different
+        devices and emit ``gate_to_drain`` specs.
+
+        This covers:
+        - SRAM cross-couple (gate of one inverter ↔ drain of the other)
+        - Stage-to-stage (NAND output drain ↔ inverter gate input)
+
+        When two gate_to_drain routes on the same row pair cross in X,
+        they are assigned different layers to avoid shorting.
+        """
+        specs: list[RoutingSpec] = []
+        handled: set[str] = set()
+
+        # For each gate terminal, find the closest same-type drain on
+        # the same net (NMOS gate → closest NMOS drain, PMOS gate →
+        # closest PMOS drain).  The drain bridge already connects N/P
+        # drain pairs vertically, so one gate_to_drain per gate suffices.
+        from layout_gen.synth.placer import global_gate_x, global_sd_x
+        gtd_pairs: list[tuple[str, TerminalRef, TerminalRef]] = []
+
+        for net_name, info in ng.nets.items():
+            if info.is_power:
+                continue
+
+            gates  = [t for t in info.terminals if t.terminal == "G"]
+            drains = [t for t in info.terminals if t.terminal == "D"]
+
+            for g in gates:
+                gdev = placed.get(g.device)
+                if gdev is None:
+                    continue
+                g_type = ng.device_types[g.device]
+                gx0, gx1 = global_gate_x(gdev, 0)
+                g_cx = (gx0 + gx1) / 2
+
+                # Find closest drain on same net, same type, different device
+                best_d = None
+                best_dist = float("inf")
+                for d in drains:
+                    if d.device == g.device:
+                        continue
+                    ddev = placed.get(d.device)
+                    if ddev is None:
+                        continue
+                    if ng.device_types[d.device] != g_type:
+                        continue
+                    if gdev.spec.row_pair != ddev.spec.row_pair:
+                        continue
+                    j_d = 0 if ddev.spec.sd_flip else ddev.geom.n_fingers
+                    dx0, dx1 = global_sd_x(ddev, j_d, self.rules)
+                    d_cx = (dx0 + dx1) / 2
+                    dist = abs(g_cx - d_cx)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_d = d
+
+                if best_d is not None:
+                    key = f"gtd_{net_name}_{g.device}"
+                    if key not in handled:
+                        handled.add(key)
+                        gtd_pairs.append((net_name, g, best_d))
+
+        if not gtd_pairs:
+            return specs
+
+        # Detect crossing: two routes cross if their gate and drain X
+        # positions are on opposite sides (one goes L→R, the other R→L).
+        # Group by row pair and detect crossings.
+        from layout_gen.synth.placer import global_gate_x, global_sd_x
+
+        # Build route descriptors with X positions
+        routes: list[dict] = []
+        for net_name, g, d in gtd_pairs:
+            gdev = placed[g.device]
+            ddev = placed[d.device]
+            gx0, gx1 = global_gate_x(gdev, 0)
+            gate_cx = (gx0 + gx1) / 2
+            j_d = 0 if ddev.spec.sd_flip else ddev.geom.n_fingers
+            dx0, dx1 = global_sd_x(ddev, j_d, self.rules)
+            drain_cx = (dx0 + dx1) / 2
+            row_pair = gdev.spec.row_pair
+            routes.append({
+                "net": net_name, "gate": g, "drain": d,
+                "gate_cx": gate_cx, "drain_cx": drain_cx,
+                "row_pair": row_pair, "layer_idx": 0,
+            })
+
+        # Assign layers: check each pair of routes for crossing
+        for i in range(len(routes)):
+            for j in range(i + 1, len(routes)):
+                ri, rj = routes[i], routes[j]
+                if ri["row_pair"] != rj["row_pair"]:
+                    continue
+                # Routes cross if one goes left→right and other right→left
+                dir_i = ri["drain_cx"] - ri["gate_cx"]
+                dir_j = rj["drain_cx"] - rj["gate_cx"]
+                if dir_i * dir_j < 0:  # opposite directions = crossing
+                    rj["layer_idx"] = max(rj["layer_idx"], ri["layer_idx"] + 1)
+
+        # Emit specs
+        for r in routes:
+            specs.append(RoutingSpec(
+                net=r["net"],
+                style="gate_to_drain",
+                layer="",  # handler will resolve from layer_idx
+                path=[r["gate"].ref, r["drain"].ref],
+                extra={"layer_idx": r["layer_idx"]},
+            ))
 
         return specs
 

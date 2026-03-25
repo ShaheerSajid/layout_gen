@@ -90,6 +90,16 @@ class TransistorGeom:
 
 # ── Public helpers ─────────────────────────────────────────────────────────────
 
+def _min_channel_width(rules: PDKRules, device_type: str) -> float:
+    """Return the PDK minimum channel width (µm) for *device_type*."""
+    dev = rules.device(device_type)
+    # Prefer explicit channel_width_min; fall back to diff width_min
+    w = dev.get("channel_width_min_um", 0.0)
+    if w > 0:
+        return w
+    return rules.diff.get("width_min_um", 0.0)
+
+
 def finger_count(w_um: float, rules: PDKRules, device_type: str = "nmos") -> int:
     """Return the minimum number of gate fingers for channel width *w_um*.
 
@@ -106,7 +116,12 @@ def finger_count(w_um: float, rules: PDKRules, device_type: str = "nmos") -> int
         Logical device type (``"nmos"`` or ``"pmos"``).
     """
     w_max = rules.device(device_type).get("w_finger_max_um", 2.0)
-    return max(1, math.ceil(w_um / w_max))
+    n = max(1, math.ceil(w_um / w_max))
+    # Clamp so w_finger never drops below minimum channel width
+    w_min = _min_channel_width(rules, device_type)
+    if w_min > 0:
+        n = min(n, max(1, int(w_um / w_min)))
+    return n
 
 
 def transistor_geom(
@@ -170,6 +185,7 @@ def draw_transistor(
     rules:       PDKRules = RULES,
     *,
     n_fingers:   int | None = None,
+    skip_sd:     set[int] | None = None,
 ) -> "gf.Component":
     """Draw a single transistor and return a gdsfactory Component.
 
@@ -337,8 +353,21 @@ def draw_transistor(
 
     drain_li1_x0, source_li1_x0 = None, None
 
+    _skip = skip_sd or set()
+
     for j, cx in enumerate(sd_x_centres):
         is_drain = (j % 2 == 1)    # finger 0: left=source, right=drain
+
+        # Always track port positions even for skipped S/D
+        if j == 0:
+            source_li1_x0 = cx
+        if j == geom.n_fingers:
+            drain_li1_x0 = cx
+
+        # Skip contacts + li1 on S/D strips that connect only via shared
+        # diffusion at abutment (e.g. internal nets in NAND gates).
+        if j in _skip:
+            continue
 
         # Place one column of contacts
         for cy in c_y_centres:
@@ -377,6 +406,7 @@ def draw_transistor(
             layer=lyr_li1,
         )
 
+        # Refine port X to actual li1 centre when li1 is drawn
         if j == 0:
             source_li1_x0 = (li_x0 + li_x1) / 2
         if j == geom.n_fingers:

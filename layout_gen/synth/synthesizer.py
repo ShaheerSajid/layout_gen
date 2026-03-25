@@ -161,6 +161,11 @@ class Synthesizer:
             # ── Build component skeleton (add device refs) ─────────────────
             import gdsfactory as gf
             comp = gf.Component(name=_cell_name(template, iteration))
+
+            # Compute which S/D indices to skip contacts on (shared
+            # diffusion at abutment provides the connection already).
+            skip_map = _compute_skip_sd(template, placed)
+
             for dev in placed.values():
                 tc = draw_transistor(
                     dev.geom.w_um,
@@ -168,6 +173,7 @@ class Synthesizer:
                     dev.spec.device_type,
                     self.rules,
                     n_fingers=dev.geom.n_fingers,
+                    skip_sd=skip_map.get(dev.name),
                 )
                 ref = comp.add_ref(tc)
                 ref.move((dev.x, dev.y))
@@ -264,6 +270,88 @@ class Synthesizer:
                            converged=(not violations))
 
 
+# ── Skip-contacts computation ──────────────────────────────────────────────────
+
+def _compute_skip_sd(
+    template: CellTemplate,
+    placed:   dict[str, PlacedDevice],
+) -> dict[str, set[int]]:
+    """Determine which S/D indices should skip contacts + li1.
+
+    At abutment boundaries, the shared S/D connects via continuous
+    diffusion.  If the net on that shared S/D is internal (not power
+    and not an external port), contacts and li1/met1 are unnecessary.
+    Skipping them avoids metal-area DRC violations on PDKs where
+    li1 and met1 are the same layer.
+
+    Returns dict mapping device_name → set of S/D indices to skip.
+    """
+    skip: dict[str, set[int]] = {}
+
+    # Build set of nets that need metal connections (power + ports)
+    port_nets = set(template.ports.keys()) if template.ports else set()
+    power_nets = set()
+    for net_name, net_info in (template.nets or {}).items():
+        if net_info.net_type == "power":
+            power_nets.add(net_name)
+    needs_metal = power_nets | port_nets
+
+    if not template.placement_directives:
+        return skip
+
+    for directive in template.placement_directives:
+        if directive.relation != "abut_x":
+            continue
+        if not directive.relative_to:
+            continue
+
+        dev_name = directive.name
+        anchor_name = directive.relative_to
+        dev = placed.get(dev_name)
+        anchor = placed.get(anchor_name)
+        if dev is None or anchor is None:
+            continue
+        # Only same-type abutment (NMOS-NMOS, PMOS-PMOS)
+        if dev.spec.device_type != anchor.spec.device_type:
+            continue
+
+        # The shared S/D: rightmost of anchor, leftmost of dev
+        # Anchor's rightmost S/D index = n_fingers
+        # Dev's leftmost S/D index = 0
+        # Determine the net on the shared S/D
+        # For anchor: rightmost S/D is drain (j=n_fingers, odd → drain) or
+        #   source depending on finger count and sd_flip
+        anchor_j = anchor.geom.n_fingers  # rightmost S/D index
+        dev_j = 0                          # leftmost S/D index
+
+        # Determine terminal type at these indices
+        # j even → source, j odd → drain (before sd_flip)
+        def _terminal_at(d, j):
+            is_drain = (j % 2 == 1)
+            if d.spec.sd_flip:
+                is_drain = not is_drain
+            return "D" if is_drain else "S"
+
+        anchor_term = _terminal_at(anchor, anchor_j)
+        dev_term = _terminal_at(dev, dev_j)
+
+        # Look up the net name from the template
+        anchor_spec = template.devices.get(anchor_name)
+        dev_spec = template.devices.get(dev_name)
+        if anchor_spec is None or dev_spec is None:
+            continue
+
+        anchor_net = anchor_spec.terminals.get(anchor_term, "")
+        dev_net = dev_spec.terminals.get(dev_term, "")
+
+        # Only skip if both map to the same internal net
+        if anchor_net == dev_net and anchor_net and anchor_net not in needs_metal:
+            skip.setdefault(anchor_name, set()).add(anchor_j)
+            skip.setdefault(dev_name, set()).add(dev_j)
+
+    return skip
+
+
 # ── Implant merging ────────────────────────────────────────────────────────────
 
 def _merge_implants(
@@ -346,7 +434,7 @@ def _merge_nwells(
     nw_sp  = rules.nwell.get("spacing_min_um", 1.27)
 
     pmos_devs = [d for d in placed.values() if d.spec.device_type == "pmos"]
-    if len(pmos_devs) < 2:
+    if not pmos_devs:
         return
 
     # Compute nwell bbox per device

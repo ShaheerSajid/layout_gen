@@ -340,7 +340,19 @@ class Placer:
             )
             n = int(spec.fingers)
             if n > 0 and n != geom.n_fingers:
+                from layout_gen.transistor import _min_channel_width
                 w_f    = geom.w_um / n
+                w_min  = _min_channel_width(self.rules, spec.device_type)
+                if w_min > 0 and w_f < w_min:
+                    import warnings
+                    max_n = max(1, int(geom.w_um / w_min))
+                    warnings.warn(
+                        f"{name}: fingers={n} gives w_finger={w_f:.3f}µm "
+                        f"< min channel width {w_min:.3f}µm; "
+                        f"clamping to {max_n} fingers"
+                    )
+                    n   = max_n
+                    w_f = geom.w_um / n
                 endcap = self.rules.poly["endcap_over_diff_um"]
                 geom   = _replace(
                     geom,

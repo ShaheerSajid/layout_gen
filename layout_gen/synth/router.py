@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Callable, Any
 
 from layout_gen.pdk        import PDKRules
-from layout_gen.cells.standard import _rect, _gate_x, _sd_x, _diff_y
+from layout_gen.cells.standard import _rect as _rect_raw, _gate_x, _sd_x, _diff_y
 from layout_gen.synth.loader   import RoutingSpec
 from layout_gen.synth.placer   import (
     PlacedDevice,
@@ -45,6 +45,26 @@ from layout_gen.synth.placer   import (
     global_poly_top,
     global_poly_bottom,
 )
+
+
+# ── Drawing + corridor carving ───────────────────────────────────────────────
+
+_current_corridor = None   # CorridorMap | None
+
+# Track poly contacts already drawn so shared gates don't get duplicates.
+# Key: (gate_cx_snapped, gate_device_name), Value: (pc_x, pc_y)
+_drawn_poly_contacts: dict[tuple[float, str], tuple[float, float]] = {}
+
+
+def _rect(c, x0, x1, y0, y1, layer, snap_grid=0.005):
+    """Draw a rectangle and carve it into the corridor map."""
+    _rect_raw(c, x0, x1, y0, y1, layer, snap_grid)
+    if _current_corridor is not None:
+        _current_corridor.carve_gds(
+            layer,
+            min(x0, x1), min(y0, y1),
+            max(x0, x1), max(y0, y1),
+        )
 
 
 # ── PortCandidate ─────────────────────────────────────────────────────────────
@@ -97,10 +117,15 @@ class Router:
     ----------
     rules :
         PDK rules.
+    corridor :
+        Optional :class:`~layout_gen.synth.corridor.CorridorMap`.
+        When provided, every ``_rect`` call automatically carves the
+        corridor, and handlers can query it for valid routing regions.
     """
 
-    def __init__(self, rules: PDKRules):
+    def __init__(self, rules: PDKRules, corridor: Any = None):
         self.rules = rules
+        self.corridor = corridor
 
     def route(
         self,
@@ -109,19 +134,26 @@ class Router:
         placed:   dict[str, PlacedDevice],
     ) -> list[PortCandidate]:
         """Route all specs and return collected port candidates."""
+        global _current_corridor
+        _drawn_poly_contacts.clear()
         candidates: list[PortCandidate] = []
-        for spec in routing:
-            handler = _REGISTRY.get(spec.style)
-            if handler is None:
-                warnings.warn(
-                    f"No handler registered for routing style {spec.style!r} "
-                    f"(net={spec.net!r}); skipping.",
-                    stacklevel=2,
-                )
-                continue
-            result = handler(comp, spec, placed, self.rules)
-            if result:
-                candidates.extend(result)
+        _current_corridor = self.corridor
+        try:
+            for spec in routing:
+                handler = _REGISTRY.get(spec.style)
+                if handler is None:
+                    warnings.warn(
+                        f"No handler registered for routing style {spec.style!r} "
+                        f"(net={spec.net!r}); skipping.",
+                        stacklevel=2,
+                    )
+                    continue
+                result = handler(comp, spec, placed, self.rules,
+                                 corridor=self.corridor)
+                if result:
+                    candidates.extend(result)
+        finally:
+            _current_corridor = None
         return candidates
 
 
@@ -184,6 +216,7 @@ def _nudge_for_poly_spacing(
 
 # ── Power rail gap helper ──────────────────────────────────────────────────────
 
+
 def _power_rail_gap(rules: PDKRules) -> float:
     """Extra Y gap between power rail and transistor body when li1 = met1.
 
@@ -197,6 +230,25 @@ def _power_rail_gap(rules: PDKRules) -> float:
     met1_sp = rules.met1.get("spacing_min_um", 0.14)
     endcap  = rules.poly.get("endcap_over_diff_um", 0.0)
     return max(0.0, met1_sp - endcap) + 0.01   # 10 nm margin
+
+
+# ── Minimum-area helper ───────────────────────────────────────────────────────
+
+def _min_area_half(rules: PDKRules, layer_name: str) -> float:
+    """Return the half-side length needed for a square pad to meet min area.
+
+    If the layer has an ``area_min_um2`` rule, the square pad must have
+    side >= sqrt(area_min).  Returns ``sqrt(area_min) / 2`` so callers
+    can use it as a half-extent.  Returns 0.0 if no area rule exists.
+    """
+    import math
+    layer_rules = getattr(rules, layer_name, {})
+    if not isinstance(layer_rules, dict):
+        return 0.0
+    area_min = layer_rules.get("area_min_um2", 0.0)
+    if area_min <= 0:
+        return 0.0
+    return math.sqrt(area_min) / 2
 
 
 # ── General-purpose via stack drawing ──────────────────────────────────────────
@@ -263,6 +315,7 @@ def _shared_gate_poly(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Vertical poly bridge from NMOS gate top to PMOS gate bottom.
 
@@ -311,10 +364,16 @@ def _drain_bridge(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
-    """Vertical li1 bridge from NMOS drain top to PMOS drain bottom.
+    """Li1 bridge from NMOS drain to PMOS drain.
 
     Expected path: ``[N.D, P.D]``
+
+    When the drains are vertically aligned (same X), draws a straight
+    vertical bridge.  When they are offset (e.g. mirrored PMOS), draws
+    an L-shaped route: vertical at NMOS drain X, horizontal jog to PMOS
+    drain X at the gap between NMOS and PMOS diff.
     """
     if len(spec.path) < 2:
         return []
@@ -323,25 +382,55 @@ def _drain_bridge(
     dev_n = placed[n_name]
     dev_p = placed[p_name]
 
-    # Drain is at j=n_fingers (right) by default; sd_flip puts it at j=0 (left)
+    # NMOS drain position
     j_n = 0 if dev_n.spec.sd_flip else dev_n.geom.n_fingers
-    dx0, dx1 = global_sd_x(dev_n, j_n, rules)
+    ndx0, ndx1 = global_sd_x(dev_n, j_n, rules)
 
-    # When li1=met1, ensure the bridge meets met1 min width
-    if rules.li1_is_met1:
-        met1_w = rules.met1.get("width_min_um", 0.14)
-        bridge_w = dx1 - dx0
-        if bridge_w < met1_w:
-            cx = (dx0 + dx1) / 2
-            dx0 = cx - met1_w / 2
-            dx1 = cx + met1_w / 2
+    # PMOS drain position
+    j_p = 0 if dev_p.spec.sd_flip else dev_p.geom.n_fingers
+    pdx0, pdx1 = global_sd_x(dev_p, j_p, rules)
+
+    li1_w = rules.li1.get("width_min_um", 0.17)
+
+    # When li1=met1, ensure bridge meets met1 min width
+    def _enforce_min_w(x0, x1):
+        if rules.li1_is_met1:
+            met1_w = rules.met1.get("width_min_um", 0.14)
+            w = x1 - x0
+            if w < met1_w:
+                cx = (x0 + x1) / 2
+                x0 = cx - met1_w / 2
+                x1 = cx + met1_w / 2
+        return x0, x1
+
+    ndx0, ndx1 = _enforce_min_w(ndx0, ndx1)
+    pdx0, pdx1 = _enforce_min_w(pdx0, pdx1)
 
     nd_y0, nd_y1 = global_diff_y(dev_n, rules)
     pd_y0, pd_y1 = global_diff_y(dev_p, rules)
 
     lyr = rules.layer("li1")
-    if pd_y0 > nd_y1:
-        _rect(comp, dx0, dx1, nd_y1, pd_y0, lyr)
+
+    # Check if drains are aligned or offset
+    n_cx = (ndx0 + ndx1) / 2
+    p_cx = (pdx0 + pdx1) / 2
+    offset = abs(n_cx - p_cx)
+
+    if offset < 0.01:
+        # ── Straight vertical bridge ──
+        if pd_y0 > nd_y1:
+            _rect(comp, ndx0, ndx1, nd_y1, pd_y0, lyr)
+    else:
+        # ── L-shaped bridge: vertical from NMOS drain, horizontal jog to PMOS drain ──
+        jog_y = (nd_y1 + pd_y0) / 2
+        hw = max(li1_w / 2, (ndx1 - ndx0) / 2)
+
+        _rect(comp, ndx0, ndx1, nd_y1, jog_y + hw, lyr)
+        _rect(comp, pdx0, pdx1, jog_y - hw, pd_y0, lyr)
+
+        jog_x0 = min(ndx0, pdx0)
+        jog_x1 = max(ndx1, pdx1)
+        _rect(comp, jog_x0, jog_x1, jog_y - hw, jog_y + hw, lyr)
 
     bridge_height = max(pd_y0 - nd_y1, dev_n.geom.l_um)
     out_mid_y = (nd_y1 + pd_y0) / 2
@@ -349,11 +438,240 @@ def _drain_bridge(
     return [PortCandidate(
         net=spec.net,
         location_key="drain_bridge_right_edge_mid_y",
-        x=dx1, y=out_mid_y,
+        x=max(ndx1, pdx1), y=out_mid_y,
         layer="li1",
         width=bridge_height,
         orientation=0,
     )]
+
+
+@_style("gate_to_drain")
+def _gate_to_drain(
+    comp:   Any,
+    spec:   RoutingSpec,
+    placed: dict[str, PlacedDevice],
+    rules:  PDKRules,
+    **kwargs,
+) -> list[PortCandidate]:
+    """Connect a gate terminal to a drain terminal via the NMOS-PMOS gap.
+
+    Expected path: ``[Dev_A.G, Dev_B.D]``
+
+    Draws the poly contact shapes directly (not via a pre-built cell)
+    so that they are properly spaced from adjacent S/D features.
+    Uses ``draw_via_stack`` for higher-layer routes (crossing avoidance).
+
+    ``spec.extra["layer_idx"]``: 0 = first interconnect (li1),
+    1 = next layer up (met1 on sky130, met2 on GF180/TSMC), etc.
+    """
+    if len(spec.path) < 2:
+        return []
+
+    from layout_gen.synth.placer import (
+        global_gate_x, global_sd_x, global_diff_y,
+        global_poly_top, global_poly_bottom,
+    )
+
+    gate_name = spec.path[0].split(".")[0]
+    drain_name = spec.path[1].split(".")[0]
+    gate_dev = placed[gate_name]
+    drain_dev = placed[drain_name]
+    is_nmos_gate = gate_dev.spec.device_type == "nmos"
+
+    # ── Gate poly position ───────────────────────────────────────────────
+    gx0, gx1 = global_gate_x(gate_dev, 0)
+    gate_cx = (gx0 + gx1) / 2
+    gate_w  = gx1 - gx0   # poly gate width (= l_um)
+
+    # ── Drain S/D position ───────────────────────────────────────────────
+    j_d = 0 if drain_dev.spec.sd_flip else drain_dev.geom.n_fingers
+    dx0, dx1 = global_sd_x(drain_dev, j_d, rules)
+    drain_cx = (dx0 + dx1) / 2
+
+    # ── Contact sizing ──────────────────────────────────────────────────
+    c_size   = rules.contacts["size_um"]
+    ch       = c_size / 2
+    poly_enc = rules.contacts.get("poly_enclosure_um", 0.05)
+    poly_enc_2adj = rules.contacts.get("poly_enclosure_2adj_um", 0.08)
+
+    # Li1 enclosure of contact
+    li1_enc_2adj = rules.contacts.get("enclosure_in_li1_2adj_um", 0.08)
+    li1_enc      = rules.contacts.get("enclosure_in_li1_um", 0.0)
+    li1_w_min    = rules.li1.get("width_min_um", 0.17)
+    li1_sp       = rules.li1.get("spacing_min_um", 0.17)
+
+    # ── Contact Y position: just above/below poly endcap ─────────────────
+    pc_half_y = ch + poly_enc_2adj
+    if is_nmos_gate:
+        pc_y = global_poly_top(gate_dev) + pc_half_y
+    else:
+        pc_y = global_poly_bottom(gate_dev) - pc_half_y
+
+    # ── Contact X position: shifted toward connecting drain ──────────────
+    # The gate poly is between two S/D strips. The contact must be
+    # spaced from the S/D li1 strip on the OPPOSITE side from the
+    # connecting drain to avoid shorting with other nets' drain bridges.
+    #
+    # Find the S/D li1 strip on the far side (away from connecting drain)
+    # and shift the contact X toward the drain until clearance is met.
+    # Li1 enclosure: CO.6 / li.5 require 2adj enclosure on at least
+    # one pair of adjacent sides.  Use 2adj on both X sides so the
+    # Y sides can stay at minimum enclosure.
+    li1_enc_route = max(ch + li1_enc_2adj, li1_w_min / 2)
+    li1_enc_far   = max(ch + li1_enc_2adj, li1_w_min / 2)
+    li1_hy_val    = max(ch + li1_enc, li1_w_min / 2)
+
+    # Default: centred on gate
+    pc_x = gate_cx
+
+    # Determine which side the connecting drain is on
+    drain_is_left = drain_cx < gate_cx
+
+    # Assign li1 half-extents: route-side gets 2adj, far-side gets min
+    if drain_is_left:
+        li1_hx_left  = li1_enc_route   # toward drain (route connects here)
+        li1_hx_right = li1_enc_far     # away from drain (tight)
+    else:
+        li1_hx_left  = li1_enc_far
+        li1_hx_right = li1_enc_route
+
+    # Find the nearest S/D strip on the OPPOSITE side and shift
+    # the contact toward the drain to maintain spacing.
+    n_fingers = gate_dev.geom.n_fingers
+    for j in range(n_fingers + 1):
+        sdx0, sdx1 = global_sd_x(gate_dev, j, rules)
+        sd_cx = (sdx0 + sdx1) / 2
+        if drain_is_left and sd_cx > gate_cx:
+            # S/D on right — shift contact left so right edge clears it
+            max_pc_x = sdx0 - li1_sp - li1_hx_right
+            pc_x = min(pc_x, max_pc_x)
+            break
+        elif not drain_is_left and sd_cx < gate_cx:
+            # S/D on left — shift contact right so left edge clears it
+            min_pc_x = sdx1 + li1_sp + li1_hx_left
+            pc_x = max(pc_x, min_pc_x)
+            break
+
+    # ── Corridor check: constrain pad to free region on the far side ──
+    corridor = kwargs.get("corridor")
+    if corridor is not None:
+        pad_y0 = pc_y - li1_hy_val
+        pad_y1 = pc_y + li1_hy_val
+        if drain_is_left:
+            # Far side is right — find rightward limit
+            limit_x = corridor.max_extent(
+                "li1", pc_x + li1_hx_right, pad_y0, pad_y1, "right",
+            )
+            # limit_x is the first blocked cell; pad right edge must stay before it
+            max_pc_x = limit_x - li1_hx_right
+            pc_x = min(pc_x, max_pc_x)
+        else:
+            # Far side is left — find leftward limit
+            limit_x = corridor.max_extent(
+                "li1", pc_x - li1_hx_left, pad_y0, pad_y1, "left",
+            )
+            # limit_x is the first blocked cell; pad left edge must stay after it
+            min_pc_x = limit_x + li1_hx_left
+            pc_x = max(pc_x, min_pc_x)
+
+    # ── Snap contact centre to mfg grid so all offsets stay on-grid ──────
+    _grid = rules.mfg_grid
+    if _grid > 0:
+        pc_x = round(round(pc_x / _grid) * _grid, 6)
+        pc_y = round(round(pc_y / _grid) * _grid, 6)
+
+    # ── Draw poly contact shapes (skip if already drawn for this gate) ──
+    contact_key = round(gate_cx, 4)
+    prev = _drawn_poly_contacts.get(contact_key)
+
+    lyr_poly  = rules.layer("poly")
+    lyr_licon = rules.layer("licon1")
+    lyr_li1   = rules.layer("li1")
+
+    poly_pad_hx = ch + poly_enc
+    poly_pad_hy = ch + poly_enc_2adj
+
+    if prev is not None:
+        # Reuse the existing contact position for routing
+        pc_x, pc_y = prev
+    else:
+        _drawn_poly_contacts[contact_key] = (pc_x, pc_y)
+
+        # 1. Licon (contact cut)
+        _rect(comp, pc_x - ch, pc_x + ch, pc_y - ch, pc_y + ch, lyr_licon)
+
+        # 2. Poly pad — minimum enclosure of licon
+        _rect(comp, pc_x - poly_pad_hx, pc_x + poly_pad_hx,
+                    pc_y - poly_pad_hy, pc_y + poly_pad_hy, lyr_poly)
+
+        # 3. Li1 pad — asymmetric: 2adj enclosure toward route, min elsewhere
+        _rect(comp, pc_x - li1_hx_left, pc_x + li1_hx_right,
+                    pc_y - li1_hy_val, pc_y + li1_hy_val, lyr_li1)
+
+    # 4. Extend gate poly stub from transistor edge to contact (always —
+    #    each handler needs the stub from its own transistor side)
+    if is_nmos_gate:
+        poly_top = global_poly_top(gate_dev)
+        _rect(comp, gx0, gx1, poly_top, pc_y + poly_pad_hy, lyr_poly)
+    else:
+        poly_bot = global_poly_bottom(gate_dev)
+        _rect(comp, gx0, gx1, pc_y - poly_pad_hy, poly_bot, lyr_poly)
+
+    # ── Determine route layer ────────────────────────────────────────────
+    layer_idx = (spec.extra or {}).get("layer_idx", 0)
+
+    base_layer = "li1"
+    if layer_idx == 0:
+        route_layer = base_layer
+    else:
+        try:
+            transitions = rules.via_stack_between(base_layer, "met2")
+            if transitions:
+                route_layer = transitions[-1].upper_metal
+            else:
+                route_layer = "met1"
+        except (KeyError, IndexError):
+            route_layer = "met1"
+
+    lyr_route = rules.layer(route_layer)
+
+    # ── Route width ──────────────────────────────────────────────────────
+    route_rules = getattr(rules, route_layer, None) or {}
+    if isinstance(route_rules, dict):
+        route_w = route_rules.get("width_min_um", li1_w_min)
+    else:
+        route_w = li1_w_min
+    rhw = route_w / 2
+
+    # ── Horizontal route from poly contact to drain ──────────────────────
+    route_y  = pc_y
+    route_x0 = min(pc_x - li1_hx_left, dx0)
+    route_x1 = max(pc_x + li1_hx_right, dx1)
+
+    if layer_idx == 0:
+        # Direct route on li1
+        _rect(comp, route_x0, route_x1, route_y - rhw, route_y + rhw, lyr_route)
+        # Vertical li1 from route to drain S/D strip
+        dd_y0, dd_y1 = global_diff_y(drain_dev, rules)
+        if is_nmos_gate:
+            _rect(comp, dx0, dx1, dd_y1, route_y + rhw, lyr_li1)
+        else:
+            _rect(comp, dx0, dx1, route_y - rhw, dd_y0, lyr_li1)
+    else:
+        # Via up at poly contact
+        draw_via_stack(comp, rules, pc_x, pc_y, "li1", route_layer)
+        # Horizontal route on higher layer
+        _rect(comp, route_x0, route_x1, route_y - rhw, route_y + rhw, lyr_route)
+        # Via down at drain end
+        draw_via_stack(comp, rules, drain_cx, route_y, route_layer, "li1")
+        # Vertical li1 from via to drain S/D strip
+        dd_y0, dd_y1 = global_diff_y(drain_dev, rules)
+        if is_nmos_gate:
+            _rect(comp, dx0, dx1, dd_y1, route_y + rhw, lyr_li1)
+        else:
+            _rect(comp, dx0, dx1, route_y - rhw, dd_y0, lyr_li1)
+
+    return []
 
 
 @_style("horizontal_power_rail")
@@ -362,6 +680,7 @@ def _horizontal_power_rail(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Met1 power rail spanning the full cell width.
 
@@ -444,6 +763,7 @@ def _source_to_rail(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Connect source terminals to a power rail via li1 extension + mcon.
 
@@ -518,6 +838,7 @@ def _li1_bridge(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Horizontal li1 bridge between two S/D terminals.
 
@@ -565,6 +886,7 @@ def _poly_stub_met1_bus(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """WL wordline: polycontact stub above each PG gate body + met1 horizontal bus.
 
@@ -690,6 +1012,7 @@ def _cross_couple_gate(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Cross-coupling: Q/Q_ li1 node → opposite inverter gate.
 
@@ -859,6 +1182,7 @@ def _expose_terminal(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Expose a device terminal as a port without drawing any routing geometry.
 
@@ -920,6 +1244,7 @@ def _vertical_met2_bus(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Full-height vertical stripe at a S/D terminal (BL/BL_ bitline).
 
@@ -989,6 +1314,7 @@ def _cross_row_connect(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Connect a source terminal to gate(s) in other row pairs via L-route.
 
@@ -1134,6 +1460,7 @@ def _vertical_bus(
     spec:   RoutingSpec,
     placed: dict[str, PlacedDevice],
     rules:  PDKRules,
+    **kwargs,
 ) -> list[PortCandidate]:
     """Vertical metal bus connecting S/D terminals across multiple row pairs.
 

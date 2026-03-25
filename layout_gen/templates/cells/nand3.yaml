@@ -1,34 +1,40 @@
-# layout_gen cell topology template — 2-input NAND gate
+# layout_gen cell topology template — 3-input NAND gate
 #
-# 2 NMOS in series (pull-down), 2 PMOS in parallel (pull-up).
+# 3 NMOS in series (pull-down), 3 PMOS in parallel (pull-up).
 #
-# Placement (NMOS row):  N_A | N_B        (shared-diffusion abutment at net1)
-# Placement (PMOS row):  P_A | P_B(MY)    (shared-diffusion abutment at Y)
-#                         ↕ gate ↕ gate
+# Placement (NMOS row):  N_A | N_B | N_C  (shared-diffusion abutment)
+# Placement (PMOS row):  P_A | P_B(MY) | P_C  (shared-diffusion abutment)
+#                         ↕ gate ↕ gate ↕ gate
 #
-# P_B is mirrored (MY) so P_A.D(Y) shares diffusion with P_B.D(Y).
-# The shared Y at the P_A–P_B boundary routes down to N_B.D(Y).
+# P_B is mirrored (MY) so:
+#   P_A.D(Y)   shares diffusion with P_B.D(Y)    — output Y
+#   P_B.S(VDD) shares diffusion with P_C.S(VDD)  — supply VDD
+# P_C.D(Y) is on the right, routes down to N_C.D(Y).
 
-name: cmos_nand2
+name: cmos_nand3
 description: >
-  2-input CMOS NAND gate. 2 series NMOS (pull-down), 2 parallel PMOS (pull-up).
+  3-input CMOS NAND gate. 3 series NMOS (pull-down), 3 parallel PMOS (pull-up).
 
 label_layers:
   met1: [68, 5]
 
 devices:
   N_A: {template: planar_mosfet, type: nmos, terminals: {G: A,   D: net1, S: GND}}
-  N_B: {template: planar_mosfet, type: nmos, terminals: {G: B,   D: Y,    S: net1}}
+  N_B: {template: planar_mosfet, type: nmos, terminals: {G: B,   D: net2, S: net1}}
+  N_C: {template: planar_mosfet, type: nmos, terminals: {G: C,   D: Y,    S: net2}}
   P_A: {template: planar_mosfet, type: pmos, terminals: {G: A,   D: Y,    S: VDD}}
   P_B: {template: planar_mosfet, type: pmos, terminals: {G: B,   D: Y,    S: VDD}}
+  P_C: {template: planar_mosfet, type: pmos, terminals: {G: C,   D: Y,    S: VDD}}
 
 nets:
   VDD:  {type: power, rail: top}
   GND:  {type: power, rail: bottom}
   A:    {type: signal}
   B:    {type: signal}
+  C:    {type: signal}
   Y:    {type: signal}
   net1: {type: internal}
+  net2: {type: internal}
 
 # ── Placement: explicit per-device directives ──────────────────────────────
 
@@ -39,6 +45,11 @@ placement_logic:
 
   - name: N_B
     relative_to: N_A
+    relation: abut_x
+    alignment: bottom
+
+  - name: N_C
+    relative_to: N_B
     relation: abut_x
     alignment: bottom
 
@@ -54,9 +65,15 @@ placement_logic:
     alignment: gate
     orientation: MY               # Y on left (shared with P_A.D=Y), VDD on right
 
+  - name: P_C
+    relative_to: N_C
+    relation: align_gate
+    alignment: gate               # R0: VDD on left (shared with P_B.S=VDD), Y on right
+
 ports:
   A:   {side: west,  terminal: N_A.G}
   B:   {side: west,  terminal: N_B.G}
-  Y:   {side: east,  terminal: N_B.D}
+  C:   {side: west,  terminal: N_C.G}
+  Y:   {side: east,  terminal: N_C.D}
   GND: {side: south, layer: met1}
   VDD: {side: north, layer: met1}

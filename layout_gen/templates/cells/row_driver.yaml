@@ -1,14 +1,19 @@
 # layout_gen cell topology template — SRAM row driver
 #
-# B = A & WLEN  (NAND2 gate-qualified enable followed by high-drive inverter)
-# Implements:  net1 = NAND2(A, WLEN),  B = NOT(net1)
+# B = NOT(NAND2(A, WLEN))
+# NAND2 stage followed by high-drive inverter.
 #
-# Zero routing directives.  Auto-router infers gate bridges, drain bridges,
-# li1 bridges (net1 abutment, Y_nd parallel drains, Y_nd-to-INV gate),
-# and power rails from device connectivity.
+# Placement (NMOS row):  N_A | N_WL | N_INV
+# Placement (PMOS row):  P_A | P_WL | P_INV   (gate-aligned, P_INV is 4-finger)
+#                         ↕ gate ↕ gate ↕ gate
 
 name: row_driver
-description: SRAM row driver — NAND2(A, WLEN) followed by high-drive inverter
+description: >
+  SRAM row driver — NAND2(A, WLEN) followed by high-drive inverter.
+  Implements: net1 = NAND2(A, WLEN), B = NOT(net1).
+
+label_layers:
+  met1: [68, 5]
 
 devices:
   # NAND2 stage
@@ -18,8 +23,8 @@ devices:
   P_WL:  {template: planar_mosfet, type: pmos, terminals: {G: WLEN, D: Y_nd, S: VDD}}
 
   # Output inverter stage (wider PMOS for drive strength)
-  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}}
-  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, fingers: 4}
+  N_INV: {template: planar_mosfet, type: nmos, terminals: {G: Y_nd, D: B, S: GND}, fingers: 1}
+  P_INV: {template: planar_mosfet, type: pmos, terminals: {G: Y_nd, D: B, S: VDD}, fingers: 1}
 
 nets:
   VDD:  {type: power, rail: top}
@@ -30,18 +35,42 @@ nets:
   Y_nd: {type: internal}
   net1: {type: internal}
 
-placement:
-  mode: standard
-  pairs:
-    - nmos: [N_A, N_WL, N_INV]
-      pmos: [P_A, P_WL, P_INV]
-  constraints:
-    inter_cell_gap:
-      min: "rules.diff.spacing_min_um - 2*rules.poly.endcap_over_diff_um + 2*rules.diff.extension_past_poly_um"
+# ── Placement: explicit per-device directives ──────────────────────────────
+
+placement_logic:
+  # ── NMOS row (left to right) ─────────────────────────────────────────────
+  - name: N_A
+    origin: [0, 0]
+
+  - name: N_WL
+    relative_to: N_A
+    relation: abut_x
+    alignment: bottom
+
+  - name: N_INV
+    relative_to: N_WL
+    alignment: bottom
+
+  # ── PMOS row (gate-aligned with NMOS) ────────────────────────────────────
+  - name: P_A
+    relative_to: N_A
+    relation: align_gate
+    alignment: gate
+
+  - name: P_WL
+    relative_to: N_WL
+    relation: align_gate
+    alignment: gate
+    sd_flip: true  # PMOS source/drain flipped for better layout
+
+  - name: P_INV
+    relative_to: N_INV
+    relation: align_gate
+    alignment: gate
 
 ports:
-  A:    {side: west}
-  WLEN: {side: west}
-  B:    {side: east}
-  GND:  {side: south}
-  VDD:  {side: north}
+  A:    {side: west,  terminal: N_A.G}
+  WLEN: {side: west,  terminal: N_WL.G}
+  B:    {side: east,  terminal: N_INV.D}
+  GND:  {side: south, layer: met1}
+  VDD:  {side: north, layer: met1}
