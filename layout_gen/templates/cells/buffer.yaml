@@ -1,0 +1,48 @@
+# layout_gen cell topology template — non-inverting buffer
+#
+# Y = A.  Two cascaded inverters: A → mid → Y.
+#
+# Placement:
+#   NMOS row:  N0 | N1   (independent transistors, each in its own inverter)
+#   PMOS row:  P0 | P1   (gate-aligned)
+
+name: buffer
+description: >
+  Non-inverting buffer: Y = A.  Two cascaded CMOS inverters.
+
+devices:
+  N0: {template: planar_mosfet, type: nmos, terminals: {G: A,   D: mid, S: GND}}
+  P0: {template: planar_mosfet, type: pmos, terminals: {G: A,   D: mid, S: VDD}}
+  N1: {template: planar_mosfet, type: nmos, terminals: {G: mid, D: Y,   S: GND}}
+  P1: {template: planar_mosfet, type: pmos, terminals: {G: mid, D: Y,   S: VDD}}
+
+nets:
+  VDD: {type: power, rail: top}
+  GND: {type: power, rail: bottom}
+  A:   {type: signal}
+  Y:   {type: signal}
+  mid: {type: internal}
+
+placement_logic:
+  - name: N0
+    origin: [0, 0]
+
+  - name: N1
+    relative_to: N0
+    alignment: bottom              # space_x by default — no abutment between stages
+
+  - name: P0
+    relative_to: N0
+    relation: align_gate
+    alignment: gate
+
+  - name: P1
+    relative_to: N1
+    relation: align_gate
+    alignment: gate
+
+ports:
+  A: {side: west,  terminal: N0.G}
+  Y: {side: east,  terminal: N1.D}
+  GND: {side: south, layer: met1}
+  VDD: {side: north, layer: met1}

@@ -109,6 +109,15 @@ class RuleGeoAgent(GeoFixAgent):
         if cat == "spacing":
             actions = self._fix_spacing(state, violation)
             return self._check_connectivity(state, actions)
+        elif cat == "merge":
+            # Merge handler MUST run before spacing fallback — pushing
+            # NPC patches apart wastes effort that union resolves in one
+            # action.  When merge can't apply (only one shape in range),
+            # fall through to spacing.
+            actions = self._fix_merge(state, violation)
+            if actions:
+                return actions
+            return self._check_connectivity(state, self._fix_spacing(state, violation))
         elif cat == "width":
             return self._fix_width(state, violation)
         elif cat == "enclosure" or cat == "extension":
@@ -133,7 +142,9 @@ class RuleGeoAgent(GeoFixAgent):
         size_keywords = ("size", "licon.1", "mcon.1", "co.w", "via.w")
         if any(kw in rule_lower for kw in size_keywords):
             return True
-        if v.category == "width" and v.layer in ("licon1", "mcon", "via1", "via2"):
+        if v.category == "width" and (
+            v.layer in ("licon1", "mcon") or v.layer.startswith("via")
+        ):
             return True
         if "size" in desc_lower and any(
             cl in v.layer for cl in ("licon", "mcon", "via", "contact")
@@ -211,6 +222,53 @@ class RuleGeoAgent(GeoFixAgent):
                 safe_actions.append(action)
         return safe_actions
 
+    # ── Merge ────────────────────────────────────────────────────────────────
+
+    def _fix_merge(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
+        """Merge violation (`*.merge.*` rules): adjacent same-layer shapes
+        closer than ``required`` should be unioned, not pushed apart.
+
+        Strategy:
+        1. Find every same-layer shape within ``required`` of the violation
+           centroid (the rule's own horizon, parsed from description).
+        2. If two or more found, emit a single :class:`MergeShapes` covering
+           all of them.  One coarse action resolves dozens of low-level
+           violations in dense clusters (e.g. NPC patches around polycontacts).
+
+        Returns an empty list when fewer than two shapes are within range —
+        falls back to spacing in the caller.
+        """
+        layer = v.layer
+        if not layer:
+            return []
+        # The rule's required value is the merge horizon: shapes at less
+        # than `required` distance must be unioned.
+        horizon = v.required if v.required > 0 else self.search_radius
+        # Cast a slightly larger net than the horizon — clusters that the
+        # DRC tool reports separately may share a connected hull.
+        cluster = state.near(v.x, v.y, horizon * 1.5, layer=layer)
+        if len(cluster) < 2:
+            return []
+
+        # Keep only those shapes that are actually within `horizon` of the
+        # violation centroid (some `near()` calls are bounding-box based and
+        # over-include).  We stay tight to avoid over-merging a whole row
+        # of NPC patches when only a local cluster is in conflict.
+        eligible = []
+        for r in cluster:
+            d = ((max(r.x0, v.x, r.x1) - min(r.x0, v.x, r.x1) <= 0)
+                 or (max(r.y0, v.y, r.y1) - min(r.y0, v.y, r.y1) <= 0))
+            # Compute centroid distance for centroid-based pruning
+            dx = max(0.0, max(r.x0 - v.x, v.x - r.x1))
+            dy = max(0.0, max(r.y0 - v.y, v.y - r.y1))
+            edge_dist = (dx * dx + dy * dy) ** 0.5
+            if edge_dist <= horizon:
+                eligible.append(r)
+        if len(eligible) < 2:
+            return []
+
+        return [MergeShapes(rids=[r.rid for r in eligible], layer=layer)]
+
     # ── Spacing ──────────────────────────────────────────────────────────────
 
     def _fix_spacing(self, state: LayoutState, v: ViolationInfo) -> list[Action]:
@@ -220,8 +278,46 @@ class RuleGeoAgent(GeoFixAgent):
         because moving an entire shape breaks contact/via alignment and causes
         cascading violations.  Falls back to MoveShape only when shrinking
         would make a shape narrower than the layer's minimum width.
+
+        Cross-layer spacing (e.g. licon ↔ npc): when ``v.inner_layer`` is
+        populated, looks for the nearest pair of shapes one from each layer
+        and pushes the *second* layer (which is usually the marker / non-
+        conducting layer like NPC) away.  This avoids breaking electrical
+        connectivity by always perturbing a marker rather than a wire.
         """
-        layer = v.layer
+        layer  = v.layer
+        layer2 = v.inner_layer or ""
+        if layer2:
+            # Cross-layer: shape from each side
+            primary   = state.near(v.x, v.y, self.search_radius, layer=layer)
+            secondary = state.near(v.x, v.y, self.search_radius, layer=layer2)
+            if not primary:
+                primary = state.on_layer(layer)
+            if not secondary:
+                secondary = state.on_layer(layer2)
+            if not primary or not secondary:
+                return []
+            # Find closest pair across layers
+            best = None
+            best_dist = float("inf")
+            for a in primary:
+                for b in secondary:
+                    d = a.edge_dist(b)
+                    if 0 <= d < best_dist:
+                        best_dist = d
+                        best = (a, b)
+            if best is None:
+                return []
+            a, b = best
+            deficit = (v.deficit + _EPS if v.deficit > 0
+                       else v.required - best_dist + _EPS)
+            if deficit <= 0:
+                deficit = 0.01
+            # Push the SECONDARY (b) — usually the marker layer (NPC, RPO).
+            # Markers don't carry signal, so movement is safe.
+            dx, dy = self._repulsion_vector(b, a, deficit)
+            return [MoveShape(rid=b.rid, dx=dx, dy=dy)]
+
         shapes = state.near(v.x, v.y, self.search_radius, layer=layer)
         if len(shapes) < 2:
             # Widen search

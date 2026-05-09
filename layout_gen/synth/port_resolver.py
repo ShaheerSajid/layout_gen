@@ -151,18 +151,27 @@ def resolve_ports(
         if pspec.layer:
             layer = pspec.layer
 
+        # Remember the logical layer name (e.g. "li1") — this survives
+        # gdsfactory's LayerEnum integer mapping so downstream code (label
+        # placement, LVS) can look up the matching pin layer in the PDK.
+        layer_name = layer if isinstance(layer, str) else ""
         try:
             lyr = rules.layer(layer) if isinstance(layer, str) else layer
         except (KeyError, TypeError):
             lyr = (1, 0)
 
-        comp.add_port(
+        new_port = comp.add_port(
             port_name,
             center=(x, y),
             width=width,
             orientation=orientation,
             layer=lyr,
         )
+        if layer_name and new_port is not None:
+            try:
+                new_port.info["layer_name"] = layer_name
+            except Exception:
+                pass
 
 
 def generate_expose_specs(

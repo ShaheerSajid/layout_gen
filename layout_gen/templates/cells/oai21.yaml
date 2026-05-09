@@ -1,0 +1,70 @@
+# layout_gen cell topology template — OAI21 gate
+#
+# Y = NOT((A | B) & C)
+#
+#   Pull-down (NMOS): (N_A parallel N_B) series N_C   → drains to net1, then Y
+#   Pull-up   (PMOS): (P_A series P_B) parallel P_C   → drains to Y
+#
+# Layout columns (gates aligned vertically):  A | B | C
+# NMOS row (no flips):  N_A and N_B share net1 by abutment, N_C drain is Y
+# PMOS row (no flips):  P_A — P_B share net2 by abutment (series); P_C drain ties to Y
+
+name: oai21
+description: >
+  OR-AND-INVERT (OAI21).  Y = NOT((A | B) & C).
+  2 NMOS parallel + 1 NMOS series (pull-down);
+  2 PMOS series  + 1 PMOS parallel (pull-up).
+
+devices:
+  N_A: {template: planar_mosfet, type: nmos, terminals: {G: A, D: net1, S: GND}}
+  N_B: {template: planar_mosfet, type: nmos, terminals: {G: B, D: net1, S: GND}}
+  N_C: {template: planar_mosfet, type: nmos, terminals: {G: C, D: Y,    S: net1}}
+  P_A: {template: planar_mosfet, type: pmos, terminals: {G: A, D: net2, S: VDD}}
+  P_B: {template: planar_mosfet, type: pmos, terminals: {G: B, D: Y,    S: net2}}
+  P_C: {template: planar_mosfet, type: pmos, terminals: {G: C, D: Y,    S: VDD}}
+
+nets:
+  VDD:  {type: power, rail: top}
+  GND:  {type: power, rail: bottom}
+  A:    {type: signal}
+  B:    {type: signal}
+  C:    {type: signal}
+  Y:    {type: signal}
+  net1: {type: internal}
+  net2: {type: internal}
+
+placement_logic:
+  - name: N_A
+    origin: [0, 0]
+
+  - name: N_B
+    relative_to: N_A
+    relation: abut_x
+    alignment: bottom
+
+  - name: N_C
+    relative_to: N_B
+    alignment: bottom
+
+  - name: P_A
+    relative_to: N_A
+    relation: align_gate
+    alignment: gate
+
+  - name: P_B
+    relative_to: N_B
+    relation: align_gate
+    alignment: gate
+
+  - name: P_C
+    relative_to: N_C
+    relation: align_gate
+    alignment: gate
+
+ports:
+  A:   {side: west,  terminal: N_A.G}
+  B:   {side: west,  terminal: N_B.G}
+  C:   {side: west,  terminal: N_C.G}
+  Y:   {side: east,  terminal: N_C.D}
+  GND: {side: south, layer: met1}
+  VDD: {side: north, layer: met1}

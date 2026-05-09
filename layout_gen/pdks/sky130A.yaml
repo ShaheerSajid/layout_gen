@@ -31,6 +31,34 @@ layers:
   npc:    {layer: 95,  datatype: 20}   # nitride poly cut (prevents silicide on poly stubs)
   met5:   {layer: 72,  datatype: 20}
 
+# ── Port label layers (per routing layer) ────────────────────────────────────
+#
+# Where to place GDS text labels so DRC/LVS tools recognise them as cell ports.
+# For sky130, datatype 16 is the *pin* purpose; datatype 5 is plain text and
+# is NOT promoted to ports during Magic extraction.  Cover every layer that
+# a port might land on — poly (transistor gates), li1 (S/D), and metals.
+label_layers:
+  poly: [66, 16]
+  li1:  [67, 16]
+  met1: [68, 16]
+  met2: [69, 16]
+  met3: [70, 16]
+  met4: [71, 16]
+  met5: [72, 16]
+
+# ── Bulk / well label layers ─────────────────────────────────────────────────
+#
+# Where to place GDS labels that tell extraction tools how to *name* the
+# implicit bulk nets (nwell for PMOS, pwell/substrate for NMOS).  Without
+# these, Magic invents anonymous names like ``w_n36_240#`` and ``VSUBS``,
+# which break LVS bulk matching.
+#
+# The synthesizer drops one well_label per merged nwell region and one
+# substrate label inside the cell footprint.
+well_labels:
+  nwell: [64, 16]    # WELLPIN — names the nwell as PMOS bulk (e.g. VDD)
+  pwell: [122, 16]   # SUBPIN  — names the substrate as NMOS bulk (e.g. GND)
+
 # ── Layer display colours (SVG fill hex, opacity 0–1) ────────────────────────
 #
 # Used by layout_gen.visualize.write_svg().  Every layer in the layers section
@@ -177,6 +205,13 @@ drc:
   klayout: "${PDK_ROOT}/sky130A/libs.tech/klayout/drc/sky130A_mr.drc"
   magic:   "${PDK_ROOT}/sky130A/libs.tech/magic/sky130A.tech"
 
+# ── LVS config ───────────────────────────────────────────────────────────────
+#
+# netgen_setup: device-equivalence rules used by netgen-lvs.
+# Override via env LVS_NETGEN_SETUP.
+lvs:
+  netgen_setup: "${PDK_ROOT}/sky130A/libs.tech/netgen/sky130A_setup.tcl"
+
 # ── Per-device rules ──────────────────────────────────────────────────────────
 #
 # diff_layer  : which layer key to use for the active diffusion rectangle
@@ -195,6 +230,7 @@ devices:
     nwell:            false
     w_finger_max_um:  2.0
     sd_length_min_um: 0.29
+    lvs_model_name:   sky130_fd_pr__nfet_01v8
 
   pmos:
     diff_layer:       diff
@@ -204,6 +240,7 @@ devices:
     nwell:            true
     w_finger_max_um:  2.0
     sd_length_min_um: 0.29
+    lvs_model_name:   sky130_fd_pr__pfet_01v8
 
 # ── Metal stack ──────────────────────────────────────────────────────────────
 #

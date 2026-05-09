@@ -241,13 +241,22 @@ def draw_via_stack(
     cy:         float,
     from_layer: str,
     to_layer:   str,
+    direction:  str = "horizontal",
 ) -> float:
     """Draw all vias and metal landings needed to connect *from_layer* to *to_layer*.
 
     Uses the PDK ``metal_stack`` to determine which vias to insert.
-    Each landing pad is rectangular: 2-adjacent-edge enclosure on one
-    axis, opposite-edge enclosure on the other (per PDK rules).  The
-    2adj enclosure is applied on the X axis by default (wider pads in X).
+
+    *direction* controls which axis receives the larger 2-adjacent-edge
+    enclosure so that the connecting route covers it:
+
+    * ``"horizontal"`` — 2adj on X, opp on Y (route runs left/right).
+    * ``"vertical"``   — 2adj on Y, opp on X (route runs up/down).
+
+    Only the **topmost** (upper of last transition) and **bottommost**
+    (lower of first transition) landing pads are oriented according to
+    *direction*.  Intermediate landings use the 2adj value on both axes
+    (square, DRC-safe) since no route covers them.
 
     Returns the half-extent of the topmost landing pad (max of both axes).
     If the layers resolve to the same physical layer, nothing is drawn and
@@ -257,25 +266,49 @@ def draw_via_stack(
     if not transitions:
         return 0.0
 
+    vertical = direction == "vertical"
+    n = len(transitions)
+
     def _metal_w_min(metal_name: str) -> float:
         sec = getattr(rules, metal_name, {})
         if isinstance(sec, dict):
             return sec.get("width_min_um", 0.0)
         return 0.0
 
+    def _dir_halves(enc_2adj, enc_opp, wmin, vh, use_direction):
+        """Return (hx, hy) for a landing pad.
+
+        *use_direction*: True  → orient per caller's direction.
+                         False → square pad using 2adj on both axes.
+        """
+        if not use_direction:
+            # Middle layer — square pad (2adj on both axes)
+            h = max(vh + enc_2adj, wmin / 2)
+            return h, h
+        if vertical:
+            hx = max(vh + enc_opp, wmin / 2)
+            hy = max(vh + enc_2adj, wmin / 2)
+        else:
+            hx = max(vh + enc_2adj, wmin / 2)
+            hy = max(vh + enc_opp, wmin / 2)
+        return hx, hy
+
     top_half = 0.0
-    for t in transitions:
+    for i, t in enumerate(transitions):
         vh = t.via_size / 2
+        is_first = (i == 0)
+        is_last  = (i == n - 1)
 
-        # Lower metal landing — 2adj on X, opp on Y
         lower_w = _metal_w_min(t.lower_metal)
-        lower_hx = max(vh + t.enc_lower, lower_w / 2)
-        lower_hy = max(vh + t.enc_lower_opp, lower_w / 2)
-
-        # Upper metal landing — 2adj on X, opp on Y
         upper_w = _metal_w_min(t.upper_metal)
-        upper_hx = max(vh + t.enc_upper, upper_w / 2)
-        upper_hy = max(vh + t.enc_upper_opp, upper_w / 2)
+
+        # Bottom-most landing → directional; middle → square
+        lower_hx, lower_hy = _dir_halves(
+            t.enc_lower, t.enc_lower_opp, lower_w, vh, is_first)
+
+        # Top-most landing → directional; middle → square
+        upper_hx, upper_hy = _dir_halves(
+            t.enc_upper, t.enc_upper_opp, upper_w, vh, is_last)
 
         lyr_via   = rules.layer(t.via_layer)
         lyr_lower = rules.layer(t.lower_metal)
@@ -446,7 +479,7 @@ def _drain_bridge(
         all_x1.append(sx1)
         _rect(comp, sx0, sx1, nd_y1, bus_y + rhw, lyr)
         if route_layer != "li1":
-            draw_via_stack(comp, rules, s_cx, nd_cy, "li1", route_layer)
+            draw_via_stack(comp, rules, s_cx, nd_cy, "li1", route_layer, "vertical")
 
     # PMOS vertical stubs: from bus up to pd_y0
     for j in p_drains:
@@ -457,7 +490,7 @@ def _drain_bridge(
         all_x1.append(sx1)
         _rect(comp, sx0, sx1, bus_y - rhw, pd_y0, lyr)
         if route_layer != "li1":
-            draw_via_stack(comp, rules, s_cx, pd_cy, "li1", route_layer)
+            draw_via_stack(comp, rules, s_cx, pd_cy, "li1", route_layer, "vertical")
 
     # Horizontal bus spanning all drains
     if all_x0:
@@ -734,7 +767,7 @@ def _gate_to_drain(
 
     # Via stack at drain S/D contact centre (stacks on existing licon)
     if route_layer != "li1":
-        draw_via_stack(comp, rules, drain_cx, dd_cy, route_layer, "li1")
+        draw_via_stack(comp, rules, drain_cx, dd_cy, route_layer, "li1", "vertical")
 
     return []
 
@@ -895,7 +928,7 @@ def _source_to_rail(
 
             if rail_layer != "li1":
                 # Via stack at S/D contact centre (stacks on existing licon)
-                draw_via_stack(comp, rules, tx_mid, d_cy, "li1", rail_layer)
+                draw_via_stack(comp, rules, tx_mid, d_cy, "li1", rail_layer, "vertical")
 
                 # Rail-layer strap from via to rail
                 lyr_rail = rules.layer(rail_layer)
@@ -1200,7 +1233,7 @@ def _cross_couple_gate(
     nd_ymid  = (t_drain.y0 + t_drain.y1) / 2
 
     # Via stack at Q/Q_ source node: li1 → target layer
-    src_top_half = draw_via_stack(comp, rules, q_x, nd_ymid, "li1", target_layer)
+    src_top_half = draw_via_stack(comp, rules, q_x, nd_ymid, "li1", target_layer, "vertical")
 
     # ── Target gate stubs (one per unique gate X position) ────────────────────
     gate_xs: list[float] = []
@@ -1365,7 +1398,7 @@ def _vertical_met2_bus(
     target_layer = spec.layer or "met2"
 
     # Via stack from li1 up to target layer
-    top_half = draw_via_stack(comp, rules, cx, cy, "li1", target_layer)
+    top_half = draw_via_stack(comp, rules, cx, cy, "li1", target_layer, "vertical")
 
     # Target layer min width
     target_rules = getattr(rules, target_layer, None) or {}
@@ -1459,7 +1492,7 @@ def _cross_row_connect(
     src_cy = (t_src.y0 + t_src.y1) / 2
 
     # Via stack at source: li1 → target layer
-    lh = draw_via_stack(comp, rules, src_cx, src_cy, "li1", target_layer)
+    lh = draw_via_stack(comp, rules, src_cx, src_cy, "li1", target_layer, "vertical")
     trunk_hw = max(trunk_hw, lh)
 
     # ── Resolve target gates and build poly-contact stubs ──────────────────
@@ -1601,7 +1634,7 @@ def _vertical_bus(
     # ── Via stacks and horizontal taps at each terminal ────────────────────
     for tap_x, tap_y in taps:
         # Via stack from li1 up to target layer
-        lh = draw_via_stack(comp, rules, tap_x, tap_y, "li1", target_layer)
+        lh = draw_via_stack(comp, rules, tap_x, tap_y, "li1", target_layer, "vertical")
         trunk_hw = max(trunk_hw, lh)
         # Horizontal jog on routing metal from terminal to bus
         if abs(tap_x - bus_x) > 0.001:

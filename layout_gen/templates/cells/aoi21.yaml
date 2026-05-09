@@ -1,0 +1,75 @@
+# layout_gen cell topology template — AOI21 gate
+#
+# Y = NOT((A & B) | C)
+#
+#   Pull-down (NMOS): (N_A series N_B) parallel N_C   → all drains tie to Y
+#   Pull-up   (PMOS): (P_A parallel P_B) series P_C   → P_C's drain is Y
+#
+# Layout columns (gates aligned vertically):  A | B | C
+# NMOS row (no flips):  N_A — N_B share net1 by abutment, N_C drain ties to Y
+# PMOS row (no flips):  P_A and P_B share net2 (parallel), P_C drain is Y
+#
+# The auto-router stitches Y across both rows and any non-abuttable
+# internal nets (net2 between P_A.D and P_C.S) via li1 / met1.
+
+name: aoi21
+description: >
+  AND-OR-INVERT (AOI21).  Y = NOT((A & B) | C).
+  2 NMOS series + 1 NMOS parallel (pull-down);
+  2 PMOS parallel + 1 PMOS series (pull-up).
+
+devices:
+  N_A: {template: planar_mosfet, type: nmos, terminals: {G: A, D: net1, S: GND}}
+  N_B: {template: planar_mosfet, type: nmos, terminals: {G: B, D: Y,    S: net1}}
+  N_C: {template: planar_mosfet, type: nmos, terminals: {G: C, D: Y,    S: GND}}
+  P_A: {template: planar_mosfet, type: pmos, terminals: {G: A, D: net2, S: VDD}}
+  P_B: {template: planar_mosfet, type: pmos, terminals: {G: B, D: net2, S: VDD}}
+  P_C: {template: planar_mosfet, type: pmos, terminals: {G: C, D: Y,    S: net2}}
+
+nets:
+  VDD:  {type: power, rail: top}
+  GND:  {type: power, rail: bottom}
+  A:    {type: signal}
+  B:    {type: signal}
+  C:    {type: signal}
+  Y:    {type: signal}
+  net1: {type: internal}
+  net2: {type: internal}
+
+placement_logic:
+  # NMOS row: column order A | B | C. N_A and N_B share net1 by abutment.
+  - name: N_A
+    origin: [0, 0]
+
+  - name: N_B
+    relative_to: N_A
+    relation: abut_x
+    alignment: bottom
+
+  - name: N_C
+    relative_to: N_B
+    alignment: bottom              # no abutment — N_B.D=Y, N_C.S=GND don't share
+
+  # PMOS row: gate-aligned columns A | B | C.  P_A and P_B share VDD by abutment.
+  - name: P_A
+    relative_to: N_A
+    relation: align_gate
+    alignment: gate
+
+  - name: P_B
+    relative_to: N_B
+    relation: align_gate
+    alignment: gate
+
+  - name: P_C
+    relative_to: N_C
+    relation: align_gate
+    alignment: gate
+
+ports:
+  A:   {side: west,  terminal: N_A.G}
+  B:   {side: west,  terminal: N_B.G}
+  C:   {side: west,  terminal: N_C.G}
+  Y:   {side: east,  terminal: P_C.D}
+  GND: {side: south, layer: met1}
+  VDD: {side: north, layer: met1}

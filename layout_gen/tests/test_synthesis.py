@@ -102,6 +102,88 @@ class TestDRCClean:
         )
 
 
+# ── LVS tests (optional — skipped if no LVS tool chain available) ─────────────
+
+def _try_get_lvs_runner():
+    """Return a Magic+Netgen LVS runner if both tools are reachable."""
+    try:
+        from layout_gen.lvs import get_runner
+        return get_runner()
+    except Exception:
+        return None
+
+
+@pytest.mark.skipif(
+    _try_get_lvs_runner() is None,
+    reason="No LVS tool configured (install Magic + Netgen on PATH)",
+)
+class TestLVSClean:
+    """Verify synthesized layouts match their reference netlist under LVS.
+
+    Reference netlists are generated from the same CellTemplate the
+    synthesizer consumes — these tests catch connectivity bugs (wrong
+    sd_flip, abutment shorts, missing bridges) that DRC cannot.
+    """
+
+    PARAMS = {"w_N": 0.52, "w_P": 0.42, "l": 0.15}
+
+    @pytest.fixture(scope="class")
+    def rules(self):
+        return load_pdk()
+
+    @pytest.fixture(scope="class")
+    def lvs_runner(self):
+        return _try_get_lvs_runner()
+
+    def _lvs(self, cell_name, rules, lvs_runner):
+        template = load_template(cell_name)
+        synth    = Synthesizer(rules, lvs_runner=lvs_runner)
+        result   = synth.synthesize(template, params=self.PARAMS)
+        return result
+
+    def _assert_clean(self, result):
+        assert result.lvs is not None, "LVS did not run"
+        assert result.lvs.clean, (
+            f"LVS failed with {len(result.lvs.mismatches)} mismatch(es):\n"
+            + "\n".join(f"  {m}" for m in result.lvs.mismatches[:5])
+            + "\n--- log tail ---\n" + (result.lvs.log[-1500:] or "")
+        )
+
+    def test_inverter_lvs_clean(self, rules, lvs_runner):
+        self._assert_clean(self._lvs("inverter", rules, lvs_runner))
+
+    def test_buffer_lvs_clean(self, rules, lvs_runner):
+        self._assert_clean(self._lvs("buffer", rules, lvs_runner))
+
+    def test_nand2_lvs_clean(self, rules, lvs_runner):
+        self._assert_clean(self._lvs("nand2", rules, lvs_runner))
+
+    def test_nand3_lvs_clean(self, rules, lvs_runner):
+        self._assert_clean(self._lvs("nand3", rules, lvs_runner))
+
+    def test_nor2_lvs_clean(self, rules, lvs_runner):
+        # PMOS pull-up is series — give it ~2x the per-device width so the
+        # parallel/series drive ratio matches the inverter family.
+        template = load_template("nor2")
+        synth    = Synthesizer(rules, lvs_runner=lvs_runner)
+        result   = synth.synthesize(
+            template,
+            params={"w_N": 0.52, "w_P": 0.84, "l": 0.15},
+        )
+        self._assert_clean(result)
+
+    def test_nor3_lvs_clean(self, rules, lvs_runner):
+        template = load_template("nor3")
+        synth    = Synthesizer(rules, lvs_runner=lvs_runner)
+        result   = synth.synthesize(
+            template,
+            params={"w_N": 0.52, "w_P": 1.26, "l": 0.15},
+        )
+        self._assert_clean(result)
+
+    def test_row_driver_lvs_clean(self, rules, lvs_runner):
+        self._assert_clean(self._lvs("row_driver", rules, lvs_runner))
+
 
 # ── Stacked layout tests ────────────────────────────────────────────────────
 

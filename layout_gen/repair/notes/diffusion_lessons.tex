@@ -1,0 +1,1264 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{bm}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+
+% Code listing style
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    showstringspaces=false,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    framesep=4pt,
+    rulecolor=\color{gray!50},
+    aboveskip=10pt,
+    belowskip=10pt,
+}
+
+% Math shortcuts
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\given}{\,|\,}
+\newcommand{\eps}{\varepsilon}
+
+\title{\textbf{Diffusion Models for Layout Repair}\\[0.5em]
+       \large A Working Course}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document is a working course on diffusion models, motivated by
+the layout-repair problem. Each lesson builds the math and code we
+need to train a real diffusion-based DRC repair engine. We assume
+familiarity with linear algebra, basic probability, and Python; we
+re-derive everything else as it appears.
+\end{abstract}
+
+\tableofcontents
+\vspace{1em}
+
+% =================================================================
+\section{Lesson 1: Diffusion as a Markov chain}
+
+\subsection{What problem are we solving?}
+
+We have data --- images, audio, layouts --- following an unknown
+distribution $p(x)$. We want to \emph{generate} new samples from
+$p(x)$. Two classic approaches:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{GANs}: train a generator with adversarial signal. Hard to
+  train, mode collapse, no likelihood estimate.
+\item \textbf{VAEs / autoregressive models}: tractable, but lose detail
+  or are slow.
+\end{itemize}
+
+Diffusion (Ho et al., DDPM 2020) takes a different route: instead of
+trying to learn $p(x)$ directly, learn to reverse a known
+\emph{noise-injection process}.
+
+The intuition is clean. If you know how to add a tiny bit of noise to
+data, you can train a model to remove a tiny bit of noise. Apply the
+model many times, starting from pure noise, and you recover a sample
+from $p(x)$.
+
+For our problem, the ``noise injection'' isn't a metaphor. It's
+literally what our perturbation library does: take a clean DRC-clean
+layout and apply a small destructive geometric edit. So everything we
+build will map directly onto our problem.
+
+\subsection{Markov chains}
+
+A \textbf{Markov chain} is a sequence of random variables
+$x_0, x_1, x_2, \ldots, x_T$ where each one depends only on the
+immediately previous one:
+\[
+p(x_t \given x_{t-1}, x_{t-2}, \ldots, x_0) = p(x_t \given x_{t-1}).
+\]
+The chain is fully specified by:
+\begin{enumerate}[leftmargin=*]
+\item The initial distribution $p(x_0)$.
+\item The \textbf{transition kernel} $p(x_t \given x_{t-1})$ ---
+  how to step forward.
+\end{enumerate}
+The whole sequence likelihood factors:
+\[
+p(x_0, x_1, \ldots, x_T)
+   = p(x_0) \prod_{t=1}^{T} p(x_t \given x_{t-1}).
+\]
+
+\subsection{The forward (noising) process}
+
+Diffusion defines a \textbf{specific} Markov chain that adds noise.
+Call its transition $q$ (no parameters --- we get to design it). The
+standard choice for continuous data:
+\begin{equation}
+\boxed{\;
+q(x_t \given x_{t-1}) = \N\!\left(x_t;\;\sqrt{1-\beta_t}\, x_{t-1},\; \beta_t\, \mathbf{I}\right)\;}
+\label{eq:fwd-step}
+\end{equation}
+This says: ``take $x_{t-1}$, scale it down a little, and add a little
+Gaussian noise.'' $\beta_t$ is a small number (e.g.\ $10^{-4}$ to
+$2\!\times\!10^{-2}$) called the \textbf{noise schedule} --- it controls
+how aggressive each step is.
+
+Run this chain $T$ steps (typically $T=1000$ for images). $x_T$
+becomes nearly pure Gaussian noise. The original signal is destroyed.
+
+For our layout problem: $x_t$ is a layout state. The noise step is
+one of our perturbation primitives at small magnitude. Run $T$
+perturbations and the layout is total chaos. $\beta_t$ corresponds
+to the perturbation magnitude at step $t$.
+
+\subsection{The reverse (denoising) process}
+
+We want to learn the reverse transition:
+\begin{equation}
+p_\theta(x_{t-1} \given x_t) \approx \text{``how to undo one step of noise''}.
+\end{equation}
+If we have this, we can:
+\begin{enumerate}[leftmargin=*]
+\item Sample $x_T \sim \N(0, \mathbf{I})$ (we know how).
+\item Apply $p_\theta(x_{t-1} \given x_t)$ once $\to x_{T-1}$.
+\item Apply it again $\to x_{T-2}$.
+\item After $T$ applications, $x_0 \sim p(x)$.
+\end{enumerate}
+
+The \emph{same model} is called $T$ times. Each call removes a tiny
+bit of noise. This is fundamentally different from imitation learning,
+where the model is called once and asked to predict the answer.
+
+For our problem: each call of the model is one DRC repair step. The
+model says ``given the current broken layout $x_t$, what's a slightly
+less broken layout $x_{t-1}$?'' After $T$ calls, all violations are gone.
+
+\subsection{What v9 has and what it lacks}
+
+\begin{itemize}[leftmargin=*]
+\item[\(\checkmark\)] Forward process (perturbation library) --- same idea as DDPM's $q(x_t \given x_{t-1})$.
+\item[\(\checkmark\)] Trajectories with intermediate states --- same as DDPM's chain.
+\item[\(\checkmark\)] Conditioning structure --- $k$ = noise level, partial.
+\item[$\times$] \textbf{Single training objective}: v9 trained on $(x_T, \text{action}_T)$ pairs only. Real diffusion trains on $(x_t \text{ for any } t,\;\text{the noise that took us there})$.
+\item[$\times$] \textbf{Iterative sampling}: v9 calls the model once per repair. Real diffusion calls it $T$ times, with the $t$-input changing each call.
+\item[$\times$] \textbf{Probabilistic framing}: our magnitude head outputs raw $\mu m$. Real diffusion's outputs are part of a Gaussian whose covariance depends on $\beta_t$.
+\end{itemize}
+
+These three differences are the entire reason single-shot v9 doesn't
+compose. Real diffusion is built to compose.
+
+% =================================================================
+\section{Lesson 2: The forward process --- math and code}
+
+\subsection{The transition kernel revisited}
+
+We re-state the forward step from Eq.~\eqref{eq:fwd-step} with a few
+notational shortcuts that will save us writing later:
+\begin{equation}
+\alpha_t := 1 - \beta_t,
+\qquad
+\bar{\alpha}_t := \prod_{s=1}^{t} \alpha_s.
+\end{equation}
+Then:
+\begin{equation}
+q(x_t \given x_{t-1}) = \N(x_t; \sqrt{\alpha_t}\, x_{t-1},\; \beta_t \mathbf{I}).
+\end{equation}
+Equivalently in \emph{sample form} (the same statement, but written
+as a deterministic transformation of an $\eps$ noise variable):
+\begin{equation}
+\boxed{\;
+x_t = \sqrt{\alpha_t}\, x_{t-1} + \sqrt{\beta_t}\, \eps_t,
+\qquad
+\eps_t \sim \N(0,\mathbf{I}).\;}
+\label{eq:fwd-sample}
+\end{equation}
+
+\subsection{Why this specific form?}
+
+Why $\sqrt{\alpha_t}$ on the mean and $\beta_t$ on the variance? Because
+this combination keeps the marginal variance \textbf{constant} along the
+chain. Suppose $x_{t-1}$ has variance $v$. Then by independence of $\eps_t$
+and $x_{t-1}$:
+\[
+\mathrm{Var}(x_t) = \alpha_t \cdot v + \beta_t.
+\]
+If $v=1$:
+\[
+\mathrm{Var}(x_t) = (1-\beta_t)(1) + \beta_t = 1.
+\]
+So if the data is normalised to unit variance, every $x_t$ is also
+unit variance. This is called the \emph{variance-preserving} (VP) form
+of diffusion. It keeps numbers from blowing up or vanishing as the
+chain progresses.
+
+\subsection{The noise schedule \texorpdfstring{$\beta_t$}{beta\_t}}
+
+Common schedules:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Linear}: $\beta_t$ ranges linearly from $\beta_1 = 10^{-4}$ to $\beta_T = 0.02$, $T = 1000$. Used in original DDPM.
+\item \textbf{Cosine}: smoother, used in Improved DDPM (Nichol \& Dhariwal 2021).
+\end{itemize}
+Two design constraints:
+\begin{enumerate}[leftmargin=*]
+\item $\beta_t$ small enough that each step is a small perturbation
+  (so the reverse step can be approximated by a Gaussian --- Lesson~3).
+\item $\bar{\alpha}_T$ should be close to $0$, so $x_T \approx \N(0,\mathbf{I})$
+  regardless of $x_0$. Otherwise sampling from pure noise won't match
+  the chain.
+\end{enumerate}
+
+\subsection{The closed-form jump $q(x_t \given x_0)$}
+
+This is the central trick of DDPM training. We can sample $x_t$
+\emph{directly} from $x_0$ in one shot, without iterating $t$ Markov
+steps:
+\begin{equation}
+\boxed{\;
+x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\, \eps,
+\qquad
+\eps \sim \N(0, \mathbf{I}).\;}
+\label{eq:fwd-closed}
+\end{equation}
+Equivalently:
+\begin{equation}
+q(x_t \given x_0) = \N(x_t;\; \sqrt{\bar{\alpha}_t}\, x_0,\; (1-\bar{\alpha}_t)\mathbf{I}).
+\end{equation}
+
+This is what makes training tractable. Instead of running $T$ steps for
+every training example, we sample $t$ uniformly, then apply the closed
+form once.
+
+\subsection{Derivation of the closed form}
+
+We prove Eq.~\eqref{eq:fwd-closed} by induction on $t$.
+
+\paragraph{Base case ($t=1$).}
+Eq.~\eqref{eq:fwd-sample} gives directly
+$x_1 = \sqrt{\alpha_1}\, x_0 + \sqrt{1-\alpha_1}\,\eps_1$. Since
+$\bar{\alpha}_1 = \alpha_1$, this matches Eq.~\eqref{eq:fwd-closed}. \checkmark
+
+\paragraph{Inductive step.}
+Assume $x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\, x_0 + \sqrt{1-\bar{\alpha}_{t-1}}\,\tilde\eps$ for some $\tilde\eps \sim \N(0,\mathbf{I})$. Then:
+\begin{align}
+x_t
+&= \sqrt{\alpha_t}\, x_{t-1} + \sqrt{1-\alpha_t}\,\eps_t
+   && \text{(forward step \eqref{eq:fwd-sample})} \notag\\
+&= \sqrt{\alpha_t}\Big(\sqrt{\bar{\alpha}_{t-1}}\, x_0 + \sqrt{1-\bar{\alpha}_{t-1}}\,\tilde\eps\Big) + \sqrt{1-\alpha_t}\,\eps_t
+   && \text{(inductive hyp.)} \notag\\
+&= \underbrace{\sqrt{\alpha_t \bar{\alpha}_{t-1}}}_{=\sqrt{\bar{\alpha}_t}}\, x_0
+   + \sqrt{\alpha_t(1-\bar{\alpha}_{t-1})}\,\tilde\eps
+   + \sqrt{1-\alpha_t}\,\eps_t.
+   \label{eq:induc-step}
+\end{align}
+
+The first term is what we want. Now we collapse the two noise terms.
+Note that $\tilde\eps$ and $\eps_t$ are \emph{independent} standard Gaussians.
+The sum of independent zero-mean Gaussians is Gaussian with summed
+variances:
+\[
+a\,\tilde\eps + b\,\eps_t \sim \N(0,\,(a^2+b^2)\mathbf{I}).
+\]
+Apply this with $a = \sqrt{\alpha_t(1-\bar{\alpha}_{t-1})}$ and $b = \sqrt{1-\alpha_t}$:
+\begin{align}
+a^2 + b^2
+&= \alpha_t(1-\bar{\alpha}_{t-1}) + (1-\alpha_t) \notag\\
+&= \alpha_t - \alpha_t\bar{\alpha}_{t-1} + 1 - \alpha_t \notag\\
+&= 1 - \alpha_t\bar{\alpha}_{t-1} \notag\\
+&= 1 - \bar{\alpha}_t.
+\end{align}
+So the noise sum is $\sqrt{1-\bar{\alpha}_t}\,\eps$ for some
+$\eps \sim \N(0,\mathbf{I})$. Substituting back into
+Eq.~\eqref{eq:induc-step}:
+\[
+x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\,\eps. \qquad\blacksquare
+\]
+
+\paragraph{Why this matters.} Without this closed form, every training
+example would require iterating $t$ Markov steps to construct $x_t$
+--- $O(t)$ work per example. With it, each example is $O(1)$:
+sample $\eps$, scale by precomputed coefficients. $T = 1000$ becomes
+free. This is the single most important property of the
+forward process.
+
+\subsection{Implementation: numpy demo}
+
+Let's see this in action on a 1D toy problem. Start with $x_0 = 5$
+(deterministic, ``known data point''). Run the forward chain and watch
+the distribution drift.
+
+\begin{lstlisting}[language=Python]
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Noise schedule: linear from 1e-4 to 0.02 over T=1000 steps
+T = 1000
+beta  = np.linspace(1e-4, 0.02, T)
+alpha = 1.0 - beta
+alpha_bar = np.cumprod(alpha)        # bar_alpha_t
+
+# Toy "data": 1000 samples all sitting at x = 5 (a Dirac at 5)
+N = 1000
+x0 = np.full(N, 5.0)
+
+# Snapshots of x_t at several t using the closed form
+ts = [0, 50, 200, 500, 999]
+fig, ax = plt.subplots(figsize=(10, 4))
+for t in ts:
+    if t == 0:
+        samples = x0
+    else:
+        eps = np.random.randn(N)
+        samples = (np.sqrt(alpha_bar[t-1]) * x0
+                   + np.sqrt(1 - alpha_bar[t-1]) * eps)
+    ax.hist(samples, bins=50, alpha=0.5, label=f't={t}')
+ax.set_xlabel('x_t')
+ax.set_ylabel('count')
+ax.set_title('Forward diffusion: distribution of x_t')
+ax.legend()
+plt.tight_layout()
+plt.savefig('forward_diffusion.png', dpi=120)
+\end{lstlisting}
+
+What you should see:
+\begin{itemize}[leftmargin=*]
+\item $t=0$: a single spike at $x = 5$.
+\item $t=50$: a narrow Gaussian centred just below 5 (signal slightly attenuated, small noise).
+\item $t=200,500$: the mean drifts toward 0, the variance grows.
+\item $t=999$: a wide standard Gaussian centred at 0 --- pure noise. The original $x_0=5$ is no longer recoverable from any single sample.
+\end{itemize}
+This is exactly the destruction process diffusion is built on. The
+training task in Lesson~3 will be: \emph{given $x_t$ and $t$, predict
+the noise that was added}. We'll see that this single regression task
+is sufficient to learn the entire reverse process.
+
+\subsection{From numbers to layouts}
+
+The above used a 1D Gaussian for clarity. Real DDPM does the same on
+images: $x_0$ is a flattened image (e.g.\ $32\times32\times3 = 3072$
+dimensions), $\eps$ is Gaussian noise of the same shape, every operation
+is element-wise.
+
+For \textbf{our problem}, $x_t$ is a layout. The forward step is one of
+our perturbation primitives. Mapping our perturbations onto the
+DDPM's continuous-Gaussian framework is a real research question
+(discrete-vs-continuous diffusion --- D3PM, etc.) and we'll address it
+properly in Lesson~5. For now, the concept transfers cleanly: the
+layout is degraded one step at a time by a small known perturbation,
+and we'll train a model to reverse it.
+
+\subsection{Lesson 2 summary}
+
+\begin{itemize}[leftmargin=*]
+\item Forward process is a Markov chain $x_0 \to x_1 \to \cdots \to x_T$.
+\item Each step adds a tiny Gaussian noise:
+  $q(x_t \given x_{t-1}) = \N(\sqrt{\alpha_t}\, x_{t-1},\;\beta_t\mathbf{I})$.
+\item The chain is variance-preserving: marginal variance stays $\approx 1$
+  if data is normalised.
+\item There's a closed-form for $x_t$ given $x_0$:
+  $x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\,\eps$.
+\item This makes training $O(1)$ per example (no iteration required).
+\end{itemize}
+
+In Lesson~3 we use this closed form to derive the training objective:
+the simplified \textbf{$\eps$-prediction} loss.
+
+% =================================================================
+\section{Lesson 3: The training objective --- $\eps$-prediction}
+
+\subsection{What we want from a loss function}
+
+We have data $x_0 \sim p(x)$, the forward chain $q(x_t \given x_0)$ from
+Lesson~2, and a parameterised reverse model $p_\theta(x_{t-1} \given x_t)$.
+What should the loss function be?
+
+The classical answer is \emph{maximum likelihood}: maximise
+$\E_{x_0}[\log p_\theta(x_0)]$. But $p_\theta(x_0)$ requires marginalising
+out the entire chain $x_1, \ldots, x_T$, which is intractable. The
+standard fix in latent-variable models is the \textbf{variational
+lower bound} (also called ELBO --- Evidence Lower BOund):
+\[
+\log p_\theta(x_0) \geq \E_{q(x_{1:T} \given x_0)}\!\left[
+   \log \frac{p_\theta(x_{0:T})}{q(x_{1:T} \given x_0)}\right].
+\]
+Maximising the bound is the same as minimising the negative bound,
+which (after some algebra in Ho et al.\ 2020) decomposes into a sum of
+KL divergences, one per timestep:
+\begin{equation}
+L_{\text{VLB}} = \sum_{t=2}^{T}
+\E_{q}\!\big[\, D_{\mathrm{KL}}\!\big(q(x_{t-1}\given x_t, x_0)\,\|\,p_\theta(x_{t-1}\given x_t)\big)\,\big]
++ (\text{boundary terms}).
+\label{eq:vlb}
+\end{equation}
+Each KL term measures how well our learned reverse step matches the
+true posterior reverse step $q(x_{t-1}\given x_t, x_0)$. This posterior
+is what we'd compute if we knew $x_0$; we call it the \emph{forward
+posterior}.
+
+\subsection{The forward posterior $q(x_{t-1} \given x_t, x_0)$}
+
+By Bayes' rule:
+\[
+q(x_{t-1} \given x_t, x_0)
+   = \frac{q(x_t \given x_{t-1})\, q(x_{t-1} \given x_0)}{q(x_t \given x_0)}.
+\]
+Each factor is a Gaussian we already have closed forms for. The product
+of Gaussians is Gaussian, and after working through the algebra (we
+skip the chore --- it's a textbook exercise, see DDPM Appendix~A or
+Sohl-Dickstein 2015), the posterior is:
+\begin{equation}
+\boxed{\;q(x_{t-1} \given x_t, x_0) = \N(x_{t-1};\; \tilde\mu_t(x_t, x_0),\; \tilde\beta_t\mathbf{I})\;}
+\end{equation}
+with
+\begin{align}
+\tilde\mu_t(x_t, x_0) &=
+   \frac{\sqrt{\bar{\alpha}_{t-1}}\,\beta_t}{1-\bar{\alpha}_t}\, x_0
+   + \frac{\sqrt{\alpha_t}\,(1-\bar{\alpha}_{t-1})}{1-\bar{\alpha}_t}\, x_t, \label{eq:tilde-mu}\\
+\tilde\beta_t &= \frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}\,\beta_t. \label{eq:tilde-beta}
+\end{align}
+Read these in plain English: the optimal reverse step's mean is a
+\emph{convex combination of the clean data $x_0$ and the noisy state
+$x_t$}, with mixing coefficients that depend only on the noise schedule.
+
+\subsection{Choosing a parameterisation for $p_\theta$}
+
+We choose $p_\theta(x_{t-1}\given x_t) = \N(x_{t-1};\, \mu_\theta(x_t, t),\, \tilde\beta_t \mathbf{I})$.
+That is: same variance as the true posterior (a fixed, schedule-derived
+quantity --- not learned), but the mean is a neural network.
+
+The KL between two Gaussians with the same variance reduces to a
+squared distance between means:
+\[
+D_{\mathrm{KL}}\big(\N(\tilde\mu, \tilde\beta_t)\,\|\,\N(\mu_\theta, \tilde\beta_t)\big)
+   = \frac{1}{2\tilde\beta_t}\,\|\tilde\mu - \mu_\theta\|^2.
+\]
+So Eq.~\eqref{eq:vlb} becomes
+\[
+L_{\text{VLB}} \approx \sum_t \E_q\!\left[\tfrac{1}{2\tilde\beta_t}\,\|\tilde\mu_t(x_t,x_0) - \mu_\theta(x_t,t)\|^2\right]
+\]
+plus boundary terms we ignore. The model's job is: \emph{given $x_t$
+and $t$, predict the posterior mean $\tilde\mu_t(x_t, x_0)$}.
+
+\subsection{The change of variable that unlocks everything}
+
+We could train the network to output $\mu_\theta(x_t, t)$ directly.
+Ho et al.'s key insight: change variable so the network outputs noise.
+
+From Eq.~\eqref{eq:fwd-closed} (the closed-form jump), invert for $x_0$:
+\[
+x_0 = \frac{1}{\sqrt{\bar{\alpha}_t}}\,\big(x_t - \sqrt{1-\bar{\alpha}_t}\,\eps\big).
+\]
+Substitute into $\tilde\mu_t(x_t, x_0)$ from Eq.~\eqref{eq:tilde-mu} and
+simplify (algebra omitted --- many lines of careful index pushing):
+\begin{equation}
+\boxed{\;\tilde\mu_t(x_t, x_0) = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\eps\right).\;}
+\label{eq:mu-from-eps}
+\end{equation}
+This is a remarkable result. The optimal posterior mean is determined
+by $x_t$, the schedule, and the noise $\eps$ --- nothing else. So we can
+parameterise:
+\[
+\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\eps_\theta(x_t, t)\right),
+\]
+where $\eps_\theta$ is a neural network that predicts the noise.
+Plugging this $\mu_\theta$ back into the KL distance:
+\begin{align}
+\|\tilde\mu_t - \mu_\theta\|^2
+   &= \left\|\frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1-\bar{\alpha}_t}}\,(\eps - \eps_\theta(x_t, t))\right\|^2 \notag\\
+   &= \frac{\beta_t^2}{\alpha_t(1-\bar{\alpha}_t)}\,\|\eps - \eps_\theta(x_t, t)\|^2.
+\end{align}
+
+\subsection{The simplified loss}
+
+Putting it all together, $L_{\text{VLB}}$ is a weighted sum (over $t$)
+of squared-noise-prediction errors. The weight at timestep $t$ is
+\[
+w_t = \frac{\beta_t^2}{2\,\tilde\beta_t\,\alpha_t\,(1-\bar{\alpha}_t)}.
+\]
+Empirically (this is the experimental finding of DDPM), \emph{dropping
+the weight $w_t$ entirely}, i.e.\ using a uniform $w_t = 1$, works
+better. Samples look sharper, training is more stable. So we use:
+\begin{equation}
+\boxed{\;
+L_{\text{simple}} = \E_{t \sim \mathcal{U}(1,T),\; x_0,\; \eps \sim \N(0,\mathbf{I})}
+   \left[\, \big\| \eps - \eps_\theta(\sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1-\bar{\alpha}_t}\,\eps,\; t) \big\|^2 \,\right].\;}
+\label{eq:l-simple}
+\end{equation}
+
+This is the entire DDPM training loss. Read it again: \emph{sample any
+timestep, noise the data accordingly, and ask the network to predict
+the noise}. That's the whole game.
+
+\subsection{Why predicting noise beats predicting data}
+
+We could equivalently train the network to predict $x_0$ directly. Why
+is $\eps$-prediction empirically better?
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Variance scaling}: $\eps$ is always unit-variance Gaussian
+  regardless of $t$. The output target's distribution doesn't change
+  across $t$, which is friendlier for normalisation in deep networks.
+\item \textbf{Loss weighting}: the implicit weight $w_t$ on
+  $\eps$-prediction matches what works empirically. Predicting $x_0$ has
+  a different schedule and tends to under-weight large $t$.
+\item \textbf{Easy task at large $t$}: at $t \approx T$, $x_t$ is mostly
+  noise. Predicting $\eps$ from $x_t$ at large $t$ is nearly the
+  identity --- the network just outputs $x_t/\sqrt{1-\bar{\alpha}_t}$.
+  Predicting $x_0$ at large $t$ is hopeless: the input has almost no
+  information about it. So $\eps$-prediction puts the easy targets at
+  one end of the schedule and the hard ones at the other.
+\end{itemize}
+
+\subsection{The training algorithm}
+
+DDPM training is a single tight loop:
+
+\begin{tcolorbox}[colback=gray!5,colframe=black,title=\textbf{DDPM training step}]
+\begin{enumerate}[leftmargin=*]
+\item Sample $x_0 \sim \mathcal{D}_{\text{train}}$ (a real data point).
+\item Sample $t \sim \mathcal{U}\{1, \ldots, T\}$ (a random timestep).
+\item Sample $\eps \sim \N(0, \mathbf{I})$ (a noise vector).
+\item Form $x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\eps$.
+\item Compute $\hat\eps = \eps_\theta(x_t, t)$ using the network.
+\item Loss: $\|\eps - \hat\eps\|^2$.
+\item Backprop, update $\theta$.
+\end{enumerate}
+\end{tcolorbox}
+
+That's it. No adversarial signal, no separate posterior network. Compare
+to the v9 setup: v9 takes $(x_T, \text{action})$ pairs only, with
+$\text{action}$ as the target. DDPM takes $(x_t, \eps_t)$ for any $t$,
+with the noise as the target. The latter sees \emph{the same data point
+at every level of corruption} during training, which is what makes the
+reverse chain compose.
+
+\subsection{In code}
+
+\begin{lstlisting}[language=Python]
+def ddpm_train_step(model, x0_batch, schedule, optimizer):
+    B = x0_batch.shape[0]
+    T = schedule.T
+    # 1-3: sample t and noise
+    t   = torch.randint(1, T + 1, (B,))             # uniform in {1,...,T}
+    eps = torch.randn_like(x0_batch)                # standard normal
+    # 4: form x_t via the closed form
+    a_bar = schedule.alpha_bar[t - 1]               # (B,)
+    a_bar = a_bar.view(B, *([1] * (x0_batch.ndim - 1)))
+    x_t = a_bar.sqrt() * x0_batch + (1 - a_bar).sqrt() * eps
+    # 5: predict eps
+    eps_hat = model(x_t, t)
+    # 6: MSE loss
+    loss = ((eps - eps_hat) ** 2).mean()
+    # 7: backprop
+    optimizer.zero_grad(); loss.backward(); optimizer.step()
+    return loss.item()
+\end{lstlisting}
+
+That is the complete training inner loop for a continuous-Gaussian DDPM.
+Lesson~5 modifies this to handle our polygon-perturbation setting where
+``$\eps$'' is replaced by a discrete perturbation action.
+
+\subsection{Lesson 3 summary}
+
+\begin{itemize}[leftmargin=*]
+\item ELBO $\to$ sum of KLs, one per timestep.
+\item Each KL reduces to $\|\tilde\mu_t - \mu_\theta\|^2$ (matching variances).
+\item Change of variable: predict noise $\eps$ instead of mean $\mu$.
+\item Drop the time-dependent weight: $L_{\text{simple}} = \E[\|\eps - \eps_\theta(x_t, t)\|^2]$.
+\item Each training step: sample $(x_0, t, \eps)$, form $x_t$, regress noise.
+\end{itemize}
+
+% =================================================================
+\section{Lesson 4: The reverse process --- sampling}
+
+\subsection{The setup}
+
+We've trained a network $\eps_\theta(x_t, t)$ on the simplified loss.
+Now we want to \emph{generate} new samples. The reverse process is:
+\begin{enumerate}[leftmargin=*]
+\item $x_T \sim \N(0, \mathbf{I})$ (pure noise).
+\item For $t = T, T{-}1, \ldots, 1$: draw $x_{t-1} \sim p_\theta(x_{t-1}\given x_t)$.
+\item Output $x_0$.
+\end{enumerate}
+We chose $p_\theta(x_{t-1}\given x_t) = \N(\mu_\theta(x_t, t),\,\tilde\beta_t\mathbf{I})$,
+with $\mu_\theta$ derived from $\eps_\theta$ via Eq.~\eqref{eq:mu-from-eps}.
+So one reverse step is:
+\begin{equation}
+\boxed{\;
+x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\!\left(x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\eps_\theta(x_t, t)\right) + \sigma_t\, z,
+\qquad z \sim \N(0, \mathbf{I}),\;}
+\label{eq:rev-step}
+\end{equation}
+with $\sigma_t = \sqrt{\tilde\beta_t}$ for $t > 1$ and $\sigma_1 = 0$.
+
+\subsection{Reading the formula}
+
+Three terms:
+\begin{itemize}[leftmargin=*]
+\item $\frac{1}{\sqrt{\alpha_t}}\,x_t$: undo the variance shrinkage that
+  the forward step applied.
+\item $-\frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1-\bar{\alpha}_t}}\,\eps_\theta(x_t, t)$:
+  subtract the model's noise estimate, scaled by the schedule.
+\item $\sigma_t\, z$: re-inject a tiny bit of noise so the chain is stochastic
+  (deterministic = DDIM, see below).
+\end{itemize}
+
+The first two terms together predict the posterior mean. The third makes
+the step a sample, not a point.
+
+\subsection{The full sampling algorithm}
+
+\begin{tcolorbox}[colback=gray!5,colframe=black,title=\textbf{DDPM ancestral sampling}]
+\begin{enumerate}[leftmargin=*]
+\item $x_T \sim \N(0, \mathbf{I})$.
+\item For $t = T, \ldots, 1$:
+  \begin{enumerate}[leftmargin=*]
+  \item $\hat\eps = \eps_\theta(x_t, t)$.
+  \item $\mu = \frac{1}{\sqrt{\alpha_t}}(x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\hat\eps)$.
+  \item If $t > 1$: $z \sim \N(0, \mathbf{I})$, $x_{t-1} = \mu + \sqrt{\tilde\beta_t}\, z$.
+  \item Else: $x_0 = \mu$.
+  \end{enumerate}
+\item Return $x_0$.
+\end{enumerate}
+\end{tcolorbox}
+
+In code:
+\begin{lstlisting}[language=Python]
+@torch.no_grad()
+def ddpm_sample(model, shape, schedule):
+    """Generate one sample by reversing the diffusion chain."""
+    x = torch.randn(shape)                              # x_T
+    for t in reversed(range(1, schedule.T + 1)):
+        a       = schedule.alpha[t - 1]
+        a_bar   = schedule.alpha_bar[t - 1]
+        beta_t  = schedule.beta[t - 1]
+        # Posterior variance (only when t > 1)
+        if t > 1:
+            a_bar_prev = schedule.alpha_bar[t - 2]
+            tilde_beta = (1 - a_bar_prev) / (1 - a_bar) * beta_t
+            sigma = math.sqrt(tilde_beta)
+            z = torch.randn_like(x)
+        else:
+            sigma, z = 0.0, 0.0
+        # Predict noise and apply reverse step
+        t_in = torch.full((shape[0],), t, dtype=torch.long)
+        eps_hat = model(x, t_in)
+        mu = (x - beta_t / math.sqrt(1 - a_bar) * eps_hat) / math.sqrt(a)
+        x  = mu + sigma * z
+    return x
+\end{lstlisting}
+
+\subsection{Why this works (intuition)}
+
+Each reverse step is small. The model only has to estimate the noise
+in a slightly-noised state, which is an easier problem than predicting
+the full data point in one shot. After $T$ steps, the cumulative effect
+is to integrate from noise to data along a path that the network has
+been trained to follow piecewise.
+
+Compare to v9: v9's repair is one big step from violating to clean. The
+network must commit to a fix in a single forward pass. Diffusion gives
+the same model $T$ chances to refine its answer.
+
+\subsection{DDIM: the deterministic alternative}
+
+DDIM (Song et al.\ 2021) shows you can use the same trained $\eps_\theta$
+but make sampling deterministic and fewer-step:
+\[
+x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\,\underbrace{\left(\frac{x_t - \sqrt{1-\bar{\alpha}_t}\,\eps_\theta}{\sqrt{\bar{\alpha}_t}}\right)}_{\hat x_0(x_t)}
+   + \sqrt{1-\bar{\alpha}_{t-1}}\,\eps_\theta.
+\]
+The first term is an explicit estimate of $x_0$ from $x_t$; the second
+re-noises that estimate to the level of $t-1$. With $\sigma_t = 0$ the
+process is fully deterministic.
+
+DDIM samples in 50 steps with quality comparable to DDPM at 1000.
+We'll use this when we need fast inference (Lesson~7).
+
+\subsection{Sampling for our problem}
+
+The data manifold of $p(x)$ in our case is ``DRC-clean layouts of a
+given cell.'' The reverse chain, applied to a violating layout (which
+plays the role of $x_t$ for some $t$), should walk that layout back
+toward the manifold. This is the operational meaning of layout repair
+in diffusion language.
+
+Two important deviations from textbook DDPM that we'll handle in
+Lesson~5:
+\begin{enumerate}[leftmargin=*]
+\item Our ``noise'' $\eps$ is a discrete \emph{action} (a perturbation
+  primitive: shift, grow, shrink, etc.), not a Gaussian. The
+  $\eps$-prediction loss has to be replaced.
+\item Inference doesn't start from $x_T \sim \N(0, \mathbf{I})$. It starts
+  from a real violating layout produced by a placer/router. We need to
+  estimate the effective $t$ of that layout from the DRC violations.
+\end{enumerate}
+
+\subsection{Lesson 4 summary}
+
+\begin{itemize}[leftmargin=*]
+\item Sampling = repeatedly applying the trained reverse step from $t = T$ down to $t = 1$.
+\item Each step: predict noise, subtract a scaled version, add a small re-noise.
+\item DDIM gives a deterministic, few-step alternative using the same model.
+\item For us, sampling = layout repair, started from a real violating state at an estimated $t$.
+\end{itemize}
+
+% =================================================================
+\section{Lesson 5: Adapting diffusion to layout repair}
+
+\subsection{The mismatch}
+
+Textbook DDPM lives in $\R^d$. Pixel-space images:
+\begin{itemize}[leftmargin=*]
+\item Continuous-valued: $x_t \in \R^{H \times W \times C}$.
+\item Fixed shape: every image has the same dimension.
+\item Gaussian noise is the natural perturbation.
+\end{itemize}
+
+Layouts are different:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Mixed structure}: a list of polygons. Each polygon has
+  continuous coordinates and a discrete layer label.
+\item \textbf{Variable size}: cells have different polygon counts.
+\item \textbf{Sparse, structured perturbations}: our forward process isn't
+  ``add Gaussian noise to every coordinate.'' It's ``pick one polygon
+  and apply one of N primitives'' (shift, grow, shrink, translate,
+  off-grid nudge, delete).
+\end{itemize}
+
+We have to adapt the framework, not abandon it. The key insight: the
+\emph{closed-form-jump} property of Gaussian diffusion isn't sacred.
+What's sacred is:
+\begin{enumerate}[leftmargin=*]
+\item A forward process that destroys information in known small steps.
+\item A reverse model trained to undo one step at a time.
+\item A loss that lets us sample $(x_0, t, x_t)$ cheaply.
+\end{enumerate}
+Several diffusion variants relax the Gaussian assumption while keeping
+this structure.
+
+\subsection{D3PM: discrete-state diffusion}
+
+Austin et al.\ 2021 (``Structured Denoising Diffusion Models in Discrete
+State-Spaces'') showed how to do diffusion when the data is categorical.
+Forward process: at each step, with probability $\beta_t$ flip a token
+to a random other token. Forward posterior $q(x_{t-1}\given x_t, x_0)$
+is computable in closed form using transition matrices. Loss is
+cross-entropy between predicted and true token at the previous step.
+
+This is the conceptual ancestor for what we want: a diffusion process
+where the per-step perturbation is one of a finite set.
+
+\subsection{Our mapping}
+
+Treat the layout as a tuple $(P, A)$:
+\begin{itemize}[leftmargin=*]
+\item $P$: ordered set of polygons. $|P|$ varies.
+\item $A_t$: the ``action'' applied at step $t$ when going forward (one of
+  our perturbation primitives), targeted at one polygon in $P$.
+\end{itemize}
+
+\textbf{Forward step (already implemented).} From clean state $x_{t-1}$,
+sample one perturbation action $A_t$ from the perturbation library and
+apply it to get $x_t$. The perturbation magnitude is scaled by $\beta_t$:
+small at $t$ near $T$? \emph{No --- inverted, see below.}
+
+\paragraph{Note on schedule direction.} Our existing miner (which produced
+the v9 dataset) does \emph{forward} perturbations: clean $\to$ broken.
+Step $t = 1$ in the perturbation chain is the smallest perturbation, $t = K$
+is the largest aggregated. In DDPM convention, $t = T$ is the noisiest
+state. So our ``$k$ = number of perturbations applied'' corresponds to
+DDPM's $t$ directly. There's no notational inversion.
+
+\textbf{Forward closed-form.} We don't have a clean closed-form
+$q(x_t \given x_0)$ like the Gaussian case. Each $A_t$ is conditionally
+independent given the perturbation library, but the resulting $x_t$
+depends on the entire trajectory of which polygons got hit.
+
+\emph{Pragmatic substitute}: cache the trajectory. For every $x_0$ in
+our corpus, generate $K$ trajectories (one per random seed) and store
+$(x_0, A_1, A_2, \ldots, A_K, x_1, \ldots, x_K)$. Training samples
+$(x_t, A_t)$ from this cache. This is exactly what the existing dataset
+in \texttt{layout\_gen/repair/dataset.py} provides --- we already
+generated 1435 such trajectories.
+
+\subsection{The reverse step}
+
+The textbook reverse is $\eps$-prediction. Here, the reverse must predict
+\emph{the action $A_t$ that caused the transition $x_{t-1} \to x_t$}.
+Concretely the network output is what \texttt{model.py} already produces:
+\begin{itemize}[leftmargin=*]
+\item \textbf{kind}: categorical over $\{$shift\_edge, shrink, grow, translate, nudge, delete$\}$.
+\item \textbf{target}: which polygon in $P_t$.
+\item \textbf{edge}: categorical over $\{$N, S, E, W, *$\}$ (only for shift\_edge).
+\item \textbf{magnitude}: continuous $\mu m$ (or $(dx, dy)$ for translate).
+\end{itemize}
+Inverse-action equivalence: applying the inverse of $A_t$ to $x_t$
+recovers $x_{t-1}$. So we train the model to predict $A_t$, and at
+inference time we apply its inverse.
+
+\subsection{The training loss}
+
+The DDPM loss $\|\eps - \eps_\theta\|^2$ becomes a hybrid:
+\begin{equation}
+\boxed{\;
+L = L_{\text{kind}} + \lambda_T\, L_{\text{target}} + \lambda_E\, L_{\text{edge}} + \lambda_M\, L_{\text{mag}}\;}
+\end{equation}
+with:
+\begin{itemize}[leftmargin=*]
+\item $L_{\text{kind}}$: cross-entropy over action kinds.
+\item $L_{\text{target}}$: cross-entropy or centroid-regression
+  $\|\hat c - c\|^2$ for picking the target polygon. (v7 found centroid
+  regression worked; raw target-pointer logits stayed near chance.)
+\item $L_{\text{edge}}$: cross-entropy over edge labels (zero out for
+  kinds that don't have an edge).
+\item $L_{\text{mag}}$: MSE on magnitude, masked by which kind needs it.
+\end{itemize}
+$\lambda$'s are tuning constants. In practice $\lambda_T = \lambda_E = \lambda_M = 1$
+works as a starting point, then scale based on which heads under/over-fit.
+
+This loss is \emph{not} the closed-form clean DDPM loss. It's the
+\textbf{discrete-action analogue}. The conceptual structure is the same:
+condition on $(x_t, t)$, predict the per-step transition.
+
+\subsection{Estimating $t$ at inference time}
+
+DDPM samples from $x_T \sim \N(0, \mathbf{I})$, where $T$ is fixed and known.
+For us, the input layout has an unknown ``corruption level''. We need
+to estimate $\hat t$.
+
+\textbf{Heuristic that works.} $\hat t$ = number of DRC violations,
+clamped to $[1, K]$ (our corpus only saw $k \leq 6$). The model is
+trained on layouts with exactly $k$ violations and learns to take a
+state at $k$ to a state at $k-1$.
+
+This is what the existing inference loop does (\texttt{infer.py:270}:
+\verb|k_in = min(max(n_before, 1), k_max)|). It's a heuristic, not derived,
+but it works because the magnitude of perturbation in our forward chain
+is correlated with the violation count.
+
+A more principled alternative: learn a small ``$t$-classifier'' alongside
+the main model that maps $x_t \to \hat t$. We may try this in v11.
+
+\subsection{Iterative repair loop}
+
+\begin{tcolorbox}[colback=gray!5,colframe=black,title=\textbf{Diffusion-style repair (analogue of DDPM sampling)}]
+\begin{enumerate}[leftmargin=*]
+\item Run DRC on $x$. Let $V$ = list of violations.
+\item If $|V| = 0$: done.
+\item Estimate $\hat t = \min(|V|, K)$.
+\item Encode polygons of $x$ to features.
+\item Pick one violation $v \in V$ as conditioning input (random or worst-first).
+\item Predict $\hat A = \text{model}(x, \hat t, v)$.
+\item Apply inverse action: $x \leftarrow A^{-1}(x)$.
+\item Goto~1.
+\end{enumerate}
+\end{tcolorbox}
+
+This is structurally identical to DDPM ancestral sampling: each step
+removes one ``unit of corruption'' and the same network is called
+again. The differences are: $t$ is re-estimated, conditioning includes
+the violation, and the reverse step is a discrete action instead of a
+Gaussian.
+
+\subsection{What changes vs.\ v9}
+
+v9 already implements much of this scaffolding. The diffusion-faithful
+upgrades are:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Train on every $t$, not just terminal} (the big one). v9
+  uses only the final-state $(x_K, A_K)$. v10 uses
+  $(x_t, A_t)\,\forall t$, expanded from each trajectory. The dataset
+  already supports \verb|expand_steps=True|.
+
+\item \textbf{Match training $t$ distribution to inference}. Sample $t$
+  uniformly from $\{1, \ldots, K\}$ during training so the network sees
+  every step level equally often.
+
+\item \textbf{Provide $t$ as a learned embedding}, not just an integer.
+  Replace \verb|k_emb| with a sinusoidal-or-learned vector embedding of $t$
+  (DDPM uses sinusoidal of $t$ followed by an MLP).
+
+\item \textbf{Add a $t$-aware schedule of conditioning}. At large $t$,
+  early in repair, the model should attend more to global structure;
+  at small $t$, near clean, more to the specific violation.
+
+\item \textbf{Use the centroid head as primary target signal} (already
+  done in v7+).
+\end{enumerate}
+
+These are concrete code changes, not architectural rewrites. v10 is
+v9 plus the four bullets above.
+
+\subsection{Lesson 5 summary}
+
+\begin{itemize}[leftmargin=*]
+\item Layouts $\neq$ pixels. We use a discrete-action diffusion variant.
+\item Forward = our perturbation library. Cached as trajectories.
+\item Reverse = action prediction. Loss is multi-head, not single MSE.
+\item $t$ at inference = clamped violation count.
+\item v10 = v9 + multi-step training + better $t$ embedding + balanced sampling.
+\end{itemize}
+
+% =================================================================
+\section{Lesson 6: Conditioning and classifier-free guidance}
+
+\subsection{Why conditioning matters here}
+
+A pure DDPM samples $p_\theta(x_0)$ --- any clean image. We want to
+sample \emph{the clean version of this specific layout, with this
+specific violation, in this specific cell}. That is conditional
+generation: $p_\theta(x_0 \given c)$ where $c$ is some context.
+
+In our problem, the context $c$ is naturally:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Cell context}: which polygons are present, their layers,
+  positions, sizes. This is the ``image'' to repair.
+\item \textbf{Violation conditioning}: the rule category, the
+  violation's $(x, y)$ in cell-bbox-normalised space, the deficit.
+\item \textbf{Optional global hints}: PDK identifier, cell type
+  (inverter, NAND2), expected aspect ratio.
+\end{itemize}
+
+The first item is \emph{always} the input (it's $x_t$ itself); the
+second is what v9 added in v6 onwards (\verb|violation_xy|, \verb|rule_cat|);
+the third is mostly a future direction.
+
+\subsection{Naive conditional training}
+
+The simplest way: append $c$ to the model's input. The network learns
+$\eps_\theta(x_t, t, c)$. The training loss becomes
+\[
+L = \E\!\left[\|\eps - \eps_\theta(x_t, t, c)\|^2\right]
+\]
+where $c$ is paired with $x_0$ in the dataset. At sampling time, plug
+in your desired $c$ and sample as usual.
+
+Our \texttt{model.py:DRCDenoiser} already does this. The conditioning
+inputs are projected through \verb|violation_proj| and \verb|rule_cat_emb|
+and added to the polygon embeddings. This is a clean implementation of
+``conditional diffusion''.
+
+\subsection{The problem with naive conditioning}
+
+In images, naive conditional models often produce samples that are only
+weakly aligned with the condition. The model has learned $p_\theta(x_0,c)$
+approximately, but at inference can drift to high-likelihood regions
+that ignore $c$.
+
+Fix #1: \emph{Classifier guidance} (Dhariwal \& Nichol 2021). Train a
+separate classifier $p_\phi(c \given x_t)$, then bias the reverse step
+toward states that score well under it:
+\[
+\tilde\mu_\theta = \mu_\theta + s\,\Sigma_\theta\,\nabla_{x_t}\log p_\phi(c\given x_t),
+\]
+with guidance scale $s$. This works but requires training a classifier
+on noisy intermediates.
+
+Fix #2: \emph{Classifier-free guidance} (Ho \& Salimans 2021), the
+modern default.
+
+\subsection{Classifier-free guidance (CFG)}
+
+The trick is elegant. Train one model that handles both
+the conditional case ($c$ given) and the unconditional case ($c = \emptyset$).
+At every training step, with probability $p_{\text{drop}}$ (e.g.\ 10\%),
+\emph{replace $c$ with a special $\emptyset$ token}. The network learns:
+\[
+\eps_\theta(x_t, t, c)\quad\text{and}\quad\eps_\theta(x_t, t, \emptyset)
+\]
+under the same parameters.
+
+At inference time, mix the two predictions linearly:
+\begin{equation}
+\boxed{\;
+\hat\eps_{\text{guided}} = (1 + w)\,\eps_\theta(x_t, t, c) - w\,\eps_\theta(x_t, t, \emptyset).\;}
+\label{eq:cfg}
+\end{equation}
+$w$ is the \textbf{guidance scale}:
+\begin{itemize}[leftmargin=*]
+\item $w = 0$: pure conditional (standard).
+\item $w > 0$: extrapolate \emph{away} from unconditional, \emph{toward}
+  conditional. Stronger alignment to $c$, lower diversity.
+\item $w \approx 5\text{-}15$: typical range that works well in image diffusion.
+\end{itemize}
+Eq.~\eqref{eq:cfg} reads as: take the gradient direction from
+unconditional to conditional and amplify it. The model has implicitly
+learned the conditional likelihood ratio.
+
+\subsection{Why this is beautiful}
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{One model.} No separate classifier, no extra training infra.
+\item \textbf{Tunable at inference.} The same checkpoint can produce
+  loose or tight conditioning by changing $w$.
+\item \textbf{Works empirically.} CFG is the de-facto default in modern
+  image diffusion (Imagen, Stable Diffusion, Parti).
+\end{enumerate}
+
+\subsection{CFG for our problem}
+
+What does ``unconditional'' mean here? We have multiple condition
+streams; we can drop them independently or jointly. Sensible options:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Drop violation only}: $c = (\text{cell\_polys}, \emptyset_{\text{viol}})$.
+  Forces the model to use the violation when present.
+\item \textbf{Drop rule category only}: $c = (\text{cell\_polys}, (x,y), \emptyset_{\text{cat}})$.
+  Tests whether category info actually helps.
+\item \textbf{Joint drop}: drop both with prob $p_{\text{drop}}$.
+\end{itemize}
+For v10, we'll start with joint drop at $p_{\text{drop}} = 0.1$ and
+inference $w \in \{0, 1, 3, 5\}$ as an ablation. Larger $w$ should make
+the model more strictly fix the violation we're pointing at; smaller $w$
+should give more diversity (useful when the same violation could be
+fixed multiple ways).
+
+\subsection{Implementation sketch}
+
+Two changes to the existing trainer:
+
+\textbf{Training} (\texttt{train.py}): with prob 0.1, zero out the
+\verb|violation_xy| and replace \verb|rule_cat| with a special
+\verb|UNCOND| token. Define
+\verb|RULE_CAT_INDEX["UNCOND"] = N_CATEGORIES| and add an extra
+embedding row.
+
+\textbf{Inference} (\texttt{infer.py}): for each repair step, run the
+model twice --- once with the real $c$, once with the unconditional
+$\emptyset$. Combine via Eq.~\eqref{eq:cfg}.
+
+\begin{lstlisting}[language=Python]
+def cfg_predict(model, feats, mask, t, viol_xy, rule_cat, w=3.0):
+    # Conditional pass
+    pred_c = model(feats, mask, t, violation_xy=viol_xy, rule_cat=rule_cat)
+    # Unconditional pass: zero out viol, swap rule_cat to UNCOND
+    uncond_xy  = torch.zeros_like(viol_xy)
+    uncond_cat = torch.full_like(rule_cat, RULE_CAT_INDEX["UNCOND"])
+    pred_u = model(feats, mask, t, violation_xy=uncond_xy, rule_cat=uncond_cat)
+    # Mix logits / regression heads
+    combined = {}
+    for k in pred_c:
+        combined[k] = (1 + w) * pred_c[k] - w * pred_u[k]
+    return combined
+\end{lstlisting}
+
+CFG is normally derived for $\eps$-prediction (a single regression
+output). For our multi-head model the cleanest thing is to mix
+\textbf{logits} for the categorical heads (kind, edge, target snap) and
+\textbf{regression outputs} (centroid, magnitude) directly, then take
+softmax / argmax of the mixed logits. There's no clean theoretical
+derivation here; the practical justification is empirical and the
+extension is widely used in conditional decision-prediction setups.
+
+\subsection{Lesson 6 summary}
+
+\begin{itemize}[leftmargin=*]
+\item Conditioning = pass extra context $c$ alongside $(x_t, t)$.
+\item Naive conditional models often under-utilise $c$.
+\item CFG: train with $c$ randomly dropped 10\% of the time, then at
+  inference mix the conditional and unconditional predictions with
+  scale $w$.
+\item $w$ trades alignment-to-condition vs.\ diversity at inference,
+  per-call.
+\item For our problem: drop violation + rule\_cat jointly with $p_\text{drop}=0.1$.
+\end{itemize}
+
+% =================================================================
+\section{Lesson 7: v10 --- training and evaluation}
+
+\subsection{The v10 specification}
+
+\textbf{Architecture.} Same as v9 (transformer encoder over polygons,
+multi-head decoder). Changes:
+\begin{itemize}[leftmargin=*]
+\item Replace \verb|k_emb| with a sinusoidal embedding of $t$ followed by
+  a 2-layer MLP, $t \in \{1, \ldots, K\}$, $K = 6$.
+\item Add the UNCOND row to \verb|rule_cat_emb|; allow zero
+  \verb|violation_xy| for the unconditional case.
+\item Keep all other architecture ($d_\text{hidden} = 32$, 1 layer, 2 heads).
+\end{itemize}
+
+\textbf{Data.} Reuse the augmented 1435-trajectory corpus. Set
+\verb|expand_steps=True| to expose all $(x_t, A_t)$ pairs, not just the
+terminal one --- yields $\sim$6033 samples after expansion.
+
+\textbf{Training.} Diffusion-style:
+\begin{itemize}[leftmargin=*]
+\item Sample $t$ uniformly per batch element.
+\item For each, fetch $(x_t, A_t)$ from the cached trajectory at that $t$.
+\item Apply $D_4$ symmetry augmentation as in v9.
+\item Drop conditioning with $p_\text{drop} = 0.1$ for CFG.
+\item Multi-head loss: kind CE + target centroid MSE + edge CE + magnitude MSE.
+\item LR: warmup 500 steps to $3\!\times\!10^{-3}$, cosine decay over 30 epochs.
+\item Optimizer: AdamW, weight decay $10^{-4}$.
+\item Batch size: 32.
+\item Gradient clip: 1.0.
+\end{itemize}
+
+\textbf{Evaluation.}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Held-out validation loss} (per head).
+\item \textbf{End-to-end repair on the test set}: 50 violating layouts;
+  measure (i) convergence rate (\% reaching 0 violations), (ii) mean
+  iterations to converge, (iii) regression rate (\% where final $>$ initial).
+\item \textbf{CFG sweep}: $w \in \{0, 1, 3, 5, 7\}$, pick best.
+\item \textbf{Comparison to v9}: same test set, same metrics.
+\end{itemize}
+
+\subsection{Pre-implementation acceptance criteria}
+
+Set these \emph{before} training so we can be honest about whether v10
+is a real win:
+
+\begin{tcolorbox}[colback=gray!5,colframe=black,title=\textbf{v10 success criteria}]
+\begin{enumerate}[leftmargin=*]
+\item Per-head validation loss strictly lower than v9 across kind,
+  target, edge, magnitude.
+\item End-to-end convergence rate $\geq 30\%$ on the inverter test set
+  (v9 was effectively 0\%: it produced 9 $\to$ 43 violations).
+\item Regression rate $\leq 30\%$ (most repairs at least don't make
+  things worse).
+\item CFG actually helps: optimal $w \neq 0$.
+\end{enumerate}
+\end{tcolorbox}
+
+If we don't hit (1) and (2), we don't ship v10 --- we diagnose why and
+return to Lesson~5/6.
+
+\subsection{Diagnostic plan}
+
+Before declaring success or failure on the headline metrics, run these
+sanity checks (\texttt{diagnose.py} already does most of them):
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Confusion matrix on \texttt{kind}}. If the model collapses
+  to one or two dominant classes, it's not actually denoising at every $t$.
+\item \textbf{Per-$t$ accuracy}. The model should be best at small $t$
+  (near clean) and worst at large $t$. If accuracy is flat, the
+  $t$-conditioning isn't being used.
+\item \textbf{Centroid L2 vs.\ random}. Pick a random polygon vs.\ the
+  predicted one. If the model's no better than random target selection,
+  conditioning isn't getting through.
+\item \textbf{Step-wise repair trace}. Plot violations-after vs.\ step
+  index for several test layouts. Should be roughly monotonically
+  decreasing for converging cases.
+\end{itemize}
+
+\subsection{What could go wrong (and what we'd do)}
+
+\textbf{Failure mode 1: training loss drops, repair fails.} The model
+learned to mimic the training distribution but the generated actions
+don't actually fix violations. Likely cause: distributional mismatch
+between training $x_t$ (perturbed clean states) and inference $x_t$
+(real router/placer outputs). Fix: include real-world failures in
+training corpus, or do online RL fine-tuning.
+
+\textbf{Failure mode 2: kind collapse returns.} Model predicts
+\verb|grow_rect| for everything. Likely cause: insufficient class
+balancing or a kind that's much easier to optimise. Fix: stronger
+class-balanced loss weighting or focal loss.
+
+\textbf{Failure mode 3: CFG hurts.} Higher $w$ doesn't improve repair
+rate. Likely cause: violation-conditioning isn't actually a useful signal
+beyond the polygon features themselves. Fix: ablate which conditioning
+streams are useful; possibly re-design how violation info is injected.
+
+\textbf{Failure mode 4: oscillations.} Repair gets to 0 violations and
+then jumps back up. Likely cause: the same model that fixed the violation
+also doesn't know to stop, applies a new perturbation. Fix: add a
+``no-op'' action and bias toward it when DRC says clean (we already
+short-circuit with a DRC check, but the model itself doesn't know).
+
+\subsection{The implementation order}
+
+Now in code:
+\begin{enumerate}[leftmargin=*]
+\item Modify \texttt{model.py:DRCDenoiser} to use sinusoidal $t$
+  embedding + UNCOND row.
+\item Modify \texttt{dataset.py} to (a) expose all timesteps with
+  \verb|expand_steps=True| (already supported) and (b) emit UNCOND
+  conditioning with prob 0.1.
+\item Add \texttt{train\_v10.py} (a copy of \texttt{train.py} with the
+  new sampling and dropout).
+\item Run training. 30 epochs. Monitor losses + per-head val acc.
+\item Run \texttt{diagnose.py} on the resulting checkpoint.
+\item Run \texttt{test\_repair.py} with each $w \in \{0,1,3,5,7\}$.
+\item Compare to v9 results, write up.
+\end{enumerate}
+
+\subsection{If v10 succeeds}
+
+\begin{itemize}[leftmargin=*]
+\item Re-mine the corpus with more seed cells (NAND2, NAND3, NOR2, etc.).
+  Goal: 5000+ trajectories.
+\item Train v11 on the larger corpus.
+\item Begin gf180mcuD validation: re-run mining and training on a second
+  PDK to confirm method transfers.
+\item Eventually validate on a TSMC node (planar 22-180nm).
+\end{itemize}
+
+\subsection{If v10 fails}
+
+\begin{itemize}[leftmargin=*]
+\item Don't immediately try v11 with more data. Instead, use the
+  diagnostics to pick the most diagnostic of the four failure modes
+  above, fix the root cause, and re-run v10.
+\item If two iterations don't fix it, reconsider the framing. The
+  bridge from textbook DDPM to discrete-action layouts has multiple
+  weak points; one of them might be wrong.
+\end{itemize}
+
+\subsection{Lesson 7 summary}
+
+\begin{itemize}[leftmargin=*]
+\item v10 = v9 + (multi-step training, sinusoidal $t$, CFG).
+\item Set acceptance criteria \emph{before} training. Don't move
+  goalposts after.
+\item Always run the diagnostic battery, not just headline metrics.
+\item Plan for failure modes before they happen.
+\end{itemize}
+
+% =================================================================
+\section*{Where to go from here}
+
+This document covers the core machinery. The natural extensions, in
+roughly priority order:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Reinforcement-learning fine-tuning.} Once a diffusion
+  model can repair $\sim$50\% of layouts, switch to a reward signal of
+  ``violations remaining'' and fine-tune with PPO or rejection
+  sampling. This bridges the train/test distributional gap.
+\item \textbf{Latent-space diffusion.} Encode polygons through a small
+  VAE first, do diffusion in the latent. Saves compute and may
+  generalise better.
+\item \textbf{Multi-cell context.} Today the model sees one cell at a
+  time. Real chip repair has cells embedded in larger contexts.
+  Conditioning on neighbouring layout would help.
+\item \textbf{Cross-PDK transfer.} Train on sky130 + gf180; test
+  zero-shot on TSMC. Likely needs PDK-aware conditioning (PDK
+  identifier as a token).
+\item \textbf{Theory.} A proper derivation of the discrete-action loss
+  as a discrete-state diffusion (D3PM-style), so the multi-head loss
+  isn't just an empirical hack.
+\end{enumerate}
+
+The journey from v9 to a TSMC-validated DRC-repair engine is real
+research, not a checklist. But the conceptual scaffolding is in
+place. From here, every week's work should give measurable progress
+on at least one of: repair convergence rate, training data quantity,
+PDK coverage, or theoretical understanding.
+
+\end{document}

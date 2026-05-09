@@ -78,34 +78,44 @@ class ViolationInfo:
 # ── Layer name normalization ─────────────────────────────────────────────────
 
 _LAYER_ALIASES: dict[str, str] = {
-    "m1": "met1", "m2": "met2", "m3": "met3", "m4": "met4", "m5": "met5",
     "metal1": "met1", "metal2": "met2",
     "li": "li1", "local_interconnect": "li1",
     "ct": "licon1", "contact": "licon1", "licon": "licon1",
     "polycontact": "licon1", "polycon": "licon1",
-    "via": "via1", "v1": "via1", "v2": "via2",
+    "via": "via1",
     "nsd": "nsdm", "psd": "psdm", "nplus": "nsdm", "pplus": "psdm",
     "active": "diff", "od": "diff", "diffusion": "diff",
     "gate": "poly", "pc": "poly",
     "nw": "nwell", "n_well": "nwell",
 }
+# Generate m1→met1 .. m10→met10 and v1→via1 .. v9→via9 dynamically
+for _i in range(1, 11):
+    _LAYER_ALIASES[f"m{_i}"] = f"met{_i}"
+for _i in range(1, 10):
+    _LAYER_ALIASES[f"v{_i}"] = f"via{_i}"
 
 
 def _normalize_layer(s: str) -> str:
     """Map common layer aliases to canonical names."""
     s = s.strip().lower().replace("-", "").replace("_", "")
-    # Direct canonical names
-    if s in ("poly", "diff", "li1", "met1", "met2", "met3", "met4", "met5",
-             "licon1", "mcon", "via1", "via2", "nwell", "nsdm", "psdm"):
+    # Direct canonical names — static set + dynamic met/via patterns
+    if s in ("poly", "diff", "li1", "licon1", "mcon", "nwell", "nsdm", "psdm"):
+        return s
+    # met1..met10, via1..via9 are canonical
+    if (s.startswith("met") or s.startswith("via")) and s[3:].isdigit():
         return s
     return _LAYER_ALIASES.get(s, s)
 
 
 # ── Category detection ───────────────────────────────────────────────────────
 
-# Patterns in rule names/descriptions → category
+# Patterns in rule names/descriptions → category.  Order matters — more
+# specific categories match first.  ``merge`` precedes ``spacing`` because
+# rules like "min spacing, should be manually merged if less than 0.27µm"
+# are *spacing* rules whose preferred fix is union, not push.
 _CATEGORY_PATTERNS: list[tuple[str, str]] = [
     (r"off.?grid|offgrid|grid",            "offgrid"),
+    (r"merged?\s+if|manually\s+merged|spacing.*merge", "merge"),
     (r"spacing|space|spac\b|\.sp\b",       "spacing"),
     (r"width|wid\b|\.w\b|minimum width",   "width"),
     (r"enclos|ovlp|overlap.*encl",         "enclosure"),
@@ -196,6 +206,23 @@ def parse_violation(v: DRCViolation) -> ViolationInfo:
                 # Description overrides rule-name layer for outer
                 inner = inner or layer
                 layer = outer
+
+    # For cross-layer spacing rules: pull every layer name in the description
+    # so handlers can see both sides.  E.g. "licon on diff spacing to npc"
+    # → primary=licon, secondary=npc.
+    if category in ("spacing", "merge") and desc and not inner:
+        _KNOWN = {"poly", "diff", "li1", "licon1", "mcon",
+                  "nwell", "nsdm", "psdm", "npc", "rpo", "tap"}
+        for tok in re.findall(r"[a-zA-Z][a-zA-Z0-9]*", desc):
+            cand = _normalize_layer(tok)
+            if not cand or cand == layer:
+                continue
+            is_known = cand in _KNOWN
+            is_metal = (cand.startswith(("met", "via"))
+                        and len(cand) > 3 and cand[3:].isdigit())
+            if is_known or is_metal:
+                inner = cand
+                break
     required = _extract_required(desc)
     measured = v.value if v.value is not None else 0.0
     deficit  = max(0.0, required - measured) if required > 0 else 0.0

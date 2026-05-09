@@ -76,6 +76,10 @@ class SynthResult:
         Number of synthesis attempts made.
     converged :
         ``True`` if DRC was not run or the layout passed DRC.
+    lvs :
+        :class:`~layout_gen.lvs.base.LVSResult` if an ``lvs_runner`` was
+        configured, otherwise ``None``.  The verdict is ``lvs.clean``;
+        ``converged`` reflects DRC only.
     """
     component:  Any                        # gf.Component
     placed:     dict[str, PlacedDevice]
@@ -83,6 +87,7 @@ class SynthResult:
     violations: list = field(default_factory=list)
     iterations: int  = 1
     converged:  bool = True
+    lvs:        Any  = None
 
 
 # ── Synthesizer ────────────────────────────────────────────────────────────────
@@ -114,6 +119,7 @@ class Synthesizer:
         max_iter:       int                     = 10,
         geo_agent:      GeoFixAgent | None      = None,
         geo_max_iter:   int                     = 10,
+        lvs_runner:     Any | None              = None,
     ):
         self.rules          = rules
         self.drc_runner     = drc_runner
@@ -121,6 +127,7 @@ class Synthesizer:
         self.max_iter       = max_iter
         self.geo_agent      = geo_agent
         self.geo_max_iter   = geo_max_iter
+        self.lvs_runner     = lvs_runner
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -197,17 +204,20 @@ class Synthesizer:
             )
 
             # ── GDS labels ────────────────────────────────────────────────
-            _add_labels(comp, template)
+            _add_labels(comp, template, self.rules)
+            _add_well_labels(comp, template, placed, self.rules)
 
             # ── DRC (optional) ─────────────────────────────────────────────
             if self.drc_runner is None:
+                lvs_result = self._run_lvs(comp, template, current_params)
                 return SynthResult(comp, placed, current_params,
-                                   [], iteration, True)
+                                   [], iteration, True, lvs=lvs_result)
 
             violations = _run_drc(self.drc_runner, comp)
             if not violations:
+                lvs_result = self._run_lvs(comp, template, current_params)
                 return SynthResult(comp, placed, current_params,
-                                   [], iteration, True)
+                                   [], iteration, True, lvs=lvs_result)
 
             # ── ML-guided param adjustment for next iteration ────────────
             new_params = self.ml_model(
@@ -252,9 +262,48 @@ class Synthesizer:
             violations = _run_drc(self.drc_runner, comp)
 
         # Return best result even if DRC is not clean
+        lvs_result = self._run_lvs(comp, template, current_params)
         return SynthResult(comp, placed, current_params,
                            violations, self.max_iter,
-                           converged=(not violations))
+                           converged=(not violations),
+                           lvs=lvs_result)
+
+    # ── LVS helper ───────────────────────────────────────────────────────────
+
+    def _run_lvs(
+        self,
+        comp:     Any,
+        template: CellTemplate,
+        params:   dict,
+    ) -> Any:
+        """Run LVS on *comp* against a reference netlist generated from
+        *template*.  Returns ``None`` if no ``lvs_runner`` is configured.
+        """
+        if self.lvs_runner is None:
+            return None
+        try:
+            from layout_gen.lvs.netlist import build_reference_netlist
+            ref = build_reference_netlist(template, self.rules, params)
+        except Exception as exc:
+            warnings.warn(f"LVS reference generation failed: {exc}", stacklevel=3)
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix=".gds", delete=False) as f_gds:
+            gds_path = Path(f_gds.name)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".spice", delete=False, encoding="utf-8",
+        ) as f_sp:
+            f_sp.write(ref)
+            ref_path = Path(f_sp.name)
+        try:
+            comp.write_gds(str(gds_path), with_metadata=False)
+            return self.lvs_runner.run(gds_path, ref_path, template.name)
+        except Exception as exc:
+            warnings.warn(f"LVS runner failed: {exc}", stacklevel=3)
+            return None
+        finally:
+            gds_path.unlink(missing_ok=True)
+            ref_path.unlink(missing_ok=True)
 
 
 # ── Skip-contacts computation ──────────────────────────────────────────────────
@@ -490,43 +539,138 @@ def _clamp_params(params: dict, rules: PDKRules) -> dict:
 
 # ── GDS label export ──────────────────────────────────────────────────────────
 
-def _add_labels(comp: Any, template: "CellTemplate") -> None:
-    """Add GDS text labels at port locations for LVS connectivity."""
-    label_map = {
+def _add_labels(comp: Any, template: "CellTemplate", rules: PDKRules) -> None:
+    """Add GDS text labels at port locations for LVS connectivity.
+
+    The ``label_layers:`` section in the PDK YAML maps each routing layer
+    to the GDS (layer, datatype) pair that the technology's DRC/LVS deck
+    treats as the *pin* purpose.  We resolve each port's pin layer by
+    matching its GDS layer to that map; this is what lets Magic promote a
+    GDS label into a top-cell port during extraction.
+    """
+    pdk_labels: dict[str, tuple[int, int]] = dict(rules.label_layers or {})
+
+    # Index by GDS layer number for fast lookup
+    pdk_by_gds = {ll[0]: ll for ll in pdk_labels.values()}
+
+    # Template-level overrides (legacy field) layered on top
+    template_map: dict[str, tuple[int, int]] = {
         "met1": template.label_layers.met1,
         "met2": template.label_layers.met2,
     }
-    for port in comp.ports:
-        # Determine label layer from port's GDS layer
+
+    def _resolve_for_port(port) -> tuple[int, int]:
+        # 1. Logical layer name stashed by port_resolver (most reliable —
+        #    gdsfactory may have remapped port.layer to an enum integer).
+        try:
+            ln = port.info.get("layer_name", "")
+        except Exception:
+            ln = ""
+        if ln in pdk_labels:
+            return pdk_labels[ln]
+        # 2. Template-declared layer for this port name.
+        pspec = template.ports.get(port.name)
+        if pspec and pspec.layer in pdk_labels:
+            return pdk_labels[pspec.layer]
+        if pspec and pspec.layer in template_map:
+            return template_map[pspec.layer]
+        # 3. Match by GDS layer number for ports that still carry a tuple.
         port_layer = port.layer
-        label_layer = None
         if isinstance(port_layer, (list, tuple)) and len(port_layer) >= 2:
-            # Match (layer, datatype) to met1/met2
             gds_layer = port_layer[0] if isinstance(port_layer[0], int) else port_layer
-            for metal, ll in label_map.items():
-                try:
-                    rules_layer = None  # can't access rules here easily
-                    if gds_layer == ll[0]:
-                        label_layer = ll
-                        break
-                except Exception:
-                    pass
-        # Default: use met1 label layer
-        if label_layer is None:
-            # Check if port has explicit layer in template
-            pspec = template.ports.get(port.name)
-            if pspec and pspec.layer == "met2":
-                label_layer = label_map["met2"]
-            else:
-                label_layer = label_map["met1"]
+            if gds_layer in pdk_by_gds:
+                return pdk_by_gds[gds_layer]
+        return pdk_labels.get("met1") or template_map["met1"]
+
+    for port in comp.ports:
         try:
             comp.add_label(
                 port.name,
                 position=port.center,
-                layer=label_layer,
+                layer=_resolve_for_port(port),
             )
         except Exception:
             pass  # label support varies by gdsfactory version
+
+
+def _add_well_labels(
+    comp:     Any,
+    template: "CellTemplate",
+    placed:   dict[str, PlacedDevice],
+    rules:    PDKRules,
+) -> None:
+    """Drop VDD/GND labels onto the nwell and substrate layers.
+
+    Magic's extractor names bulk nets from labels on the well-pin layers
+    (``nwell`` / ``pwell`` in the PDK YAML's ``well_labels`` section).
+    Without these labels Magic invents anonymous nets (``VSUBS``,
+    ``w_36#`` …) that don't match the schematic-side bulk, breaking LVS
+    even when the topology is otherwise correct.
+
+    Note: this only *names* the well/substrate.  Physical well/substrate
+    *taps* (diff + licon stack tying bulk to the rail) are required for
+    the cell to be electrically correct in silicon — that is a separate
+    concern.
+    """
+    well_layers: dict[str, tuple[int, int]] = dict(rules.well_labels or {})
+    if not well_layers:
+        return
+
+    # Find power nets on each rail.
+    vdd_net = ""
+    gnd_net = ""
+    for n in template.nets.values():
+        if n.net_type != "power":
+            continue
+        if n.rail == "top":
+            vdd_net = n.name
+        elif n.rail == "bottom":
+            gnd_net = n.name
+    # Fall-back name guessing
+    if not vdd_net and "VDD" in template.nets:
+        vdd_net = "VDD"
+    if not gnd_net:
+        for cand in ("VSS", "GND"):
+            if cand in template.nets:
+                gnd_net = cand
+                break
+
+    # Cell bounds — labels go inside the footprint.
+    if not placed:
+        return
+    x_lo = min(d.x for d in placed.values())
+    x_hi = max(d.x + d.geom.total_x_um for d in placed.values())
+    y_lo = min(d.y for d in placed.values())
+    y_hi = max(d.y + d.geom.total_y_um for d in placed.values())
+    cx = (x_lo + x_hi) / 2
+
+    # nwell label → on a PMOS body (highest cluster of PMOS rows)
+    pmos = [d for d in placed.values() if d.spec.device_type == "pmos"]
+    if pmos and vdd_net and "nwell" in well_layers:
+        py0 = min(d.y for d in pmos)
+        py1 = max(d.y + d.geom.total_y_um for d in pmos)
+        try:
+            comp.add_label(
+                vdd_net,
+                position=(cx, (py0 + py1) / 2),
+                layer=well_layers["nwell"],
+            )
+        except Exception:
+            pass
+
+    # substrate (pwell) label → outside the nwell, on the NMOS row
+    nmos = [d for d in placed.values() if d.spec.device_type == "nmos"]
+    if nmos and gnd_net and "pwell" in well_layers:
+        ny0 = min(d.y for d in nmos)
+        ny1 = max(d.y + d.geom.total_y_um for d in nmos)
+        try:
+            comp.add_label(
+                gnd_net,
+                position=(cx, (ny0 + ny1) / 2),
+                layer=well_layers["pwell"],
+            )
+        except Exception:
+            pass
 
 
 # ── DRC helper ────────────────────────────────────────────────────────────────

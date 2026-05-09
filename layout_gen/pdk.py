@@ -106,6 +106,10 @@ class PDKRules:
         (``"nmos"``, ``"pmos"``) contains: diff_layer, gate_layer,
         implant_layer, bulk_layer, nwell (bool), w_finger_max_um,
         sd_length_min_um.
+    _extra_rules:
+        Dynamic rule sections for any metal/via layer not explicitly named
+        as a field (e.g. ``met6``, ``met7``, ``via5`` … ``via9``).
+        Accessed transparently via ``__getattr__``.
     """
 
     name:     str
@@ -116,13 +120,7 @@ class PDKRules:
     li1:      dict
     met1:     dict
     met2:     dict
-    met3:     dict
-    met4:     dict
-    met5:     dict
     via1:     dict
-    via2:     dict
-    via3:     dict
-    via4:     dict
     implant:  dict
     nwell:    dict
     mcon:     dict
@@ -130,12 +128,40 @@ class PDKRules:
     npc:      dict
     devices:  dict
     drc:      dict    # DRC deck paths: {"klayout": "...", "magic": "..."}
+    lvs:      dict = field(default_factory=dict)   # LVS: {"netgen_setup": "..."}
+    label_layers: dict = field(default_factory=dict)  # {metal_name: (gds_layer, datatype)}
+    well_labels:  dict = field(default_factory=dict)  # {well_name: (gds_layer, datatype)}
     grid:     dict = field(default_factory=lambda: {
         "manufacturing_um": 0.005, "routing_um": 0.005,
     })
     preferred_direction: dict[str, str] = field(default_factory=dict)
     colors:   dict = field(default_factory=dict)
     _metal_stack_raw: list = field(default_factory=list)
+    _extra_rules: dict = field(default_factory=dict)
+
+    def __getattr__(self, name: str):
+        """Fall through to _extra_rules for dynamic metal/via sections.
+
+        Returns an empty dict for unknown metal/via sections to match the
+        old behavior where met3..met5 / via2..via4 defaulted to ``{}``.
+        """
+        # Only called when normal attribute lookup fails.
+        # Guard against infinite recursion during init / pickling.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            extra = object.__getattribute__(self, "_extra_rules")
+        except AttributeError:
+            raise AttributeError(name)
+        if name in extra:
+            return extra[name]
+        # Return empty dict for plausible rule section names (met*, via*)
+        # so callers don't need to guard every access.
+        if name.startswith(("met", "via")):
+            return {}
+        raise AttributeError(
+            f"PDKRules({self.name!r}) has no rule section {name!r}"
+        )
 
     @property
     def li1_is_met1(self) -> bool:
@@ -414,11 +440,37 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
             p = pdk_yaml.parent / p
         drc[tool] = str(p.resolve())
 
+    # Resolve LVS config (netgen setup file path, etc.)
+    raw_lvs = data.get("lvs", {})
+    lvs: dict[str, str] = {}
+    for key, val in raw_lvs.items():
+        if isinstance(val, str) and ("/" in val or "$" in val):
+            env_key = f"LVS_{key.upper()}"
+            resolved = os.environ.get(env_key) or os.path.expandvars(val)
+            p = pathlib.Path(resolved)
+            if not p.is_absolute():
+                p = pdk_yaml.parent / p
+            lvs[key] = str(p)
+        else:
+            lvs[key] = val
+
     # Parse preferred_direction: YAML values may be unquoted strings or ""
     raw_pdir = data.get("preferred_direction", {})
     pdir: dict[str, str] = {}
     for layer_name, direction in raw_pdir.items():
         pdir[layer_name] = str(direction) if direction else ""
+
+    # Explicitly named fields in PDKRules
+    _named_rule_fields = {
+        "poly", "diff", "contacts", "li1", "met1", "met2", "via1",
+        "implant", "nwell", "mcon", "tap", "npc",
+    }
+
+    # Collect any extra rule sections (met3..met10, via2..via9, etc.)
+    extra: dict[str, dict] = {}
+    for key, val in rules.items():
+        if key not in _named_rule_fields and isinstance(val, dict):
+            extra[key] = val
 
     return PDKRules(
         name     = data["name"],
@@ -429,13 +481,7 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
         li1      = rules.get("li1",     {}),
         met1     = rules.get("met1",    {}),
         met2     = rules.get("met2",    {}),
-        met3     = rules.get("met3",    {}),
-        met4     = rules.get("met4",    {}),
-        met5     = rules.get("met5",    {}),
         via1     = rules.get("via1",    {}),
-        via2     = rules.get("via2",    {}),
-        via3     = rules.get("via3",    {}),
-        via4     = rules.get("via4",    {}),
         implant  = rules.get("implant", {}),
         nwell    = rules.get("nwell",   {}),
         mcon     = rules.get("mcon",    {}),
@@ -443,10 +489,20 @@ def load_pdk(pdk_yaml: pathlib.Path | str = PDK_YAML) -> PDKRules:
         npc      = rules.get("npc",     {}),
         devices  = data.get("devices",  {}),
         drc      = drc,
+        lvs      = lvs,
+        label_layers = {
+            k: tuple(v) for k, v in (data.get("label_layers", {}) or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) == 2
+        },
+        well_labels = {
+            k: tuple(v) for k, v in (data.get("well_labels", {}) or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) == 2
+        },
         grid     = data.get("grid", {}),
         preferred_direction = pdir,
         colors   = data.get("colors", {}),
         _metal_stack_raw = data.get("metal_stack", []),
+        _extra_rules = extra,
     )
 
 

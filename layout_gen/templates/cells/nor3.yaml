@@ -1,0 +1,72 @@
+# layout_gen cell topology template — 3-input NOR gate
+#
+# 3 NMOS in parallel (pull-down), 3 PMOS in series (pull-up).
+#
+# Placement (NMOS row):  N_A | N_B(sd_flip) | N_C       (parallel — share Y or GND)
+# Placement (PMOS row):  P_A | P_B          | P_C       (series — share net1, net2)
+#                         ↕ gate ↕ gate ↕ gate
+#
+# N_B is sd_flipped so:
+#   N_A.D(Y)   shares diffusion with N_B.D(Y)
+#   N_B.S(GND) shares diffusion with N_C.S(GND)
+# N_C.D(Y) is on the right and routes up to P_C.D(Y).
+
+name: cmos_nor3
+description: >
+  3-input CMOS NOR gate. 3 parallel NMOS (pull-down), 3 series PMOS (pull-up).
+
+devices:
+  N_A: {template: planar_mosfet, type: nmos, terminals: {G: A,   D: Y,    S: GND}}
+  N_B: {template: planar_mosfet, type: nmos, terminals: {G: B,   D: Y,    S: GND}}
+  N_C: {template: planar_mosfet, type: nmos, terminals: {G: C,   D: Y,    S: GND}}
+  P_A: {template: planar_mosfet, type: pmos, terminals: {G: A,   D: net1, S: VDD}}
+  P_B: {template: planar_mosfet, type: pmos, terminals: {G: B,   D: net2, S: net1}}
+  P_C: {template: planar_mosfet, type: pmos, terminals: {G: C,   D: Y,    S: net2}}
+
+nets:
+  VDD:  {type: power, rail: top}
+  GND:  {type: power, rail: bottom}
+  A:    {type: signal}
+  B:    {type: signal}
+  C:    {type: signal}
+  Y:    {type: signal}
+  net1: {type: internal}
+  net2: {type: internal}
+
+placement_logic:
+  - name: N_A
+    origin: [0, 0]
+
+  - name: N_B
+    relative_to: N_A
+    relation: abut_x
+    alignment: bottom
+    sd_flip: true                 # Y on left (shared with N_A.D), GND on right
+
+  - name: N_C
+    relative_to: N_B
+    relation: abut_x
+    alignment: bottom
+
+  - name: P_A
+    relative_to: N_A
+    relation: align_gate
+    alignment: gate
+
+  - name: P_B
+    relative_to: N_B
+    relation: align_gate
+    alignment: gate
+
+  - name: P_C
+    relative_to: N_C
+    relation: align_gate
+    alignment: gate
+
+ports:
+  A:   {side: west,  terminal: N_A.G}
+  B:   {side: west,  terminal: N_B.G}
+  C:   {side: west,  terminal: N_C.G}
+  Y:   {side: east,  terminal: P_C.D}
+  GND: {side: south, layer: met1}
+  VDD: {side: north, layer: met1}
