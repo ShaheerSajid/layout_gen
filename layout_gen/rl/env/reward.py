@@ -88,6 +88,15 @@ class RewardConfig:
     # intended structure rather than discovering an axis from scratch.
     alignment_delta: float = 1.5
 
+    # ── Half-perimeter wirelength ─────────────────────────────────────
+    # Multiplier on Δ(-Σ HPWL_net). HPWL is negated so "shorter is
+    # better" (more positive). Δ is mostly negative during PLACE (each
+    # placement can only grow a net's bbox), so a positive weight here
+    # *penalises* placements that spread connected terminals apart.
+    # This is the standard dense placement-quality signal used by
+    # MaskPlace / AlphaChip / R-GCN-PPO.
+    hpwl_delta: float = 0.5
+
     # ── Common terms ──────────────────────────────────────────────────
     step:       float = 0.05
     terminal:   float = 5.0     # only fires in REPAIR phase
@@ -116,6 +125,7 @@ class RewardBreakdown:
     connectivity_delta: float = 0.0
     alignment_delta:    float = 0.0
     electrical_delta:   float = 0.0
+    hpwl_delta:         float = 0.0
 
     @property
     def total(self) -> float:
@@ -123,7 +133,7 @@ class RewardBreakdown:
                 + self.terminal + self.invalid + self.no_change
                 + self.place_success + self.route_success
                 + self.connectivity_delta + self.alignment_delta
-                + self.electrical_delta)
+                + self.electrical_delta + self.hpwl_delta)
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -138,6 +148,7 @@ class RewardBreakdown:
             "connectivity_delta": self.connectivity_delta,
             "alignment_delta":    self.alignment_delta,
             "electrical_delta":   self.electrical_delta,
+            "hpwl_delta":         self.hpwl_delta,
             "total":              self.total,
         }
 
@@ -164,6 +175,8 @@ def compute_reward(
     alignment_after:      float = 0.0,
     electrical_before:    float = 0.0,
     electrical_after:     float = 0.0,
+    hpwl_before:          float = 0.0,
+    hpwl_after:           float = 0.0,
 ) -> RewardBreakdown:
     """Compute reward from before/after violation lists, action flags,
     and the active episode phase.
@@ -216,6 +229,9 @@ def compute_reward(
     )
     rb.electrical_delta = (
         cfg.electrical_delta * (electrical_after - electrical_before)
+    )
+    rb.hpwl_delta = (
+        cfg.hpwl_delta * (hpwl_after - hpwl_before)
     )
 
     if not action_valid:

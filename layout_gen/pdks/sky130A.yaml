@@ -114,6 +114,12 @@ rules:
     spacing_to_tap_um:       0.055  # poly.5 — poly on field to tap
     endcap_over_diff_um:     0.13   # poly.8 — poly extension past diff edge (endcap)
     extension_of_diff_um:    0.25   # poly.7 — diff extension beyond poly (min S/D)
+    # Contacted-Poly-Pitch used by the high-density Sky130 standard
+    # cell libraries (sky130_fd_sc_hd*). RL action-space pitch
+    # quantisation reads this when --routing-mode std_cell is on; the
+    # DRC-minimum (width_min + spacing_min = 0.36 µm) is the lower
+    # bound the fab supports but real stdcells round up to 0.46 µm.
+    pitch_um:                0.46
 
   diff:
     width_min_um:            0.15   # difftap.1 — min diff/tap width

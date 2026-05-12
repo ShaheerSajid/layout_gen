@@ -320,5 +320,116 @@ def test_electrical_singleton_net_counts_as_connected():
     assert compute_electrical_score(state, g, terms) == pytest.approx(1.0)
 
 
+# ── HPWL (half-perimeter wirelength) ────────────────────────────────────────
+
+def test_hpwl_zero_when_no_terminals_placed():
+    from layout_gen.rl.env.connectivity import compute_hpwl_score
+    g = _toy_graph()
+    state = LayoutState()
+    assert compute_hpwl_score(state, g, {}) == 0.0
+
+
+def test_hpwl_zero_with_single_terminal_on_net():
+    """A net with only one placed terminal has no bbox → 0 HPWL."""
+    from layout_gen.rl.env.connectivity import compute_hpwl_score
+    g = _toy_graph()
+    state = LayoutState()
+    terms = {(0, "D"): (1.0, 0.5, "li1")}  # net OUT has 1/2 placed
+    assert compute_hpwl_score(state, g, terms) == 0.0
+
+
+def test_hpwl_negated_sum_of_bbox_half_perimeters():
+    """Two terminals on net OUT at x=1,y=0.5 and x=3,y=2.0 →
+    half-perimeter = 2 + 1.5 = 3.5; score = -3.5."""
+    from layout_gen.rl.env.connectivity import compute_hpwl_score
+    g = _toy_graph()
+    state = LayoutState()
+    terms = {
+        (0, "D"): (1.0, 0.5, "li1"),
+        (1, "D"): (3.0, 2.0, "li1"),
+    }
+    assert compute_hpwl_score(state, g, terms) == pytest.approx(-3.5)
+
+
+def test_hpwl_score_rises_as_terminals_cluster():
+    """Moving the second terminal closer to the first → score rises
+    (less negative)."""
+    from layout_gen.rl.env.connectivity import compute_hpwl_score
+    g = _toy_graph()
+    far  = {(0, "D"): (0.0, 0.0, "li1"), (1, "D"): (5.0, 5.0, "li1")}
+    near = {(0, "D"): (0.0, 0.0, "li1"), (1, "D"): (1.0, 1.0, "li1")}
+    s_far  = compute_hpwl_score(LayoutState(), g, far)
+    s_near = compute_hpwl_score(LayoutState(), g, near)
+    assert s_near > s_far  # near is "better" (closer to 0)
+    assert s_far  == pytest.approx(-10.0)
+    assert s_near == pytest.approx(-2.0)
+
+
+def test_reward_includes_hpwl_delta():
+    cfg = RewardConfig(
+        hpwl_delta=0.5,
+        place_success=0.0, route_success=0.0,
+        drc_delta_per_phase={"place": 0.0},
+    )
+    rb = compute_reward(
+        violations_before=[], violations_after=[],
+        state_changed=True, action_valid=True,
+        phase="place", config=cfg,
+        hpwl_before=-5.0, hpwl_after=-3.0,
+    )
+    # Δhpwl = (-3.0) - (-5.0) = +2.0; weighted = 1.0
+    assert rb.hpwl_delta == pytest.approx(1.0)
+
+
+def test_reward_hpwl_delta_negative_when_score_drops():
+    """Placing a device that grows a net's bbox → score becomes more
+    negative → hpwl_delta < 0."""
+    cfg = RewardConfig(hpwl_delta=1.0)
+    rb = compute_reward(
+        violations_before=[], violations_after=[],
+        state_changed=True, action_valid=True,
+        phase="place", config=cfg,
+        hpwl_before=-2.0, hpwl_after=-5.0,
+    )
+    assert rb.hpwl_delta == pytest.approx(-3.0)
+
+
+def test_env_exposes_hpwl_in_info(rules, cache):
+    """Env.info should include the per-step HPWL score."""
+    env = _inverter_env(rules, cache)
+    obs, info = env.reset()
+    assert "hpwl" in info
+    # Empty layout: no terminals placed → 0.
+    assert info["hpwl"] == 0.0
+
+
+def test_env_hpwl_falls_after_placing_far_apart_devices(rules, cache):
+    """Place two devices on the same net far apart → hpwl drops (more
+    negative)."""
+    env = _inverter_env(rules, cache)
+    env.reset()
+    # PLACE device 0 (NMOS) at one corner.
+    action = np.zeros(env.action_space.nvec.shape, dtype=np.int64)
+    action[0] = len(REPAIR_KINDS)
+    action[6] = 0
+    action[7] = 1; action[8] = 1
+    action[9] = 0
+    _, _, _, _, info0 = env.step(action)
+    hpwl0 = info0["hpwl"]
+
+    # PLACE device 1 (PMOS) at the opposite corner.
+    action = np.zeros(env.action_space.nvec.shape, dtype=np.int64)
+    action[0] = len(REPAIR_KINDS)
+    action[6] = 1
+    action[7] = 6; action[8] = 6
+    action[9] = 0
+    _, _, _, _, info1 = env.step(action)
+    hpwl1 = info1["hpwl"]
+
+    # After placing the second device, at least one shared net (OUT)
+    # has both terminals → bbox materialises → hpwl strictly drops.
+    assert hpwl1 < hpwl0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

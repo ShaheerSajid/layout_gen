@@ -40,10 +40,19 @@ NET_TYPES:    tuple[str, ...] = ("power", "signal", "internal", "other")
 RAIL_POSITIONS: tuple[str, ...] = ("none", "top", "bottom")
 TEMPLATES:    tuple[str, ...] = ("planar_mosfet", "other")
 
+# Typed device↔device edges from placement_directives + placement_relations.
+# Used by the R-GCN encoder. Order matters — index = edge type id.
+DEVICE_EDGE_TYPES: tuple[str, ...] = (
+    "align_gate",        # gates share an x (vertical column)
+    "abut_x",            # adjacent on x (any abutment)
+    "shared_diffusion",  # abutted AND sharing S/D diffusion
+)
+
 _DEV_TYPE_IDX  = {t: i for i, t in enumerate(DEVICE_TYPES)}
 _NET_TYPE_IDX  = {t: i for i, t in enumerate(NET_TYPES)}
 _RAIL_IDX      = {r: i for i, r in enumerate(RAIL_POSITIONS)}
 _TEMPLATE_IDX  = {t: i for i, t in enumerate(TEMPLATES)}
+_DEVICE_EDGE_TYPE_IDX = {t: i for i, t in enumerate(DEVICE_EDGE_TYPES)}
 
 
 # ── Graph dataclasses ────────────────────────────────────────────────────────
@@ -86,10 +95,16 @@ class TopologyGraph:
         Ordered list of :class:`DeviceNode`. Index = device_idx.
     nets :
         Ordered list of :class:`NetEdge`. Index = net_idx.
+    device_edges :
+        Typed undirected device↔device edges from the YAML's placement
+        intent. Each entry is ``(d_idx_a, d_idx_b, edge_type)`` where
+        ``edge_type`` ∈ :data:`DEVICE_EDGE_TYPES`. Consumed by the
+        R-GCN branch of :class:`TopologyEncoder`.
     """
-    cell_name: str
-    devices:   list[DeviceNode]
-    nets:      list[NetEdge]
+    cell_name:    str
+    devices:      list[DeviceNode]
+    nets:         list[NetEdge]
+    device_edges: list[tuple[int, int, str]] = field(default_factory=list)
 
     @property
     def n_devices(self) -> int:
@@ -173,11 +188,75 @@ def graph_from_template(
                 continue
             nets[j].connections.append((d_idx, term))
 
+    device_edges = _extract_typed_edges(template, name_to_idx)
+
     return TopologyGraph(
         cell_name=template.name,
         devices=devices,
         nets=nets,
+        device_edges=device_edges,
     )
+
+
+# ── Typed device-device edge extraction ──────────────────────────────────────
+
+def _extract_typed_edges(
+    template: CellTemplate,
+    name_to_idx: dict[str, int],
+) -> list[tuple[int, int, str]]:
+    """Pull placement-intent edges from the YAML into ``(i, j, kind)``
+    triples. Both PlacementDirective relations and the
+    ``placement.relations`` block contribute. All edges are emitted
+    as canonical (i < j) pairs and de-duplicated."""
+    out: set[tuple[int, int, str]] = set()
+
+    def _add(name_a: str, name_b: str, kind: str) -> None:
+        ia = name_to_idx.get(name_a)
+        ib = name_to_idx.get(name_b)
+        if ia is None or ib is None or ia == ib:
+            return
+        if kind not in _DEVICE_EDGE_TYPE_IDX:
+            return
+        lo, hi = (ia, ib) if ia < ib else (ib, ia)
+        out.add((lo, hi, kind))
+
+    # PlacementDirective.relation → (target, anchor, kind).
+    for d in template.placement_directives or []:
+        if not d.relative_to or not d.relation:
+            continue
+        if d.relation == "align_gate":
+            _add(d.name, d.relative_to, "align_gate")
+        elif d.relation == "abut_x":
+            _add(d.name, d.relative_to, "abut_x")
+        # "space_x" intentionally ignored — it's a soft separation hint,
+        # not a structural relation worth a dedicated edge type.
+
+    # placement.relations pairs (already symmetric in the YAML).
+    relations = getattr(template, "placement_relations", None) or {}
+    for rel_type, pair_list in relations.items():
+        kind = _canon_relation_kind(rel_type)
+        if kind is None:
+            continue
+        for pair in pair_list or ():
+            if len(pair) >= 2:
+                _add(pair[0], pair[1], kind)
+
+    return sorted(out)
+
+
+def _canon_relation_kind(rel_type: str) -> str | None:
+    """Map a YAML ``placement.relations`` key to a DEVICE_EDGE_TYPES
+    member, or None when the key has no GNN representation."""
+    rel = (rel_type or "").lower()
+    if rel == "gate_align":
+        return "align_gate"
+    if rel == "shared_diffusion":
+        return "shared_diffusion"
+    if rel == "cross_couple_gap":
+        # Cross-couple keeps the pair *near* each other on the same row,
+        # which is functionally abutment-adjacent for layout purposes.
+        return "abut_x"
+    return None
 
 
 # ── Sizing / canonicalisation helpers ────────────────────────────────────────
@@ -319,6 +398,7 @@ def encode_net(net: NetEdge) -> Sequence[float]:
 
 __all__ = [
     "DEVICE_TYPES", "NET_TYPES", "RAIL_POSITIONS", "TEMPLATES",
+    "DEVICE_EDGE_TYPES",
     "DEVICE_FEAT_DIM", "NET_FEAT_DIM",
     "DeviceNode", "NetEdge", "TopologyGraph",
     "graph_from_template",

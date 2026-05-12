@@ -29,9 +29,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from layout_gen.rl.topology.parser import (
-    DEVICE_FEAT_DIM, NET_FEAT_DIM,
+    DEVICE_EDGE_TYPES, DEVICE_FEAT_DIM, NET_FEAT_DIM,
     TopologyGraph, encode_device, encode_net,
 )
+
+
+_N_DEVICE_EDGE_TYPES = len(DEVICE_EDGE_TYPES)
+_DEVICE_EDGE_TYPE_TO_IDX = {t: i for i, t in enumerate(DEVICE_EDGE_TYPES)}
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -68,13 +72,19 @@ def graphs_to_tensors(
       * ``net_mask``     (B, N_max) float in {0, 1}
       * ``incidence``    (B, D_max, N_max) float in {0, 1}; 1 iff device d
                          is connected to net n in the original graph.
+      * ``device_adj``   (B, T, D_max, D_max) float in {0, 1}; per-edge-
+                         type symmetric adjacency over devices (T =
+                         len(DEVICE_EDGE_TYPES)). Used by the R-GCN
+                         branch of the encoder.
     """
     B = len(graphs)
+    T = _N_DEVICE_EDGE_TYPES
     device_feats = torch.zeros(B, max_devices, DEVICE_FEAT_DIM)
     net_feats    = torch.zeros(B, max_nets,    NET_FEAT_DIM)
     device_mask  = torch.zeros(B, max_devices)
     net_mask     = torch.zeros(B, max_nets)
     incidence    = torch.zeros(B, max_devices, max_nets)
+    device_adj   = torch.zeros(B, T, max_devices, max_devices)
 
     for b, g in enumerate(graphs):
         n_d = min(g.n_devices, max_devices)
@@ -93,31 +103,50 @@ def graphs_to_tensors(
                 if d_idx < n_d:
                     incidence[b, d_idx, j] = 1.0
 
+        for (ia, ib, kind) in g.device_edges or ():
+            t = _DEVICE_EDGE_TYPE_TO_IDX.get(kind)
+            if t is None or ia >= n_d or ib >= n_d:
+                continue
+            device_adj[b, t, ia, ib] = 1.0
+            device_adj[b, t, ib, ia] = 1.0
+
     return {
         "device_feats": device_feats,
         "net_feats":    net_feats,
         "device_mask":  device_mask,
         "net_mask":     net_mask,
         "incidence":    incidence,
+        "device_adj":   device_adj,
     }
 
 
 # ── Encoder ──────────────────────────────────────────────────────────────────
 
 class _GraphConv(nn.Module):
-    """One round of bipartite message passing.
+    """One round of bipartite message passing + typed device↔device R-GCN.
 
-    Updates net embeddings by aggregating incident devices, then updates
-    device embeddings by aggregating incident nets. Aggregation = mean
-    over masked + incident neighbours, normalised by per-row degree.
+    The bipartite half is unchanged: nets ← devices, then devices ← nets,
+    via mean aggregation over the device↔net incidence. The R-GCN half
+    adds one extra message per device-device edge type — each type
+    gets its own learned linear projection (R-GCN per-relation
+    weights). The typed messages are summed into the device update
+    along with the bipartite message and a self-connection.
     """
 
-    def __init__(self, d_token: int, dropout: float = 0.0) -> None:
+    def __init__(self, d_token: int, dropout: float = 0.0,
+                 n_edge_types: int = _N_DEVICE_EDGE_TYPES) -> None:
         super().__init__()
         self.dev_in_net = nn.Linear(d_token, d_token)
         self.net_to_net = nn.Linear(d_token, d_token)
         self.net_in_dev = nn.Linear(d_token, d_token)
         self.dev_to_dev = nn.Linear(d_token, d_token)
+        # Per-edge-type weight matrices (R-GCN). One linear per type;
+        # bias=False because the self-connection already contributes one.
+        self.n_edge_types = int(n_edge_types)
+        self.typed_edges = nn.ModuleList([
+            nn.Linear(d_token, d_token, bias=False)
+            for _ in range(self.n_edge_types)
+        ])
         self.dropout    = nn.Dropout(dropout)
 
     def forward(
@@ -127,6 +156,7 @@ class _GraphConv(nn.Module):
         incidence:  torch.Tensor,   # (B, D, N)
         device_mask: torch.Tensor,  # (B, D)
         net_mask:    torch.Tensor,  # (B, N)
+        device_adj:  torch.Tensor | None = None,   # (B, T, D, D)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # ── nets ← devices ─────────────────────────────────────────────────
         # Mask out device-side rows that are padded.
@@ -146,7 +176,24 @@ class _GraphConv(nn.Module):
         agg_to_dev = torch.bmm(incidence, masked_net)                  # (B, D, d)
         deg_d = incidence.sum(dim=2).clamp(min=1.0).unsqueeze(-1)      # (B, D, 1)
         agg_to_dev = agg_to_dev / deg_d
-        new_dev = F.gelu(self.dev_to_dev(device_emb) + self.net_in_dev(agg_to_dev))
+        update = self.dev_to_dev(device_emb) + self.net_in_dev(agg_to_dev)
+
+        # ── devices ← typed device-device neighbours (R-GCN) ──────────────
+        if device_adj is not None and self.n_edge_types > 0:
+            # device_adj: (B, T, D, D). For each type t, mean-aggregate
+            # neighbour device features then project with the type's
+            # weight matrix. Adds zero contribution for types with no
+            # edges (degree 0 → masked out below).
+            for t, proj in enumerate(self.typed_edges):
+                adj_t = device_adj[:, t]                                # (B, D, D)
+                deg_t = adj_t.sum(dim=2, keepdim=True)                  # (B, D, 1)
+                if deg_t.max() <= 0:
+                    continue
+                agg_t = torch.bmm(adj_t, masked_dev)                    # (B, D, d)
+                agg_t = agg_t / deg_t.clamp(min=1.0)
+                update = update + proj(agg_t)
+
+        new_dev = F.gelu(update)
         new_dev = new_dev * device_mask.unsqueeze(-1)
         new_dev = self.dropout(new_dev)
 
@@ -189,6 +236,9 @@ class TopologyEncoder(nn.Module):
         device_mask  = batch["device_mask"]
         net_mask     = batch["net_mask"]
         incidence    = batch["incidence"]
+        # device_adj is optional — encoder still works on stored
+        # checkpoints / callers that don't supply typed edges.
+        device_adj   = batch.get("device_adj")
 
         device_emb = self.dev_in(device_feats) * device_mask.unsqueeze(-1)
         net_emb    = self.net_in(net_feats)    * net_mask.unsqueeze(-1)
@@ -197,6 +247,7 @@ class TopologyEncoder(nn.Module):
             device_emb, net_emb = layer(
                 device_emb, net_emb, incidence,
                 device_mask, net_mask,
+                device_adj=device_adj,
             )
 
         device_emb = self.dev_out_norm(device_emb) * device_mask.unsqueeze(-1)

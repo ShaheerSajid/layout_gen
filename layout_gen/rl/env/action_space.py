@@ -190,6 +190,34 @@ class ActionSpace:
         ``i`` maps to ``(i + 0.5) / x_bins * cell_width_um`` (centre of
         the bin) — so the policy can never pick a coord exactly at 0
         or W (which is helpful for avoiding rail abutment by accident).
+    poly_pitch_um :
+        Optional. When supplied, the PLACE x_um coordinate is snapped
+        to the nearest poly-pitch grid line. This makes gate alignment
+        a hard constraint of the action space rather than a learned
+        soft one (DTCO-style, MDPI 2025). Poly tracks are typically
+        non-negotiable for digital layouts; analog floorplans may
+        still want it off.
+    metal_pitch_um_per_layer :
+        Optional ``{layer_name: pitch_um}`` mapping (e.g.
+        ``{"met1": 0.34, "met2": 0.46, "li1": 0.34}``). When the
+        decoded ROUTE action targets a layer in this dict, the
+        ``route_x_um`` and/or ``route_y_um`` are snapped to that
+        pitch — which axes get snapped is governed by
+        ``metal_direction_per_layer``.
+    metal_direction_per_layer :
+        Optional ``{layer_name: "horizontal" | "vertical" | ""}``
+        mapping. Drives which axis a layer's pitch quantises:
+
+        * ``"horizontal"`` — layer runs in horizontal tracks; **only
+          the y coordinate** (cross-axis track index) snaps to pitch.
+          x stays free, since routes extend along the horizontal.
+        * ``"vertical"`` — only x snaps.
+        * ``""`` or layer absent from the dict — both x and y snap
+          (no directional preference; appropriate for li1).
+
+        Together with ``metal_pitch_um_per_layer`` this gives the
+        policy a maze-router-style track grid that respects the
+        PDK's directional routing convention.
     """
 
     def __init__(self,
@@ -202,6 +230,9 @@ class ActionSpace:
                  y_bins:            int   = DEFAULT_POSITION_BINS,
                  cell_width_um:     float = DEFAULT_CELL_WIDTH_UM,
                  cell_height_um:    float = DEFAULT_CELL_HEIGHT_UM,
+                 poly_pitch_um:     float | None = None,
+                 metal_pitch_um_per_layer: dict[str, float] | None = None,
+                 metal_direction_per_layer: dict[str, str] | None = None,
                  # ── ROUTE knobs ─────────────────────────────────────
                  enable_route:      bool  = False,
                  net_cap:           int   = DEFAULT_NET_CAP,
@@ -218,6 +249,20 @@ class ActionSpace:
         self.y_bins         = y_bins
         self.cell_width_um  = cell_width_um
         self.cell_height_um = cell_height_um
+        self.poly_pitch_um  = (
+            float(poly_pitch_um) if poly_pitch_um and poly_pitch_um > 0
+            else None
+        )
+        self.metal_pitch_um_per_layer = {
+            str(k): float(v)
+            for k, v in (metal_pitch_um_per_layer or {}).items()
+            if v and float(v) > 0
+        } or None
+        self.metal_direction_per_layer = {
+            str(k): str(v).lower()
+            for k, v in (metal_direction_per_layer or {}).items()
+            if v
+        } or None
 
         self.enable_route   = enable_route
         self.net_cap        = net_cap
@@ -273,6 +318,10 @@ class ActionSpace:
             action.device_idx = int(dev_i)
             action.x_um = self._bin_to_coord(xb_i, self.x_bins, self.cell_width_um)
             action.y_um = self._bin_to_coord(yb_i, self.y_bins, self.cell_height_um)
+            if self.poly_pitch_um is not None:
+                action.x_um = self._snap_to_pitch(
+                    action.x_um, self.cell_width_um, self.poly_pitch_um,
+                )
             action.orientation = orientation_from_index(
                 or_i if 0 <= or_i < N_ORIENTATIONS else 0
             )
@@ -291,8 +340,46 @@ class ActionSpace:
             )
             action.route_w_um  = self._size_bin(wb_i, self.route_w_bins)
             action.route_h_um  = self._size_bin(hb_i, self.route_h_bins)
+            if self.metal_pitch_um_per_layer is not None:
+                pitch = self.metal_pitch_um_per_layer.get(action.route_layer)
+                if pitch is not None:
+                    direction = (
+                        self.metal_direction_per_layer.get(action.route_layer, "")
+                        if self.metal_direction_per_layer is not None else ""
+                    )
+                    # Snap only the cross-axis when the layer has a
+                    # preferred direction; snap both axes when it
+                    # doesn't (e.g. li1). "horizontal" → snap y;
+                    # "vertical" → snap x.
+                    snap_x = direction != "horizontal"
+                    snap_y = direction != "vertical"
+                    if snap_x:
+                        action.route_x_um = self._snap_to_pitch(
+                            action.route_x_um, self.cell_width_um, pitch,
+                        )
+                    if snap_y:
+                        action.route_y_um = self._snap_to_pitch(
+                            action.route_y_um, self.cell_height_um, pitch,
+                        )
 
         return action
+
+    @staticmethod
+    def _snap_to_pitch(raw_um: float, span_um: float, pitch_um: float) -> float:
+        """Snap ``raw_um`` to the nearest pitch-grid line, where grid
+        lines are ``k * pitch + pitch/2`` for k = 0, 1, …. The half-
+        pitch offset keeps the policy from ever landing on the cell
+        boundary (x=0 or x=span); clamped into ``[pitch/2, span -
+        pitch/2]`` so the snap never falls outside the cell."""
+        if pitch_um <= 0:
+            return float(raw_um)
+        half = pitch_um / 2.0
+        snapped = round((raw_um - half) / pitch_um) * pitch_um + half
+        if snapped < half:
+            snapped = half
+        if span_um > pitch_um and snapped > span_um - half:
+            snapped = span_um - half
+        return float(snapped)
 
     def _size_bin(self, idx: int, n_bins: int) -> float:
         idx = max(0, min(int(idx), n_bins - 1))
@@ -463,6 +550,67 @@ def action_mask_for(
     return np.concatenate(parts)
 
 
+# ── Pitch derivation from PDK rules ──────────────────────────────────────────
+
+def derive_poly_pitch_um(rules) -> float | None:
+    """Best-effort poly pitch in µm derived from a :class:`PDKRules` object.
+
+    Preferred source: ``rules.poly["pitch_um"]`` if the YAML defines it
+    (e.g. sky130 CPP = 0.46 µm). Otherwise falls back to the minimum
+    contacted poly pitch ``width_min_um + spacing_min_um`` which is the
+    DRC lower bound. Returns None when neither is available.
+    """
+    poly = getattr(rules, "poly", None) or {}
+    p = poly.get("pitch_um")
+    if p:
+        return float(p)
+    w = poly.get("width_min_um")
+    s = poly.get("spacing_min_um")
+    if w and s:
+        return float(w) + float(s)
+    return None
+
+
+def derive_metal_pitches_um(rules) -> dict[str, float]:
+    """Per-layer metal pitch in µm derived from a :class:`PDKRules` object.
+
+    Computes ``width_min_um + spacing_min_um`` for every metal/li layer
+    that defines both fields. This is the *minimum* track pitch — real
+    standard cells often use a wider, library-defined track pitch, but
+    the DRC-minimum is a safe lower bound when no library is loaded.
+    Empty dict when the PDK exposes no usable metal rule sections.
+    """
+    pitches: dict[str, float] = {}
+    candidates = ["li1", "met1", "met2", "met3", "met4", "met5"]
+    for name in candidates:
+        section = getattr(rules, name, None) or {}
+        w = section.get("width_min_um")
+        s = section.get("spacing_min_um")
+        if w and s:
+            pitches[name] = float(w) + float(s)
+    return pitches
+
+
+def derive_metal_directions(rules) -> dict[str, str]:
+    """Per-layer preferred routing direction from a :class:`PDKRules`.
+
+    Reads ``rules.preferred_direction`` and normalises values to the
+    set ``{"horizontal", "vertical", ""}``. Layers with an empty value
+    (e.g. li1) keep the empty string — :class:`ActionSpace` treats
+    those as "snap both axes" rather than "no snap"."""
+    raw = getattr(rules, "preferred_direction", None) or {}
+    out: dict[str, str] = {}
+    for layer, direction in raw.items():
+        v = str(direction).lower().strip()
+        if v.startswith("h"):
+            out[str(layer)] = "horizontal"
+        elif v.startswith("v"):
+            out[str(layer)] = "vertical"
+        else:
+            out[str(layer)] = ""
+    return out
+
+
 __all__ = [
     "REPAIR_KINDS", "PLACE_KINDS", "ROUTE_KINDS", "ACTION_KINDS",
     "N_REPAIR_KINDS", "N_PLACE_KINDS", "N_ROUTE_KINDS", "N_KINDS",
@@ -472,6 +620,8 @@ __all__ = [
     "DEFAULT_CELL_WIDTH_UM", "DEFAULT_CELL_HEIGHT_UM",
     "DELTA_MIN_UM", "DELTA_MAX_UM", "OFFGRID_SCALE",
     "combined_kinds", "magnitude_bins",
+    "derive_poly_pitch_um", "derive_metal_pitches_um",
+    "derive_metal_directions",
     "EnvAction", "ActionSpace",
     "action_mask_for",
 ]

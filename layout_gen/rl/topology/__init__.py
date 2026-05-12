@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from layout_gen.rl.topology.parser import (
     DeviceNode, NetEdge, TopologyGraph,
-    DEVICE_TYPES, NET_TYPES, RAIL_POSITIONS,
+    DEVICE_TYPES, NET_TYPES, RAIL_POSITIONS, DEVICE_EDGE_TYPES,
     graph_from_template,
 )
 from layout_gen.rl.topology.encoder import (
@@ -29,7 +29,7 @@ from layout_gen.rl.topology.encoder import (
 
 __all__ = [
     "DeviceNode", "NetEdge", "TopologyGraph",
-    "DEVICE_TYPES", "NET_TYPES", "RAIL_POSITIONS",
+    "DEVICE_TYPES", "NET_TYPES", "RAIL_POSITIONS", "DEVICE_EDGE_TYPES",
     "graph_from_template",
     "TopologyEncoder", "TopologyEncoderConfig",
 ]

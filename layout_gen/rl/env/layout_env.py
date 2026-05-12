@@ -58,6 +58,7 @@ from layout_gen.rl.env.place_action import (
 )
 from layout_gen.rl.env.connectivity import (
     compute_connectivity_score, compute_electrical_score,
+    compute_hpwl_score,
 )
 from layout_gen.rl.env.placement_intent import score_alignment
 from layout_gen.rl.env.reward       import (
@@ -145,6 +146,10 @@ class LayoutEnv(gym.Env):
         max_route_steps:  int  = 0,
         # ── Placement-intent reward ────────────────────────────────────
         placement_directives: list | None = None,
+        # ── Pitch quantisation (track-aligned action space) ───────────
+        poly_pitch_um:    float | None = None,
+        metal_pitch_um_per_layer: dict[str, float] | None = None,
+        metal_direction_per_layer: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
         self._drc = drc
@@ -237,6 +242,9 @@ class LayoutEnv(gym.Env):
             y_bins=y_bins,
             cell_width_um=cell_width_um,
             cell_height_um=cell_height_um,
+            poly_pitch_um=poly_pitch_um,
+            metal_pitch_um_per_layer=metal_pitch_um_per_layer,
+            metal_direction_per_layer=metal_direction_per_layer,
             enable_route=enable_route,
             net_cap=net_cap,
             route_x_bins=route_x_bins,
@@ -343,6 +351,7 @@ class LayoutEnv(gym.Env):
         connectivity_before = self._connectivity_score()
         alignment_before    = self._alignment_score()
         electrical_before   = self._electrical_score()
+        hpwl_before         = self._hpwl_score()
 
         env_action = self._action_helper.decode(action, self._last_rid_map)
 
@@ -386,6 +395,7 @@ class LayoutEnv(gym.Env):
         connectivity_after = self._connectivity_score()
         alignment_after    = self._alignment_score()
         electrical_after   = self._electrical_score()
+        hpwl_after         = self._hpwl_score()
 
         rb = compute_reward(
             violations_before=before,
@@ -400,6 +410,8 @@ class LayoutEnv(gym.Env):
             alignment_after=alignment_after,
             electrical_before=electrical_before,
             electrical_after=electrical_after,
+            hpwl_before=hpwl_before,
+            hpwl_after=hpwl_after,
         )
 
         # Phase transitions: PLACE → ROUTE (or → REPAIR if route disabled),
@@ -513,6 +525,16 @@ class LayoutEnv(gym.Env):
             self._terminals,
         )
 
+    def _hpwl_score(self) -> float:
+        """Negated sum of per-net HPWL (placement-quality signal).
+        Zero when no topology is bound. Mostly negative once two or
+        more terminals on the same net have been placed."""
+        if self._topology_graph is None:
+            return 0.0
+        return compute_hpwl_score(
+            self._state, self._topology_graph, self._terminals,
+        )
+
     def _all_devices_placed(self) -> bool:
         if self._topology_graph is None:
             return True
@@ -597,6 +619,7 @@ class LayoutEnv(gym.Env):
             "connectivity":     self._connectivity_score(),
             "alignment":        self._alignment_score(),
             "electrical":       self._electrical_score(),
+            "hpwl":             self._hpwl_score(),
             "action_mask":      mask,
             "drc_cache_stats":  self._drc.stats(),
         }

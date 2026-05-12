@@ -36,6 +36,9 @@ from layout_gen.pdk import load_pdk
 from layout_gen.synth.geo.state import LayoutState
 from layout_gen.synth.loader import load_template
 
+from layout_gen.rl.env.action_space import (
+    derive_metal_directions, derive_metal_pitches_um, derive_poly_pitch_um,
+)
 from layout_gen.rl.env.layout_env import LayoutEnv
 from layout_gen.rl.env.place_action import TransistorCache
 from layout_gen.rl.policy.network import LayoutPolicyConfig
@@ -135,6 +138,7 @@ def _build_real_env_factory(args, env_seed: int):
             return CachedDRC(runner, rules, cell_name=args.topology)
 
     cache = TransistorCache(rules)
+    poly_pitch_um, metal_pitches, metal_dirs = _resolve_pitches(args, rules)
 
     def _make():
         return LayoutEnv(
@@ -162,8 +166,48 @@ def _build_real_env_factory(args, env_seed: int):
             route_h_bins=args.route_size_bins,
             max_route_steps=args.max_route_steps,
             placement_directives=template.placement_directives,
+            poly_pitch_um=poly_pitch_um,
+            metal_pitch_um_per_layer=metal_pitches,
+            metal_direction_per_layer=metal_dirs,
         )
     return _make, graph
+
+
+def _resolve_pitches(args, rules):
+    """Translate ``--routing-mode`` + ``--poly-pitch-um`` into the
+    ``(poly_pitch_um, metal_pitch_um_per_layer)`` pair the env consumes.
+
+    Modes
+    -----
+    * ``std_cell`` (default) — poly pitch ON, metal pitches ON. Snaps
+      both placement and routing to PDK-derived track grids, giving
+      the policy a maze-router-like action substrate.
+    * ``analog`` — poly pitch ON (gates must be on a grid), metal
+      pitches OFF (routes stay on the manufacturing grid). Matches
+      typical analog layout practice.
+    * ``off`` — both OFF; the policy can output any (mfg-grid) value.
+    """
+    mode = args.routing_mode
+    if args.no_pitch_snap:
+        return None, None, None
+
+    if args.poly_pitch_um is not None:
+        poly_pitch = float(args.poly_pitch_um) if args.poly_pitch_um > 0 else None
+    else:
+        poly_pitch = derive_poly_pitch_um(rules)
+
+    if mode == "off":
+        return None, None, None
+    if mode == "analog":
+        return poly_pitch, None, None
+    # std_cell: snap routes too, and honour the PDK's preferred-direction
+    # so a horizontal layer only quantises its y (track index) and a
+    # vertical layer only quantises x.
+    return (
+        poly_pitch,
+        derive_metal_pitches_um(rules) or None,
+        derive_metal_directions(rules) or None,
+    )
 
 
 def _build_env_factory(args, env_seed: int):
@@ -236,6 +280,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--w-n", type=float, default=0.5)
     p.add_argument("--w-p", type=float, default=0.5)
     p.add_argument("--l",   type=float, default=0.15)
+
+    # Pitch quantisation (track-aligned action space).
+    p.add_argument(
+        "--routing-mode", choices=["std_cell", "analog", "off"],
+        default="std_cell",
+        help="std_cell: snap PLACE x to poly pitch AND ROUTE x/y to "
+             "per-layer metal pitch (track-aligned grid/maze router). "
+             "analog: snap only PLACE x to poly pitch; routes stay on "
+             "the mfg grid. off: no pitch snapping (legacy free-bin "
+             "behaviour). Default std_cell.")
+    p.add_argument(
+        "--poly-pitch-um", type=float, default=None,
+        help="Override the poly pitch in µm. Default: auto-detect from "
+             "rules.poly['pitch_um'], else width_min + spacing_min.")
+    p.add_argument(
+        "--no-pitch-snap", action="store_true",
+        help="Disable all pitch snapping (equivalent to --routing-mode off).")
 
     p.add_argument("--out", type=Path, default=Path("checkpoints/ppo.zip"))
     p.add_argument("--tb-log", type=Path, default=None,

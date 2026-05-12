@@ -112,8 +112,13 @@ def main(argv: list[str] | None = None) -> int:
             device_cap=args.device_cap,
             x_bins=args.position_bins,
             y_bins=args.position_bins,
+            net_cap=args.net_cap,
+            route_x_bins=args.position_bins,
+            route_y_bins=args.position_bins,
+            route_w_bins=args.route_size_bins,
+            route_h_bins=args.route_size_bins,
         )
-        print(f"[demos] {len(dataset)} (obs, PLACE-action) samples")
+        print(f"[demos] {len(dataset)} (obs, action) samples (PLACE + ROUTE)")
         cfg = LayoutPolicyConfig(
             poly_cap=args.poly_cap,
             viol_cap=args.viol_cap,

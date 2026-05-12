@@ -36,6 +36,9 @@ from layout_gen.pdk import load_pdk
 from layout_gen.synth.geo.state import LayoutState
 from layout_gen.synth.loader import load_template
 
+from layout_gen.rl.env.action_space import (
+    derive_metal_directions, derive_metal_pitches_um, derive_poly_pitch_um,
+)
 from layout_gen.rl.env.layout_env import LayoutEnv
 from layout_gen.rl.env.place_action import TransistorCache
 from layout_gen.rl.policy.network import LayoutPolicyConfig
@@ -153,6 +156,30 @@ def write_gds(state: LayoutState, rules, *, out_path: Path,
     comp.write_gds(str(out_path), with_metadata=False)
 
 
+# ── Pitch snapping resolution ────────────────────────────────────────────────
+
+def _resolve_pitches(args, rules):
+    """``--routing-mode`` + ``--poly-pitch-um`` → ``(poly_pitch_um,
+    metal_pitch_um_per_layer, metal_direction_per_layer)``. See
+    train_ppo.py for the semantics."""
+    if args.no_pitch_snap:
+        return None, None, None
+    if args.poly_pitch_um is not None:
+        poly_pitch = float(args.poly_pitch_um) if args.poly_pitch_um > 0 else None
+    else:
+        poly_pitch = derive_poly_pitch_um(rules)
+    mode = args.routing_mode
+    if mode == "off":
+        return None, None, None
+    if mode == "analog":
+        return poly_pitch, None, None
+    return (
+        poly_pitch,
+        derive_metal_pitches_um(rules) or None,
+        derive_metal_directions(rules) or None,
+    )
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -196,6 +223,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--w-n", type=float, default=0.5)
     p.add_argument("--w-p", type=float, default=0.5)
     p.add_argument("--l",   type=float, default=0.15)
+
+    # Pitch quantisation (track-aligned action space).
+    p.add_argument(
+        "--routing-mode", choices=["std_cell", "analog", "off"],
+        default="std_cell",
+        help="std_cell: snap PLACE x to poly pitch AND ROUTE x/y to "
+             "per-layer metal pitch. analog: snap only PLACE x to "
+             "poly pitch. off: no snapping. Must match the training run.")
+    p.add_argument(
+        "--poly-pitch-um", type=float, default=None,
+        help="Override the poly pitch in µm. Default: auto-detect from "
+             "rules.poly['pitch_um'], else width_min + spacing_min.")
+    p.add_argument(
+        "--no-pitch-snap", action="store_true",
+        help="Disable all pitch snapping.")
 
     # Topology encoder / policy sizing
     p.add_argument("--topology-dim", type=int, default=64)
@@ -258,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     cache = TransistorCache(rules)
 
     enable_route = not args.no_route
+    poly_pitch_um, metal_pitches, metal_dirs = _resolve_pitches(args, rules)
 
     # ── Env ──────────────────────────────────────────────────────────────
     env = LayoutEnv(
@@ -280,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
         route_h_bins=args.route_size_bins,
         max_route_steps=args.max_route_steps,
         placement_directives=template.placement_directives,
+        poly_pitch_um=poly_pitch_um,
+        metal_pitch_um_per_layer=metal_pitches,
+        metal_direction_per_layer=metal_dirs,
     )
 
     # ── Policy ───────────────────────────────────────────────────────────

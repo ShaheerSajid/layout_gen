@@ -141,6 +141,7 @@ Phase-aware composite. Per-step:
 | `connectivity_delta` | ×2.0 | Δ(per-net fraction of terminals touched by same-net wire) |
 | `alignment_delta` | ×1.5 | Δ(YAML directive satisfaction: align_gate / abut_x / origin) |
 | `electrical_delta` | ×3.0 | Δ(per-net "all terminals in one connected component") via union-find |
+| `hpwl_delta` | ×0.5 | Δ(−Σ half-perimeter of per-net terminal bbox) — dense placement-quality signal (MaskPlace / AlphaChip / R-GCN-PPO) |
 
 The combination empirically takes the inverter from `ep_rew_mean ≈ 3.3`
 (naïve) to `≈ 12.5` (BC + all rewards), and produces canonical
@@ -165,9 +166,15 @@ gate-aligned layouts.
 | 4.6: alignment reward + real-DRC default | ✅ | `9e96bdc` |
 | 4.7: electrical (transitive) connectivity | ✅ | `fac638d` |
 | 5: BC demos from synth pipeline | ✅ | `660b69a` |
-| 5.1: train_bc wired to demo dataset | ✅ | this commit |
+| 5.1: train_bc wired to demo dataset | ✅ | `a108012` |
+| 5.2: HPWL placement reward term | ✅ | prev session |
+| 5.3: pitch quantisation (poly + per-layer metal) | ✅ | prev session |
+| 5.4: direction-aware metal pitch (h/v per layer) | ✅ | prev session |
+| 5.5: typed-edge R-GCN (align_gate/abut_x/shared_diffusion) | ✅ | prev session |
+| 5.6: ROUTE demos from synth (BC pretrains route heads) | ✅ | this session |
+| 5.7: sky130 stdcell CPP (`poly.pitch_um: 0.46`) in PDK YAML | ✅ | this session |
 
-**Test count:** 106 passing.
+**Test count:** 143 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -211,6 +218,23 @@ Surveyed in May 2026 — see Sources at the bottom of this doc.
   more sophisticated than the single weighted-sum used in most papers
 - ✅ MaskablePPO + per-dim action masking (standard recipe; we have it)
 - ✅ Topology GNN conditioning (bipartite device↔net; everyone does this)
+- ✅ **Δ-HPWL placement reward** — the standard MaskPlace/AlphaChip/
+  R-GCN-PPO dense signal, now in `RewardConfig.hpwl_delta` on top of
+  the existing connectivity / electrical terms
+- ✅ **Track-aligned action space** — PLACE x snapped to poly pitch
+  and ROUTE x/y snapped to per-layer metal pitch (`std_cell` mode),
+  honouring each layer's PDK-declared `preferred_direction` so
+  horizontal layers only quantise y and vertical layers only
+  quantise x. Gives the policy a maze-router-style discrete
+  substrate. `analog` mode keeps poly pitch (gates must sit on a
+  grid) but lets metals run on the manufacturing grid only. Beats
+  the MDPI-2025 DTCO recipe, which only quantises poly.
+- ✅ **Typed-edge R-GCN** — bipartite GNN extended with per-edge-type
+  weight matrices over device↔device relations (`align_gate`,
+  `abut_x`, `shared_diffusion`) extracted from the YAML's
+  `placement_logic` + `placement.relations`. Matches the DATE 2025
+  R-GCN-PPO recipe. Previously these directives only entered through
+  the alignment reward; the GNN now encodes them too.
 - ✅ **Transitive electrical connectivity** via union-find — most
   papers use HPWL proxies; we have actual net-completion signal
 - ✅ **Real klayout in the reward loop** — most analog/cell papers use
@@ -221,35 +245,10 @@ Surveyed in May 2026 — see Sources at the bottom of this doc.
 
 **Where SOTA does things we don't yet:**
 
-Five concrete improvements, ranked by ROI. Each replaces a row in
+Two concrete improvements, ranked by ROI. Each replaces a row in
 "What's next" below.
 
-1. **HPWL reward term** *(~1 hour, biggest impact)*. Every paper in
-   the field uses Δ-HPWL (half-perimeter wirelength) as a dense
-   per-step signal. We have `connectivity_delta` ("did you touch a
-   terminal") and `electrical_delta` ("is the net connected") but no
-   "are wires short" signal. Add `compute_hpwl_score(state, topology,
-   terminals)` returning negated sum of per-net bbox perimeters; add
-   `hpwl_delta` weight to `RewardConfig`. Files: `rl/env/connectivity.py`,
-   `rl/env/reward.py`, `rl/env/layout_env.py`.
-
-2. **Poly-pitch-aligned position bins** *(~1 hour, high impact)*. The
-   MDPI DTCO paper snaps x-bins to poly pitch — the policy *cannot*
-   produce a non-gate-aligned placement. Sky130 poly pitch ≈ 0.46 µm;
-   over a 4 µm cell, valid X positions become 9 discrete points.
-   Files: `rl/env/action_space.py:ActionSpace._bin_to_coord` — quantise
-   to nearest poly-pitch multiple from `rules.poly`.
-
-3. **Typed-edge GNN (R-GCN)** *(~half day, medium-high impact)*. The
-   DATE 2025 paper uses edge types (`connected`, `h-align`,
-   `v-align`, symmetry, abut) and aggregates per-type with separate
-   weight matrices. Our YAMLs already specify these via
-   `placement_logic` (`align_gate`, `abut_x`, `mirror_x`); the
-   alignment-reward consumes them but the GNN doesn't. Files:
-   `rl/topology/parser.py` (extract edge types from directives),
-   `rl/topology/encoder.py` (per-type weight matrices in `_GraphConv`).
-
-4. **True IBRL** *(~3 hours, medium impact)*. We currently use BC just
+1. **True IBRL** *(~3 hours, medium impact)*. We currently use BC just
    to initialise PPO weights, then discard the BC policy. IBRL
    (arXiv 2311.02198) keeps the BC policy frozen and mixes its action
    proposals into the rollout buffer at a decaying rate. PPO learns
@@ -257,7 +256,7 @@ Five concrete improvements, ranked by ROI. Each replaces a row in
    `rl/training/ppo_train.py` — add `bc_proposer` arg, sample BC
    actions with probability β(step) decaying 0.5 → 0.
 
-5. **MaskPlace-style wiremask channel in observation** *(~half day,
+2. **MaskPlace-style wiremask channel in observation** *(~half day,
    speculative impact)*. State includes an (x_bins, y_bins) image
    per net showing "if I place a terminal here, what's the HPWL
    increment". For our 8×8 grid this is trivially small. Files:
@@ -277,27 +276,11 @@ Five concrete improvements, ranked by ROI. Each replaces a row in
 
 ## What's next
 
-In rough decreasing order of impact. Pick one per session. The first
-three items come from the SOTA comparison above; the rest were already
-on the roadmap.
+In rough decreasing order of impact. Pick one per session. All
+remaining SOTA-gap items are batched at the bottom; the items below
+are the next concrete things to ship.
 
-### 1. HPWL reward term (~1 hour) — SOTA gap
-
-See "Where SOTA does things we don't yet" #1. Smallest change with
-the biggest expected signal-density improvement.
-
-### 2. Poly-pitch-aligned position bins (~1 hour) — SOTA gap
-
-See "Where SOTA does things we don't yet" #2. Makes gate alignment a
-hard constraint instead of a learned soft one.
-
-### 3. Typed-edge GNN / R-GCN (~half day) — SOTA gap
-
-See "Where SOTA does things we don't yet" #3. Lets the topology GNN
-encode symmetry / alignment / abutment intent that today only enters
-through the reward.
-
-### 4. Real-DRC PPO training run (~hours, no new code)
+### 1. Real-DRC PPO training run (~hours, no new code)
 
 ```bash
 .venv/bin/python -m layout_gen.rl.scripts.train_ppo \
@@ -313,21 +296,7 @@ through the reward.
 20k steps × ~0.5 s/step ≈ 3 hours. Run overnight, then `generate.py`
 + `inspect_gds.py --strict` for the verdict.
 
-### 5. ROUTE demos from the synth router (~1 day)
-
-Currently `demo_extract.py` only emits PLACE actions. The synth pipeline
-also produces routing geometry; we can attribute each metal rect to a
-net (it overlaps that net's terminals) and emit ROUTE actions in the
-demo JSON. This would let BC pretrain the ROUTE heads as well.
-
-Files to touch:
-- `rl/training/demo_extract.py` — extend to walk `result.component`,
-  identify routing rects, attribute by terminal-overlap, output
-  `kind: route_segment` actions.
-- `rl/training/demo_dataset.py` — encode ROUTE labels (currently only
-  PLACE samples are emitted).
-
-### 6. Multi-cell training (~1 day)
+### 2. Multi-cell training (~1 day)
 
 Right now `train_ppo --topology X` trains on one cell. Add
 `--topologies X,Y,Z` and a vec-env that rotates cells per episode.
@@ -341,7 +310,7 @@ Files to touch:
 - Maybe `rl/training/ppo_train.py` — the trainer is already vec-env
   capable; just need to pass a list of factories.
 
-### 7. LVS reward via magic (~1 day)
+### 3. LVS reward via magic (~1 day)
 
 Replace the geometric heuristics in `connectivity.py` with calls to a
 real LVS extractor. We have `layout_gen/lvs/magic_runner.py` from the
@@ -351,22 +320,22 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 8. Eval harness (~half day)
+### 4. Eval harness (~half day)
 
 `rl/scripts/eval.py` that runs N episodes, reports mean ep_rew,
 DRC-clean rate, alignment score, electrical score, inspector pass
 rate. Useful for tracking progress quantitatively.
 
-### 9. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
+### 5. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
 
-See "Where SOTA does things we don't yet" #4.
+See "Where SOTA does things we don't yet" #1.
 
-### 10. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
+### 6. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
 
-See "Where SOTA does things we don't yet" #5. Speculative — try after
+See "Where SOTA does things we don't yet" #2. Speculative — try after
 the simpler items.
 
-### 11. Decommission rule-based `synth/placer.py` + `synth/router.py`
+### 7. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
 Only after RL reaches parity on all template cells. Long-term goal.
 
@@ -500,4 +469,5 @@ layout_gen/rl/
 
 ---
 
-*Last updated by Claude Code session 2026-05-12.*
+*Last updated by Claude Code session 2026-05-13 (ROUTE-action BC
+demos + sky130 stdcell CPP in PDK YAML).*

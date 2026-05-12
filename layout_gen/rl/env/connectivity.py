@@ -221,8 +221,57 @@ def compute_electrical_score(
     return float(score)
 
 
+# ── Half-perimeter wirelength (placement-quality signal) ───────────────────
+
+def compute_hpwl_score(
+    state:     LayoutState,
+    topology:  TopologyGraph,
+    terminals: dict[tuple[int, str], tuple[float, float, str]],
+) -> float:
+    """Negated sum of per-net HPWL (half-perimeter of terminal bbox).
+
+    For each net N:
+      1. Gather (x, y) of every placed terminal on N from ``terminals``.
+      2. If <2 terminals are placed, the net contributes 0 (no bbox).
+      3. Otherwise add ``(max_x - min_x) + (max_y - min_y)``.
+
+    Returns ``-Σ_nets HPWL_N``. Always ≤ 0; closer to zero is "better"
+    (terminals of each net are clustered tightly).
+
+    Why
+    ---
+    This is the standard dense placement-quality signal used across
+    MaskPlace / AlphaChip / R-GCN-PPO. The Δ between consecutive steps
+    is mostly negative during PLACE (each new terminal can only grow a
+    net's bbox); the policy is rewarded for placing devices *close* to
+    their already-placed connected partners. Complements
+    ``compute_connectivity_score`` (terminal-touch) and
+    ``compute_electrical_score`` (transitive net completion).
+
+    The ``state`` parameter is unused — included for signature symmetry
+    with the other connectivity scorers so the env can plumb them
+    uniformly. HPWL is a pure placement metric.
+    """
+    del state  # signature symmetry only
+    total = 0.0
+    for net in topology.nets:
+        xs: list[float] = []
+        ys: list[float] = []
+        for (d_idx, term_name) in net.connections:
+            pos = terminals.get((d_idx, term_name))
+            if pos is None:
+                continue
+            xs.append(pos[0])
+            ys.append(pos[1])
+        if len(xs) < 2:
+            continue
+        total += (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return -float(total)
+
+
 __all__ = [
     "DEFAULT_TOUCH_TOL_UM",
     "compute_connectivity_score",
     "compute_electrical_score",
+    "compute_hpwl_score",
 ]
