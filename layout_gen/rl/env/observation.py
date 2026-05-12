@@ -75,22 +75,36 @@ class Observation:
     viol_mask:    np.ndarray   # (VIOL_CAP,)
     global_feats: np.ndarray   # (N_GLOBAL,)
     rid_to_idx:   dict[int, int]   # not part of gym obs; used by action decode
+    topology_global: np.ndarray | None = None   # (topology_dim,) or None
 
     def to_dict(self) -> dict[str, np.ndarray]:
-        return {
+        out = {
             "poly_feats":   self.poly_feats,
             "poly_mask":    self.poly_mask,
             "viol_feats":   self.viol_feats,
             "viol_mask":    self.viol_mask,
             "global_feats": self.global_feats,
         }
+        if self.topology_global is not None:
+            out["topology_global"] = self.topology_global
+        return out
 
 
 def make_observation_space(*,
-                            poly_cap: int = DEFAULT_POLY_CAP,
-                            viol_cap: int = DEFAULT_VIOL_CAP) -> spaces.Dict:
-    """Build the gymnasium Dict space matching :func:`build_observation`."""
-    return spaces.Dict({
+                            poly_cap:     int = DEFAULT_POLY_CAP,
+                            viol_cap:     int = DEFAULT_VIOL_CAP,
+                            topology_dim: int | None = None) -> spaces.Dict:
+    """Build the gymnasium Dict space matching :func:`build_observation`.
+
+    Parameters
+    ----------
+    topology_dim :
+        When given, adds a ``topology_global`` key of shape
+        ``(topology_dim,)`` — the cell-level conditioning vector
+        produced by :class:`TopologyEncoder`. ``None`` keeps the
+        Phase 1–3 obs schema (no topology key).
+    """
+    components = {
         "poly_feats":   spaces.Box(low=-np.inf, high=np.inf,
                                    shape=(poly_cap, POLY_FEAT_DIM),
                                    dtype=np.float32),
@@ -103,7 +117,13 @@ def make_observation_space(*,
                                    shape=(viol_cap,), dtype=np.float32),
         "global_feats": spaces.Box(low=-np.inf, high=np.inf,
                                    shape=(N_GLOBAL,), dtype=np.float32),
-    })
+    }
+    if topology_dim is not None:
+        components["topology_global"] = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(topology_dim,), dtype=np.float32,
+        )
+    return spaces.Dict(components)
 
 
 # ── Builder ──────────────────────────────────────────────────────────────────
@@ -116,6 +136,7 @@ def build_observation(
     viol_cap:    int = DEFAULT_VIOL_CAP,
     cell_bbox:   tuple[float, float, float, float] | None = None,
     step_progress: float = 0.0,
+    topology_global: np.ndarray | None = None,
 ) -> Observation:
     """Build a padded observation from the current env state."""
     rects = [
@@ -167,6 +188,10 @@ def build_observation(
     global_feats[2] = (sum_value_norm / n_viol_active) if n_viol_active else 0.0
     global_feats[3] = float(np.clip(step_progress, 0.0, 1.0))
 
+    topology_arr: np.ndarray | None = None
+    if topology_global is not None:
+        topology_arr = np.asarray(topology_global, dtype=np.float32).reshape(-1)
+
     return Observation(
         poly_feats=poly_feats,
         poly_mask=poly_mask,
@@ -174,6 +199,7 @@ def build_observation(
         viol_mask=viol_mask,
         global_feats=global_feats,
         rid_to_idx=rid_to_idx,
+        topology_global=topology_arr,
     )
 
 

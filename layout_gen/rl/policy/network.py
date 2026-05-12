@@ -72,6 +72,13 @@ class LayoutPolicyConfig:
     dim_ff:      int = 128
     dropout:     float = 0.0
 
+    # ── Topology conditioning (Phase 4) ────────────────────────────────
+    # When True, forward() expects ``obs["topology_global"]`` (B, topology_dim)
+    # — a fixed-per-episode embedding of the cell's netlist graph.
+    # Default False keeps Phase 1–3 BC checkpoints loadable as-is.
+    use_topology:  bool = False
+    topology_dim:  int  = 64
+
     # Loss weights for BC. Keyed by action dim name; defaults are
     # equal-weight on the dims that always matter (kind, target) and
     # half-weight on conditional dims (edge / sign / mag).
@@ -135,6 +142,12 @@ class LayoutPolicy(nn.Module):
         self.global_in = nn.Linear(N_GLOBAL, d // 4 if d >= 4 else 1)
 
         trunk_in = d + d + (d // 4 if d >= 4 else 1)
+        if self.cfg.use_topology:
+            # Project the cell-global topology embedding into the trunk.
+            # Kept as a separate Linear so the topology weights only exist
+            # when the flag is on — old BC checkpoints stay compatible.
+            self.topology_in = nn.Linear(self.cfg.topology_dim, d)
+            trunk_in += d
         self.trunk = nn.Sequential(
             nn.Linear(trunk_in, self.cfg.d_trunk),
             nn.GELU(),
@@ -186,7 +199,18 @@ class LayoutPolicy(nn.Module):
         viol_pool = _masked_mean(viol_emb, viol_mask)
         glob      = self.global_in(global_feats)
 
-        ctx = self.trunk(torch.cat([poly_pool, viol_pool, glob], dim=-1))
+        parts = [poly_pool, viol_pool, glob]
+        if self.cfg.use_topology:
+            topo = obs.get("topology_global")
+            if topo is None:
+                # Falling back to zeros lets a topology-aware policy run on
+                # an obs that doesn't carry topology yet (e.g. early bring-up
+                # before the env wires it in). The model still processes a
+                # well-formed input; predictions just won't be topology-aware.
+                topo = poly_pool.new_zeros(poly_pool.shape[0], self.cfg.topology_dim)
+            parts.append(self.topology_in(topo))
+
+        ctx = self.trunk(torch.cat(parts, dim=-1))
         return ctx, poly_emb, poly_pad
 
     def heads(

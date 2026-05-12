@@ -94,6 +94,7 @@ class LayoutEnv(gym.Env):
         reward_config: RewardConfig | None = None,
         default_state_factory: Callable[[], LayoutState] | None = None,
         default_cell_bbox: tuple[float, float, float, float] | None = None,
+        topology_global: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self._drc = drc
@@ -105,11 +106,24 @@ class LayoutEnv(gym.Env):
         self._default_state_factory = default_state_factory
         self._default_cell_bbox     = default_cell_bbox
 
+        # Cached cell-level conditioning vector (precomputed by callers
+        # via TopologyEncoder; constant across the episode because the
+        # cell topology doesn't change). Stored as float32 ndarray.
+        self._topology_global: np.ndarray | None = None
+        topology_dim_for_space: int | None = None
+        if topology_global is not None:
+            self._topology_global = np.asarray(
+                topology_global, dtype=np.float32,
+            ).reshape(-1)
+            topology_dim_for_space = int(self._topology_global.shape[0])
+
         self._action_helper = ActionSpace(target_cap=self.target_cap,
                                           mag_bins=mag_bins)
         self.action_space      = self._action_helper.gym_space
-        self.observation_space = make_observation_space(poly_cap=poly_cap,
-                                                         viol_cap=viol_cap)
+        self.observation_space = make_observation_space(
+            poly_cap=poly_cap, viol_cap=viol_cap,
+            topology_dim=topology_dim_for_space,
+        )
 
         # Mutable per-episode state
         self._state:        LayoutState | None = None
@@ -232,6 +246,7 @@ class LayoutEnv(gym.Env):
             viol_cap=self.viol_cap,
             cell_bbox=self._cell_bbox,
             step_progress=progress,
+            topology_global=self._topology_global,
         )
         self._last_obs     = obs_struct.to_dict()
         self._last_rid_map = obs_struct.rid_to_idx
