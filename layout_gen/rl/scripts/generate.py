@@ -186,6 +186,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--real-drc", action="store_true",
                    help="Use a real klayout/magic DRC runner instead of "
                         "the no-op stub.")
+    p.add_argument("--deterministic", choices=("auto", "yes", "no"),
+                   default="auto",
+                   help="Sampling mode for the policy. 'auto' = "
+                        "deterministic when a --checkpoint is loaded, "
+                        "stochastic otherwise (an untrained policy with "
+                        "deterministic argmax tends to stack every device "
+                        "at the same bin, producing visually-overlapping "
+                        "geometry).")
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed",   type=int, default=0)
     p.add_argument("--quiet",  action="store_true")
@@ -291,8 +299,15 @@ def main(argv: list[str] | None = None) -> int:
             print("[policy] using fresh untrained policy "
                   "(pass --checkpoint to load weights)")
 
+    if args.deterministic == "yes":
+        det = True
+    elif args.deterministic == "no":
+        det = False
+    else:  # "auto"
+        det = args.checkpoint is not None
+
     final_state = rollout(env, policy,
-                           deterministic=True,
+                           deterministic=det,
                            max_total_steps=args.max_steps,
                            verbose=not args.quiet)
 
