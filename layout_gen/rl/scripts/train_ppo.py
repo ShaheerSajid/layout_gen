@@ -279,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     if graph is not None:
         print(f"[topology] cell={args.topology} devices={graph.n_devices} "
               f"nets={graph.n_nets}  enable_place={args.enable_place} "
-              f"enable_route={args.enable_route}  real_drc={args.real_drc}")
+              f"enable_route={args.enable_route}  drc={'fake' if args.no_drc else 'real'}")
 
     trainer = PPOTrainer(
         env_factory=env_factory,

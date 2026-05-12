@@ -4,3 +4,5 @@ __pycache__/
 layout_gen/repair/data/
 .venv
 checkpoints/
+demos/
+out/
