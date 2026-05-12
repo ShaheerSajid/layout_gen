@@ -1,30 +1,38 @@
 """
-layout_gen.rl.env.layout_env — gymnasium.Env wrapping layout repair.
+layout_gen.rl.env.layout_env — gymnasium.Env wrapping layout repair + place.
 
 Phase 1 implements the **repair** episode: reset to a (broken) layout,
-let the policy issue per-step edits, terminate when DRC-clean or when
-``max_steps`` is exhausted. Place / route episodes (Phase 4) are
-gated by an episode mode flag and re-use the same observation /
-reward plumbing.
+let the policy issue per-step edits, terminate when DRC-clean.
 
-Episode lifecycle
------------------
-1. ``reset(options={"state": LayoutState, "cell_bbox": (x0,y0,x1,y1)})``
-   – the env accepts a ready-made state. A factory callable is also
-   accepted via ``options["state_factory"]`` for vectorised training
-   where each env instance perturbs a fresh seed every episode.
-2. ``step(action)`` – decode the MultiDiscrete action, apply the
-   :class:`PerturbAction` (or no-op if masked out), re-run cached DRC,
-   compute the reward.
-3. Termination – ``terminated=True`` on DRC-clean. ``truncated=True``
-   when ``max_steps`` reached.
+Phase 4 part 2 adds the **place** episode: reset to an *empty* layout
+plus a topology graph, let the policy place each device once, then
+transition into REPAIR until DRC-clean.
+
+Episode lifecycle (REPAIR-only)
+-------------------------------
+1. ``reset(options={"state": LayoutState, ...})`` — env loads a
+   ready-made (typically broken) layout.
+2. ``step(action)`` decodes the action, applies the perturb primitive,
+   re-runs DRC, computes reward.
+3. ``terminated=True`` on DRC-clean; ``truncated=True`` on max_steps.
+
+Episode lifecycle (PLACE → REPAIR)
+----------------------------------
+1. ``reset()`` starts with an empty :class:`LayoutState` and the env's
+   bound :class:`TopologyGraph`. Phase = ``"place"``.
+2. Each ``step`` consumes a PLACE action; the env materialises the
+   chosen device via :func:`place_device` and marks that device done.
+3. When all devices have been placed (or PLACE phase truncated by a
+   ``max_place_steps`` budget), the env transitions to phase
+   ``"repair"`` and the policy plays repair primitives.
+4. ``terminated=True`` on DRC-clean post-repair.
 
 Action masking
 --------------
-``info["action_mask"]`` carries the flat boolean mask consumed by
-sb3-contrib MaskablePPO. Polices that ignore it will still produce
-syntactically valid actions (the env tolerates invalid rids), but they
-pay an ``invalid`` reward penalty.
+``info["action_mask"]`` is the flat boolean mask consumed by
+sb3-contrib MaskablePPO. The mask is **phase-aware**: PLACE-phase masks
+suppress all REPAIR kinds (and vice versa), and the device dim is
+limited to topology-known + not-yet-placed devices.
 """
 from __future__ import annotations
 
@@ -45,10 +53,19 @@ from layout_gen.rl.env.observation  import (
     DEFAULT_POLY_CAP, DEFAULT_VIOL_CAP,
     build_observation, make_observation_space,
 )
+from layout_gen.rl.env.place_action import (
+    TransistorCache, place_device,
+)
 from layout_gen.rl.env.reward       import (
     RewardConfig, RewardBreakdown, compute_reward,
 )
 from layout_gen.rl.env.runner       import CachedDRC, geometry_key
+from layout_gen.rl.topology.parser  import TopologyGraph
+
+from layout_gen.rl.env.action_space import (
+    DEFAULT_CELL_HEIGHT_UM, DEFAULT_CELL_WIDTH_UM,
+    DEFAULT_DEVICE_CAP, DEFAULT_POSITION_BINS,
+)
 
 
 @dataclass
@@ -58,26 +75,32 @@ class EpisodeConfig:
     state_factory: Callable[[], LayoutState] | None = None
     cell_bbox:     tuple[float, float, float, float] | None = None
     forbid_kinds:  frozenset[str] = frozenset()
+    start_phase:   str | None = None    # override env's default start phase
 
 
 class LayoutEnv(gym.Env):
-    """Gymnasium env for DRC-repair RL.
+    """Gymnasium env for DRC-repair (and, optionally, place) RL.
 
     Parameters
     ----------
     drc :
-        :class:`CachedDRC` (or any object with ``run(state) -> list[DRCViolation]``).
-    poly_cap, viol_cap :
-        Padding caps for polygons and violations.
-    target_cap :
-        Action-space target dim. Defaults to ``poly_cap`` so every
-        addressable polygon has an action slot.
-    mag_bins :
-        Magnitude bin count for the action space.
-    max_steps :
-        Truncation budget. Zero or negative = unbounded.
-    reward_config :
-        Reward weights.
+        :class:`CachedDRC` (or any object with
+        ``run(state) -> list[DRCViolation]``).
+    enable_place :
+        Turn on the PLACE action vocabulary. Required when the policy
+        will issue ``place_device`` actions. Default False keeps the
+        Phase 1–3 action space.
+    topology_graph :
+        Required when ``enable_place=True`` — provides the device list
+        the policy is choosing from.
+    transistor_cache :
+        Required when ``enable_place=True`` — caches the rect templates
+        produced by :func:`layout_gen.transistor.draw_transistor`.
+    cell_width_um, cell_height_um :
+        Cell bbox used to map PLACE x/y bins to µm coordinates.
+    max_place_steps :
+        PLACE-phase truncation budget. ``0`` = no separate budget; the
+        phase still ends when every device has been placed.
     """
 
     metadata = {"render_modes": []}
@@ -95,6 +118,17 @@ class LayoutEnv(gym.Env):
         default_state_factory: Callable[[], LayoutState] | None = None,
         default_cell_bbox: tuple[float, float, float, float] | None = None,
         topology_global: np.ndarray | None = None,
+        # ── PLACE-phase additions ──────────────────────────────────────
+        enable_place:     bool = False,
+        topology_graph:   TopologyGraph | None = None,
+        transistor_cache: TransistorCache | None = None,
+        device_cap:       int   = DEFAULT_DEVICE_CAP,
+        x_bins:           int   = DEFAULT_POSITION_BINS,
+        y_bins:           int   = DEFAULT_POSITION_BINS,
+        cell_width_um:    float = DEFAULT_CELL_WIDTH_UM,
+        cell_height_um:   float = DEFAULT_CELL_HEIGHT_UM,
+        max_place_steps:  int   = 0,
+        start_phase:      str   = "auto",
     ) -> None:
         super().__init__()
         self._drc = drc
@@ -106,9 +140,7 @@ class LayoutEnv(gym.Env):
         self._default_state_factory = default_state_factory
         self._default_cell_bbox     = default_cell_bbox
 
-        # Cached cell-level conditioning vector (precomputed by callers
-        # via TopologyEncoder; constant across the episode because the
-        # cell topology doesn't change). Stored as float32 ndarray.
+        # ── Topology conditioning ─────────────────────────────────────
         self._topology_global: np.ndarray | None = None
         topology_dim_for_space: int | None = None
         if topology_global is not None:
@@ -117,22 +149,65 @@ class LayoutEnv(gym.Env):
             ).reshape(-1)
             topology_dim_for_space = int(self._topology_global.shape[0])
 
-        self._action_helper = ActionSpace(target_cap=self.target_cap,
-                                          mag_bins=mag_bins)
+        # ── PLACE phase wiring ────────────────────────────────────────
+        self.enable_place    = enable_place
+        self._topology_graph = topology_graph
+        self._tx_cache       = transistor_cache
+        self.device_cap      = device_cap
+        self.x_bins          = x_bins
+        self.y_bins          = y_bins
+        self.cell_width_um   = cell_width_um
+        self.cell_height_um  = cell_height_um
+        self.max_place_steps = max_place_steps
+
+        if enable_place:
+            if topology_graph is None or transistor_cache is None:
+                raise ValueError(
+                    "enable_place=True requires both topology_graph and "
+                    "transistor_cache."
+                )
+            if topology_graph.n_devices > device_cap:
+                raise ValueError(
+                    f"topology has {topology_graph.n_devices} devices but "
+                    f"device_cap is {device_cap}."
+                )
+
+        if start_phase not in ("auto", "place", "repair"):
+            raise ValueError(f"start_phase must be auto/place/repair, got {start_phase!r}")
+        if start_phase == "auto":
+            start_phase = "place" if enable_place else "repair"
+        if start_phase == "place" and not enable_place:
+            raise ValueError("start_phase='place' requires enable_place=True.")
+        self._default_start_phase = start_phase
+
+        # ── Action / observation spaces ───────────────────────────────
+        self._action_helper = ActionSpace(
+            target_cap=self.target_cap,
+            mag_bins=mag_bins,
+            enable_place=enable_place,
+            device_cap=device_cap,
+            x_bins=x_bins,
+            y_bins=y_bins,
+            cell_width_um=cell_width_um,
+            cell_height_um=cell_height_um,
+        )
         self.action_space      = self._action_helper.gym_space
         self.observation_space = make_observation_space(
             poly_cap=poly_cap, viol_cap=viol_cap,
             topology_dim=topology_dim_for_space,
         )
 
-        # Mutable per-episode state
+        # ── Mutable per-episode state ─────────────────────────────────
         self._state:        LayoutState | None = None
         self._cell_bbox:    tuple[float, float, float, float] | None = None
         self._violations:   list = []
         self._step_count:   int  = 0
+        self._place_step_count: int = 0
         self._last_obs:     dict | None = None
         self._last_rid_map: dict[int, int] = {}
         self._forbid_kinds: frozenset[str] = frozenset()
+        self._phase: str = self._default_start_phase
+        self._placed_mask: np.ndarray = np.zeros(device_cap, dtype=bool)
 
     # ── Gymnasium API ────────────────────────────────────────────────────────
 
@@ -144,7 +219,18 @@ class LayoutEnv(gym.Env):
         super().reset(seed=seed)
 
         cfg = self._coerce_options(options)
-        if cfg.state is not None:
+        start_phase = cfg.start_phase or self._default_start_phase
+        if start_phase == "place" and not self.enable_place:
+            raise ValueError("Cannot start in PLACE phase: enable_place=False.")
+        self._phase = start_phase
+        self._placed_mask = np.zeros(self.device_cap, dtype=bool)
+        self._place_step_count = 0
+
+        if self._phase == "place":
+            # PLACE episodes start with an empty layout. Devices land
+            # one-by-one as the policy issues PLACE actions.
+            self._state = LayoutState()
+        elif cfg.state is not None:
             self._state = deepcopy(cfg.state)
         elif cfg.state_factory is not None:
             self._state = cfg.state_factory()
@@ -152,8 +238,9 @@ class LayoutEnv(gym.Env):
             self._state = self._default_state_factory()
         else:
             raise ValueError(
-                "LayoutEnv.reset requires options['state'], options['state_factory'], "
-                "or default_state_factory passed to __init__."
+                "LayoutEnv.reset (REPAIR phase) requires options['state'], "
+                "options['state_factory'], or default_state_factory passed "
+                "to __init__."
             )
 
         self._cell_bbox    = cfg.cell_bbox or self._default_cell_bbox
@@ -173,25 +260,34 @@ class LayoutEnv(gym.Env):
         self._step_count += 1
         before = self._violations
 
-        # Decode + apply
         env_action = self._action_helper.decode(action, self._last_rid_map)
-        perturb_action = self._action_helper.to_perturb(env_action)
 
-        action_valid = perturb_action is not None
+        action_valid = False
         state_changed = False
         before_key = geometry_key(self._state)
-        if action_valid:
-            try:
-                perturb_lib.apply(self._state, perturb_action)
-            except Exception:
-                # Malformed apply (e.g. invalid rid in a stale rid_map) —
-                # treat as invalid action. State is unchanged because
-                # apply mutates only on success of its dispatch lookups.
-                action_valid = False
-            else:
-                state_changed = geometry_key(self._state) != before_key
 
-        # Re-run DRC
+        if env_action.is_place and self._phase == "place":
+            action_valid = self._apply_place(env_action)
+            self._place_step_count += 1
+            if action_valid:
+                state_changed = geometry_key(self._state) != before_key
+        elif (not env_action.is_place) and self._phase == "repair":
+            perturb_action = self._action_helper.to_perturb(env_action)
+            action_valid = perturb_action is not None
+            if action_valid:
+                try:
+                    perturb_lib.apply(self._state, perturb_action)
+                except Exception:
+                    action_valid = False
+                else:
+                    state_changed = geometry_key(self._state) != before_key
+        # else: action kind doesn't match current phase → action_valid
+        # stays False, state unchanged. Reward will apply the invalid
+        # penalty.
+
+        # Re-run DRC. PLACE-phase DRC matters too: placing a device may
+        # introduce immediate violations (e.g. overlapping with prior
+        # placements), and the reward signal should pick that up.
         after = list(self._drc.run(self._state))
         self._violations = after
 
@@ -203,16 +299,70 @@ class LayoutEnv(gym.Env):
             config=self.reward_cfg,
         )
 
-        terminated = (len(after) == 0 and len(before) > 0)
-        truncated  = (self.max_steps > 0 and self._step_count >= self.max_steps)
+        # Phase transition: PLACE → REPAIR when every device is placed
+        # OR the per-phase step budget is exhausted.
+        phase_transitioned = False
+        if self._phase == "place":
+            if self._all_devices_placed() or (
+                self.max_place_steps > 0
+                and self._place_step_count >= self.max_place_steps
+            ):
+                self._phase = "repair"
+                phase_transitioned = True
+
+        # Termination: DRC-clean only counts once we're past PLACE phase
+        # (otherwise empty / partial layouts trivially satisfy DRC).
+        terminated = (
+            self._phase == "repair"
+            and len(after) == 0
+            and len(before) > 0
+        )
+        truncated = (self.max_steps > 0 and self._step_count >= self.max_steps)
 
         obs, info = self._build_step_output(
             reward_breakdown=rb,
             env_action=env_action,
             action_valid=action_valid,
             state_changed=state_changed,
+            phase_transitioned=phase_transitioned,
         )
         return obs, rb.total, terminated, truncated, info
+
+    # ── PLACE helpers ────────────────────────────────────────────────────────
+
+    def _apply_place(self, env_action: EnvAction) -> bool:
+        """Materialise the chosen device. Returns True iff valid."""
+        if self._topology_graph is None or self._tx_cache is None:
+            return False
+        d_idx = env_action.device_idx
+        if d_idx < 0 or d_idx >= self._topology_graph.n_devices:
+            return False
+        if d_idx >= self.device_cap or self._placed_mask[d_idx]:
+            return False
+
+        device = self._topology_graph.devices[d_idx]
+        # Sizing fallback: a device with zero w/l shouldn't be sent to
+        # draw_transistor — treat as invalid so the reward penalises it.
+        if device.w_um <= 0 or device.l_um <= 0:
+            return False
+        try:
+            place_device(
+                self._state, device,
+                x_um=env_action.x_um,
+                y_um=env_action.y_um,
+                orientation=env_action.orientation,
+                cache=self._tx_cache,
+            )
+        except Exception:
+            return False
+        self._placed_mask[d_idx] = True
+        return True
+
+    def _all_devices_placed(self) -> bool:
+        if self._topology_graph is None:
+            return True
+        n = self._topology_graph.n_devices
+        return bool(self._placed_mask[:n].all())
 
     # ── Internals ────────────────────────────────────────────────────────────
 
@@ -228,6 +378,7 @@ class LayoutEnv(gym.Env):
             state_factory=options.get("state_factory"),
             cell_bbox=options.get("cell_bbox"),
             forbid_kinds=frozenset(options.get("forbid_kinds", frozenset())),
+            start_phase=options.get("start_phase"),
         )
 
     def _build_step_output(
@@ -237,6 +388,7 @@ class LayoutEnv(gym.Env):
         env_action:       EnvAction | None = None,
         action_valid:     bool = True,
         state_changed:    bool = False,
+        phase_transitioned: bool = False,
     ) -> tuple[dict, dict]:
         progress = (self._step_count / self.max_steps
                     if self.max_steps > 0 else 0.0)
@@ -251,20 +403,19 @@ class LayoutEnv(gym.Env):
         self._last_obs     = obs_struct.to_dict()
         self._last_rid_map = obs_struct.rid_to_idx
 
-        mask = action_mask_for(
-            self._state, self._last_rid_map,
-            target_cap=self.target_cap,
-            mag_bins=self._action_helper.mag_bins,
-            forbid_kinds=self._forbid_kinds,
-        )
+        mask = self._compute_action_mask()
 
         info: dict[str, Any] = {
-            "n_violations":   len(self._violations),
-            "n_polygons":     len(self._state),
-            "step":           self._step_count,
-            "action_mask":    mask,
-            "drc_cache_stats": self._drc.stats(),
+            "n_violations":     len(self._violations),
+            "n_polygons":       len(self._state),
+            "step":             self._step_count,
+            "phase":            self._phase,
+            "n_devices_placed": int(self._placed_mask.sum()),
+            "action_mask":      mask,
+            "drc_cache_stats":  self._drc.stats(),
         }
+        if phase_transitioned:
+            info["phase_transitioned"] = True
         if reward_breakdown is not None:
             info["reward"] = reward_breakdown.to_dict()
         if env_action is not None:
@@ -272,9 +423,32 @@ class LayoutEnv(gym.Env):
                 "kind": env_action.kind, "rid": env_action.rid,
                 "edge": env_action.edge, "sign_x": env_action.sign_x,
                 "sign_y": env_action.sign_y, "mag": env_action.mag,
+                "device_idx": env_action.device_idx,
+                "x_um":       env_action.x_um,
+                "y_um":       env_action.y_um,
+                "orientation": env_action.orientation,
                 "valid": action_valid, "state_changed": state_changed,
             }
         return self._last_obs, info
+
+    def _compute_action_mask(self) -> np.ndarray:
+        n_devices = (
+            self._topology_graph.n_devices
+            if self._topology_graph is not None else 0
+        )
+        return action_mask_for(
+            self._state, self._last_rid_map,
+            target_cap=self.target_cap,
+            mag_bins=self._action_helper.mag_bins,
+            forbid_kinds=self._forbid_kinds,
+            enable_place=self.enable_place,
+            phase=self._phase,
+            device_cap=self.device_cap,
+            n_devices=n_devices,
+            placed_mask=self._placed_mask,
+            x_bins=self.x_bins,
+            y_bins=self.y_bins,
+        )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -286,15 +460,14 @@ class LayoutEnv(gym.Env):
     def violations(self):
         return self._violations
 
+    @property
+    def phase(self) -> str:
+        return self._phase
+
     def action_mask(self) -> np.ndarray:
         """sb3-contrib MaskablePPO calls a method named ``action_masks()``;
         we expose both names for convenience."""
-        return action_mask_for(
-            self._state, self._last_rid_map,
-            target_cap=self.target_cap,
-            mag_bins=self._action_helper.mag_bins,
-            forbid_kinds=self._forbid_kinds,
-        )
+        return self._compute_action_mask()
 
     # MaskablePPO standard hook
     def action_masks(self) -> np.ndarray:  # noqa: D401

@@ -49,8 +49,11 @@ import torch.nn.functional as F
 
 from layout_gen.repair.features import POLY_FEAT_DIM
 from layout_gen.rl.env.action_space import (
-    DEFAULT_MAG_BINS, DEFAULT_TARGET_CAP, N_EDGES, N_KINDS,
+    DEFAULT_DEVICE_CAP, DEFAULT_MAG_BINS, DEFAULT_POSITION_BINS,
+    DEFAULT_TARGET_CAP,
+    N_EDGES, N_PLACE_KINDS, N_REPAIR_KINDS,
 )
+from layout_gen.rl.env.place_action import N_ORIENTATIONS
 from layout_gen.rl.env.observation import (
     DEFAULT_POLY_CAP, DEFAULT_VIOL_CAP, N_GLOBAL, V_FEAT_DIM,
 )
@@ -72,12 +75,22 @@ class LayoutPolicyConfig:
     dim_ff:      int = 128
     dropout:     float = 0.0
 
-    # ── Topology conditioning (Phase 4) ────────────────────────────────
+    # ── Topology conditioning (Phase 4 part 1) ─────────────────────────
     # When True, forward() expects ``obs["topology_global"]`` (B, topology_dim)
     # — a fixed-per-episode embedding of the cell's netlist graph.
     # Default False keeps Phase 1–3 BC checkpoints loadable as-is.
     use_topology:  bool = False
     topology_dim:  int  = 64
+
+    # ── PLACE action heads (Phase 4 part 2) ────────────────────────────
+    # When True, the policy emits four additional heads
+    # (device / x_bin / y_bin / orient) and the kind head's output
+    # grows by N_PLACE_KINDS. Default False keeps Phase 1–3 + Phase 4
+    # part 1 checkpoints loadable as-is.
+    enable_place:  bool = False
+    device_cap:    int  = DEFAULT_DEVICE_CAP
+    x_bins:        int  = DEFAULT_POSITION_BINS
+    y_bins:        int  = DEFAULT_POSITION_BINS
 
     # Loss weights for BC. Keyed by action dim name; defaults are
     # equal-weight on the dims that always matter (kind, target) and
@@ -89,18 +102,33 @@ class LayoutPolicyConfig:
         "sign_x": 0.5,
         "sign_y": 0.5,
         "mag":    0.5,
+        "device": 1.0,
+        "x_bin":  0.5,
+        "y_bin":  0.5,
+        "orient": 0.5,
     })
 
 
 # ── Logits container ─────────────────────────────────────────────────────────
 
 class ActionLogits(NamedTuple):
-    kind:   torch.Tensor   # (B, N_KINDS)
+    """Per-dim logits.
+
+    ``device``, ``x_bin``, ``y_bin``, ``orient`` are populated only when
+    the policy was built with ``enable_place=True``. Otherwise they hold
+    zero-element placeholders (so the NamedTuple shape stays stable
+    across configs but contributes nothing to a flat-concat).
+    """
+    kind:   torch.Tensor   # (B, n_kinds_total)
     target: torch.Tensor   # (B, target_cap)
     edge:   torch.Tensor   # (B, N_EDGES)
     sign_x: torch.Tensor   # (B, 2)
     sign_y: torch.Tensor   # (B, 2)
     mag:    torch.Tensor   # (B, mag_bins)
+    device: torch.Tensor   # (B, device_cap) or (B, 0) when PLACE disabled
+    x_bin:  torch.Tensor   # (B, x_bins)     or (B, 0)
+    y_bin:  torch.Tensor   # (B, y_bins)     or (B, 0)
+    orient: torch.Tensor   # (B, N_ORIENTATIONS) or (B, 0)
 
 
 # ── Module ───────────────────────────────────────────────────────────────────
@@ -158,11 +186,20 @@ class LayoutPolicy(nn.Module):
         self.target_query = nn.Linear(self.cfg.d_trunk, d)
 
         # Plain heads
-        self.kind_head   = nn.Linear(self.cfg.d_trunk, N_KINDS)
+        kind_out_dim = N_REPAIR_KINDS + (N_PLACE_KINDS if self.cfg.enable_place else 0)
+        self.kind_head   = nn.Linear(self.cfg.d_trunk, kind_out_dim)
         self.edge_head   = nn.Linear(self.cfg.d_trunk, N_EDGES)
         self.signx_head  = nn.Linear(self.cfg.d_trunk, 2)
         self.signy_head  = nn.Linear(self.cfg.d_trunk, 2)
         self.mag_head    = nn.Linear(self.cfg.d_trunk, self.cfg.mag_bins)
+
+        # PLACE heads — only instantiated when enabled, so Phase 1–3
+        # checkpoints stay shape-compatible.
+        if self.cfg.enable_place:
+            self.device_head = nn.Linear(self.cfg.d_trunk, self.cfg.device_cap)
+            self.x_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.x_bins)
+            self.y_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.y_bins)
+            self.orient_head = nn.Linear(self.cfg.d_trunk, N_ORIENTATIONS)
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
@@ -224,6 +261,18 @@ class LayoutPolicy(nn.Module):
         target_logits = target_logits.masked_fill(poly_pad, float("-inf"))
         target_logits = _resize_logits(target_logits, self.cfg.target_cap)
 
+        if self.cfg.enable_place:
+            device_logits = self.device_head(ctx)
+            x_bin_logits  = self.x_bin_head(ctx)
+            y_bin_logits  = self.y_bin_head(ctx)
+            orient_logits = self.orient_head(ctx)
+        else:
+            empty = ctx.new_zeros((ctx.shape[0], 0))
+            device_logits = empty
+            x_bin_logits  = empty
+            y_bin_logits  = empty
+            orient_logits = empty
+
         return ActionLogits(
             kind   = self.kind_head(ctx),
             target = target_logits,
@@ -231,6 +280,10 @@ class LayoutPolicy(nn.Module):
             sign_x = self.signx_head(ctx),
             sign_y = self.signy_head(ctx),
             mag    = self.mag_head(ctx),
+            device = device_logits,
+            x_bin  = x_bin_logits,
+            y_bin  = y_bin_logits,
+            orient = orient_logits,
         )
 
     def forward(self, obs: dict[str, torch.Tensor]) -> ActionLogits:

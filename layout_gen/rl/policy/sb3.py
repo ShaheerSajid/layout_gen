@@ -93,10 +93,16 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _flatten_logits(self, logits: ActionLogits) -> torch.Tensor:
-        """Concat per-dim logits in MultiDiscrete order → (B, sum(nvec))."""
+        """Concat per-dim logits in MultiDiscrete order → (B, sum(nvec)).
+
+        PLACE-only heads (device / x_bin / y_bin / orient) carry zero-width
+        tensors when ``enable_place=False``, so the concat order is stable
+        regardless of config.
+        """
         return torch.cat([
             logits.kind, logits.target, logits.edge,
             logits.sign_x, logits.sign_y, logits.mag,
+            logits.device, logits.x_bin, logits.y_bin, logits.orient,
         ], dim=-1)
 
     def _logits_and_value(
