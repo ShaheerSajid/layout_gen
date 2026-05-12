@@ -14,6 +14,11 @@ from __future__ import annotations
 from layout_gen.rl.training.dataset import (
     TrajectoryDataset, TrajectorySample, encode_action_dict,
 )
+from layout_gen.rl.training.demo_dataset  import PlacementDemoDataset
+from layout_gen.rl.training.demo_extract  import (
+    PlacementDemo, extract_placement_demo, extract_many,
+    read_demo, write_demo,
+)
 from layout_gen.rl.training.synthetic import (
     mine_synthetic_trajectories,
 )
@@ -29,4 +34,7 @@ __all__ = [
     "mine_synthetic_trajectories",
     "BCTrainer", "BCTrainerConfig", "BCMetrics",
     "PPOTrainer", "PPOConfig", "make_masked_env",
+    "PlacementDemo", "PlacementDemoDataset",
+    "extract_placement_demo", "extract_many",
+    "read_demo", "write_demo",
 ]
