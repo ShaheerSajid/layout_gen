@@ -73,6 +73,14 @@ class RewardConfig:
     # already-routed net should count too).
     connectivity_delta: float = 2.0
 
+    # ── Electrical (transitive) connectivity ──────────────────────────
+    # Multiplier on Δ(net-completion count from union-find over wires
+    # + terminals). Strictly stricter than connectivity_delta — only
+    # rewards nets where ALL terminals end up in a single connected
+    # component. Use both: connectivity gives the dense gradient,
+    # electrical rewards finishing the job.
+    electrical_delta: float = 3.0
+
     # ── Placement-intent alignment ────────────────────────────────────
     # Multiplier on Δ(sum-of-clipped-linears against the YAML's
     # placement_logic directives). Pulls PLACE actions toward gate-
@@ -107,13 +115,15 @@ class RewardBreakdown:
     route_success:      float = 0.0
     connectivity_delta: float = 0.0
     alignment_delta:    float = 0.0
+    electrical_delta:   float = 0.0
 
     @property
     def total(self) -> float:
         return (self.drc_delta + self.value_delta + self.step
                 + self.terminal + self.invalid + self.no_change
                 + self.place_success + self.route_success
-                + self.connectivity_delta + self.alignment_delta)
+                + self.connectivity_delta + self.alignment_delta
+                + self.electrical_delta)
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -127,6 +137,7 @@ class RewardBreakdown:
             "route_success":      self.route_success,
             "connectivity_delta": self.connectivity_delta,
             "alignment_delta":    self.alignment_delta,
+            "electrical_delta":   self.electrical_delta,
             "total":              self.total,
         }
 
@@ -151,6 +162,8 @@ def compute_reward(
     connectivity_after:   float = 0.0,
     alignment_before:     float = 0.0,
     alignment_after:      float = 0.0,
+    electrical_before:    float = 0.0,
+    electrical_after:     float = 0.0,
 ) -> RewardBreakdown:
     """Compute reward from before/after violation lists, action flags,
     and the active episode phase.
@@ -200,6 +213,9 @@ def compute_reward(
     )
     rb.alignment_delta = (
         cfg.alignment_delta * (alignment_after - alignment_before)
+    )
+    rb.electrical_delta = (
+        cfg.electrical_delta * (electrical_after - electrical_before)
     )
 
     if not action_valid:

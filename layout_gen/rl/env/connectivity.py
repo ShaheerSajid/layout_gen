@@ -112,7 +112,117 @@ def compute_connectivity_score(
     return float(score)
 
 
+def _bbox_overlap(a, b, *, tol: float) -> bool:
+    return (a.x0 <= b.x1 + tol and a.x1 + tol >= b.x0 and
+            a.y0 <= b.y1 + tol and a.y1 + tol >= b.y0)
+
+
+# ── Transitive electrical connectivity ──────────────────────────────────────
+
+def compute_electrical_score(
+    state:     LayoutState,
+    topology:  TopologyGraph,
+    terminals: dict[tuple[int, str], tuple[float, float, str]],
+    *,
+    tol_um:    float = DEFAULT_TOUCH_TOL_UM,
+) -> float:
+    """Per-net "all terminals electrically connected" score.
+
+    For each net N:
+      1. Build a union-find over (this net's wire rects) ∪
+         (terminal positions of this net).
+      2. Wire-to-wire union when both wires are on the **same logical
+         layer** AND their bboxes overlap (with tolerance).
+      3. Wire-to-terminal union when the wire's layer matches the
+         terminal's layer AND the wire's bbox contains the terminal
+         point.
+      4. Net contributes 1.0 iff every terminal of the net ends up in
+         a single connected component; 0.0 otherwise.
+
+    Returns
+    -------
+    float :
+        Sum over nets, in ``[0, n_nets]``. Strictly stricter than
+        :func:`compute_connectivity_score` — a net of 5 disjoint
+        terminal-touching wires scores 0 here but ``≥ partial`` there.
+
+    Why this matters
+    ----------------
+    LVS-style connectivity needs *transitive* unions. The per-terminal-
+    touched score rewards a policy for each terminal it grazes; this
+    score only rewards completed nets. Use the two together: the
+    per-terminal score gives a dense gradient toward the right
+    direction, the electrical score rewards finishing the job.
+
+    Cross-layer connectivity (via stacks) is **not** modelled here —
+    a real via primitive would need to enter the action space first.
+    For now the policy is incentivised to use a single layer per net.
+    """
+    # Bucket wires per net + per layer for fast same-layer overlap checks.
+    wires_by_net: dict[str, list] = {}
+    for r in state:
+        if r.shape_type == "wire" and r.net:
+            wires_by_net.setdefault(r.net, []).append(r)
+
+    score = 0.0
+    for net in topology.nets:
+        # Resolve this net's terminals.
+        net_terms: list[tuple[float, float, str]] = []
+        for (d_idx, term_name) in net.connections:
+            pos = terminals.get((d_idx, term_name))
+            if pos is None:
+                continue
+            net_terms.append(pos)
+        if len(net_terms) <= 1:
+            # Singleton-net (or unplaced) nets are trivially "connected".
+            # They do still count toward n_nets so they don't penalise
+            # the overall score for the policy.
+            score += 1.0 if net_terms else 0.0
+            continue
+
+        net_wires = wires_by_net.get(net.name, [])
+
+        # Union-find over [terminals..., wires...].
+        n_t = len(net_terms)
+        n_w = len(net_wires)
+        n_total = n_t + n_w
+        parent = list(range(n_total))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # Same-layer wire-to-wire unions.
+        for i in range(n_w):
+            for j in range(i + 1, n_w):
+                if (net_wires[i].layer == net_wires[j].layer and
+                        _bbox_overlap(net_wires[i], net_wires[j], tol=tol_um)):
+                    union(n_t + i, n_t + j)
+
+        # Wire-to-terminal unions on matching layer + bbox-contains-point.
+        for ti, (tx, ty, tlayer) in enumerate(net_terms):
+            for wi, w in enumerate(net_wires):
+                if w.layer != tlayer:
+                    continue
+                if _touches(w.x0, w.y0, w.x1, w.y1, tx, ty, tol=tol_um):
+                    union(ti, n_t + wi)
+
+        # Net counts when all terminals share a root.
+        roots = {find(i) for i in range(n_t)}
+        if len(roots) == 1:
+            score += 1.0
+    return float(score)
+
+
 __all__ = [
     "DEFAULT_TOUCH_TOL_UM",
     "compute_connectivity_score",
+    "compute_electrical_score",
 ]

@@ -226,5 +226,99 @@ def test_env_score_rises_when_wire_lands_on_terminal(rules, cache):
     )
 
 
+# ── Electrical (transitive) connectivity ────────────────────────────────────
+
+def _two_term_net_at(x1, x2, *, layer="li1") -> tuple:
+    g = _toy_graph()
+    terms = {
+        (0, "D"): (x1, 0.5, layer),
+        (1, "D"): (x2, 0.5, layer),
+    }
+    return g, terms
+
+
+def test_electrical_zero_when_terminals_only_individually_touched():
+    """Two disjoint wires each touching one terminal → connectivity=1.0
+    but electrical=0.0 (no path between them)."""
+    from layout_gen.rl.env.connectivity import compute_electrical_score
+    g, terms = _two_term_net_at(1.0, 3.0)
+    state = LayoutState()
+    add_route_segment(state, layer="li1",
+                       x_um=0.95, y_um=0.45, w_um=0.10, h_um=0.10,
+                       net_name="OUT")
+    add_route_segment(state, layer="li1",
+                       x_um=2.95, y_um=0.45, w_um=0.10, h_um=0.10,
+                       net_name="OUT")
+    conn = compute_connectivity_score(state, g, terms)
+    elec = compute_electrical_score(state, g, terms)
+    assert conn == pytest.approx(1.0)   # both terminals touched
+    assert elec == 0.0                  # but not connected to each other
+
+
+def test_electrical_full_when_one_segment_spans_both_terminals():
+    """A single wire long enough to overlap both terminals connects
+    them. electrical=1.0."""
+    from layout_gen.rl.env.connectivity import compute_electrical_score
+    g, terms = _two_term_net_at(1.0, 3.0)
+    state = LayoutState()
+    add_route_segment(state, layer="li1",
+                       x_um=0.5, y_um=0.45, w_um=3.0, h_um=0.10,
+                       net_name="OUT")
+    elec = compute_electrical_score(state, g, terms)
+    assert elec == pytest.approx(1.0)
+
+
+def test_electrical_chain_of_overlapping_segments():
+    """Three overlapping wires forming a connected chain between two
+    terminals → electrical=1.0."""
+    from layout_gen.rl.env.connectivity import compute_electrical_score
+    g, terms = _two_term_net_at(0.0, 3.0)
+    state = LayoutState()
+    # Three overlapping segments of li1 forming a continuous strip.
+    add_route_segment(state, layer="li1",
+                       x_um=-0.10, y_um=0.45, w_um=1.20, h_um=0.10,
+                       net_name="OUT")
+    add_route_segment(state, layer="li1",
+                       x_um=1.00,  y_um=0.45, w_um=1.20, h_um=0.10,
+                       net_name="OUT")
+    add_route_segment(state, layer="li1",
+                       x_um=2.00,  y_um=0.45, w_um=1.20, h_um=0.10,
+                       net_name="OUT")
+    elec = compute_electrical_score(state, g, terms)
+    assert elec == pytest.approx(1.0)
+
+
+def test_electrical_rejects_cross_layer_unions():
+    """A met1 wire and an li1 wire sharing a bbox don't union (no via
+    primitive). Two terminals on li1 connected only via a non-li1 wire
+    should NOT score."""
+    from layout_gen.rl.env.connectivity import compute_electrical_score
+    g, terms = _two_term_net_at(1.0, 3.0)
+    state = LayoutState()
+    add_route_segment(state, layer="met1",   # wrong layer for li1 terminals
+                       x_um=0.5, y_um=0.45, w_um=3.0, h_um=0.10,
+                       net_name="OUT")
+    elec = compute_electrical_score(state, g, terms)
+    assert elec == 0.0
+
+
+def test_electrical_singleton_net_counts_as_connected():
+    """A net with only one terminal is trivially connected (no other
+    terminals to fail to reach). Scores 1.0 once that one terminal
+    exists, even with zero wires."""
+    from layout_gen.rl.env.connectivity import compute_electrical_score
+    devs = [
+        DeviceNode("N", "nmos", "planar_mosfet", 0.5, 0.15, 0, False),
+    ]
+    nets = [
+        NetEdge(name="VSS", net_type="power", rail="bottom", layer_hint="",
+                connections=[(0, "S")]),
+    ]
+    g = TopologyGraph(cell_name="x", devices=devs, nets=nets)
+    state = LayoutState()
+    terms = {(0, "S"): (0.0, 0.0, "li1")}
+    assert compute_electrical_score(state, g, terms) == pytest.approx(1.0)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
