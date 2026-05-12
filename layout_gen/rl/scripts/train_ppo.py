@@ -1,19 +1,26 @@
 """
 layout_gen.rl.scripts.train_ppo — CLI for the MaskablePPO trainer.
 
-Run from the project root::
+Two modes:
 
-    .venv/bin/python -m layout_gen.rl.scripts.train_ppo \\
-        --bc-init checkpoints/bc.pt \\
-        --total-timesteps 100000 \\
-        --n-envs 4 \\
-        --out checkpoints/ppo.zip
+  * ``--synthetic`` — env uses a fake DRC checker on a tiny seed
+    layout. No klayout required. Good for verifying the training
+    loop runs.
 
-Without ``--bc-init``, PPO trains from scratch (much slower; you almost
-certainly want a BC warm-start).
+  * ``--topology <name>`` — env loads a real cell topology YAML,
+    runs the topology GNN to compute a ``topology_global``
+    conditioning vector, and (with ``--real-drc``) dispatches to
+    klayout/magic for the violation count. Optional
+    ``--enable-place`` / ``--enable-route`` turn on the generative
+    phases; without them the env starts in REPAIR phase from
+    whatever ``--seed-state`` callable you provide (default: empty).
 
-If you don't have klayout/magic available yet, pass ``--synthetic`` to
-use the fake DRC checker — useful for end-to-end smoke testing.
+BC warm-start (``--bc-init``) loads a previously-trained
+:class:`LayoutPolicy` checkpoint into the actor.
+
+Tip: real-DRC training is bottlenecked by klayout invocations. Start
+with small ``--total-timesteps`` and short episodes to validate the
+loop, then scale up.
 """
 from __future__ import annotations
 
@@ -22,12 +29,17 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
+import torch
+
+from layout_gen.pdk import load_pdk
 from layout_gen.synth.geo.state import LayoutState
+from layout_gen.synth.loader import load_template
 
 from layout_gen.rl.env.layout_env import LayoutEnv
+from layout_gen.rl.env.place_action import TransistorCache
 from layout_gen.rl.policy.network import LayoutPolicyConfig
 from layout_gen.rl.training.ppo_train import PPOConfig, PPOTrainer
-from layout_gen.rl.training.synthetic import fake_same_layer_spacing_check
 
 
 # ── Synthetic env factory ────────────────────────────────────────────────────
@@ -76,8 +88,82 @@ def _synth_state_factory(rng: random.Random):
     return _make
 
 
+# ── Real (topology) env factory ──────────────────────────────────────────────
+
+def _build_real_env_factory(args, env_seed: int):
+    """Topology-aware env: parse the YAML, build a TopologyGraph, encode
+    it once, then return a closure that constructs LayoutEnv on demand
+    (one per vec-env worker)."""
+    from layout_gen.rl.topology import (
+        TopologyEncoder, TopologyEncoderConfig, graph_from_template,
+    )
+
+    rules = load_pdk()
+    template = load_template(args.topology)
+    cell_w = float(template.cell_dimensions.width  or 4.0)
+    cell_h = float(template.cell_dimensions.height or 2.0)
+    cell_params = {"_defaults": {"w_N": args.w_n, "w_P": args.w_p, "l": args.l}}
+    graph = graph_from_template(template, cell_params=cell_params)
+
+    enc = TopologyEncoder(TopologyEncoderConfig(
+        d_token=args.topology_dim,
+        n_layers=2,
+        max_devices=max(args.device_cap, graph.n_devices),
+        max_nets=max(graph.n_nets, args.net_cap),
+    )).eval()
+    with torch.no_grad():
+        topo_global = enc.encode_graphs([graph]).global_embedding[0].cpu().numpy()
+    topo_global = topo_global.astype(np.float32)
+
+    if args.real_drc:
+        from layout_gen.drc import get_runner
+        from layout_gen.rl.env.runner import CachedDRC
+        runner = get_runner(rules)
+        if runner is None:
+            raise RuntimeError(
+                "--real-drc was requested but no DRC tool was found "
+                "(install klayout or set KLAYOUT_BIN/MAGIC_BIN)."
+            )
+
+        def _drc_factory():
+            return CachedDRC(runner, rules, cell_name=args.topology)
+    else:
+        def _drc_factory():
+            return _DirectFakeDRC(threshold_um=0.20)
+
+    cache = TransistorCache(rules)
+
+    def _make():
+        return LayoutEnv(
+            drc=_drc_factory(),
+            poly_cap=args.poly_cap,
+            viol_cap=args.viol_cap,
+            target_cap=args.target_cap,
+            mag_bins=args.mag_bins,
+            max_steps=args.max_steps,
+            topology_global=topo_global,
+            enable_place=args.enable_place,
+            topology_graph=(graph
+                             if (args.enable_place or args.enable_route)
+                             else None),
+            transistor_cache=(cache if args.enable_place else None),
+            device_cap=max(args.device_cap, graph.n_devices),
+            x_bins=args.position_bins, y_bins=args.position_bins,
+            cell_width_um=cell_w, cell_height_um=cell_h,
+            max_place_steps=args.max_place_steps,
+            enable_route=args.enable_route,
+            net_cap=max(args.net_cap, graph.n_nets),
+            route_x_bins=args.position_bins,
+            route_y_bins=args.position_bins,
+            route_w_bins=args.route_size_bins,
+            route_h_bins=args.route_size_bins,
+            max_route_steps=args.max_route_steps,
+        )
+    return _make, graph
+
+
 def _build_env_factory(args, env_seed: int):
-    """Construct a LayoutEnv factory matching the CLI's chosen flavor."""
+    """Pick the right factory based on CLI flags."""
     if args.synthetic:
         rng = random.Random(env_seed)
         drc = _DirectFakeDRC(threshold_um=0.20)
@@ -91,19 +177,25 @@ def _build_env_factory(args, env_seed: int):
                 max_steps=args.max_steps,
                 default_state_factory=_synth_state_factory(rng),
             )
-        return _make
+        return _make, None
+    elif args.topology:
+        return _build_real_env_factory(args, env_seed)
     else:
-        raise NotImplementedError(
-            "Real-DRC env factory is wired in Phase 4 — pass --synthetic for now."
-        )
+        raise SystemExit("error: pass --synthetic or --topology <name>")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--synthetic", action="store_true",
-                   help="Use the fake DRC checker (no klayout needed).")
+    mode = p.add_argument_group("mode (pick one)")
+    mode.add_argument("--synthetic", action="store_true",
+                      help="Use the fake DRC checker on a tiny synthetic "
+                           "seed (no klayout, no real cell).")
+    mode.add_argument("--topology", default=None,
+                      help="Cell template name (e.g. 'inverter') for "
+                           "topology-aware training.")
+
     p.add_argument("--bc-init", type=Path, default=None,
                    help="Path to a BC checkpoint to warm-start the actor.")
     p.add_argument("--total-timesteps", type=int, default=20000)
@@ -114,10 +206,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--max-steps", type=int, default=16)
-    p.add_argument("--poly-cap", type=int, default=64)
-    p.add_argument("--viol-cap", type=int, default=16)
-    p.add_argument("--target-cap", type=int, default=64)
-    p.add_argument("--mag-bins", type=int, default=8)
+    p.add_argument("--poly-cap",   type=int, default=128)
+    p.add_argument("--viol-cap",   type=int, default=32)
+    p.add_argument("--target-cap", type=int, default=128)
+    p.add_argument("--mag-bins",   type=int, default=8)
+
+    # Real / topology mode
+    p.add_argument("--real-drc", action="store_true",
+                   help="Use klayout / magic for DRC (requires --topology).")
+    p.add_argument("--enable-place", action="store_true",
+                   help="Turn on the PLACE phase.")
+    p.add_argument("--enable-route", action="store_true",
+                   help="Turn on the ROUTE phase.")
+    p.add_argument("--topology-dim", type=int, default=64)
+    p.add_argument("--device-cap",   type=int, default=16)
+    p.add_argument("--net-cap",      type=int, default=16)
+    p.add_argument("--position-bins", type=int, default=8)
+    p.add_argument("--route-size-bins", type=int, default=4)
+    p.add_argument("--max-place-steps", type=int, default=4)
+    p.add_argument("--max-route-steps", type=int, default=4)
+    p.add_argument("--w-n", type=float, default=0.5)
+    p.add_argument("--w-p", type=float, default=0.5)
+    p.add_argument("--l",   type=float, default=0.15)
+
     p.add_argument("--out", type=Path, default=Path("checkpoints/ppo.zip"))
     p.add_argument("--tb-log", type=Path, default=None,
                    help="TensorBoard log directory (optional).")
@@ -125,11 +236,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--device", type=str, default="cpu")
     args = p.parse_args(argv)
 
+    if args.real_drc and not args.topology:
+        raise SystemExit("error: --real-drc requires --topology <name>")
+
     layout_cfg = LayoutPolicyConfig(
         poly_cap=args.poly_cap,
         viol_cap=args.viol_cap,
         target_cap=args.target_cap,
         mag_bins=args.mag_bins,
+        use_topology=bool(args.topology),
+        topology_dim=args.topology_dim,
+        enable_place=args.enable_place,
+        enable_route=args.enable_route,
+        device_cap=args.device_cap,
+        x_bins=args.position_bins, y_bins=args.position_bins,
+        net_cap=args.net_cap,
+        route_x_bins=args.position_bins, route_y_bins=args.position_bins,
+        route_w_bins=args.route_size_bins, route_h_bins=args.route_size_bins,
     )
     ppo_cfg = PPOConfig(
         n_envs=args.n_envs,
@@ -143,7 +266,11 @@ def main(argv: list[str] | None = None) -> int:
         verbose=1,
     )
 
-    env_factory = _build_env_factory(args, env_seed=args.seed)
+    env_factory, graph = _build_env_factory(args, env_seed=args.seed)
+    if graph is not None:
+        print(f"[topology] cell={args.topology} devices={graph.n_devices} "
+              f"nets={graph.n_nets}  enable_place={args.enable_place} "
+              f"enable_route={args.enable_route}  real_drc={args.real_drc}")
 
     trainer = PPOTrainer(
         env_factory=env_factory,

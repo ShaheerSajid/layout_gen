@@ -1,72 +1,112 @@
 """
-layout_gen.rl.env.reward — composite reward for the layout RL env.
+layout_gen.rl.env.reward — phase-aware composite reward.
 
-Reward terms (Phase 1; LVS / area / topology added in later phases)
-------------------------------------------------------------------
-* ``r_drc_delta``   : ``+w * (n_before - n_after)``.  Positive for repairs,
-                      negative for newly-introduced violations.
-* ``r_value_delta`` : ``+w * (sum_value_before - sum_value_after)``.
-                      Rewards shrinking the magnitude of remaining
-                      violations even when their count is unchanged
-                      (dense signal that helps gradient flow).
-* ``r_step``        : constant ``-w`` per step — discourages stalling
-                      and encourages compact action sequences.
-* ``r_terminal``    : ``+w`` when the layout reaches DRC-clean. Anchors
-                      the success state.
-* ``r_invalid``     : ``-w`` when the action was a structural no-op
-                      (target rid not present, or apply raised).
-* ``r_no_change``   : ``-w`` when the action ran but the geometry-hash
-                      didn't change (e.g. shrinking an already-tiny rect).
+The reward function has to handle three structurally different episode
+phases:
 
-All weights are configurable via :class:`RewardConfig`. Defaults are
-calibrated so:
-  * one repaired violation comfortably outweighs the per-step penalty;
-  * an introduced violation hurts more than the per-step penalty saves;
-  * value-delta is small relative to count-delta so the policy
-    prioritises clearing violations rather than just shrinking them.
+  * **PLACE** — the policy adds devices to a (growing) layout. Each
+    placement *adds geometry*, which on a real DRC tool tends to add
+    violations (well/tap/spacing rules don't fully resolve until the
+    cell is more complete). Penalising ``Δviolations`` here teaches
+    the policy to never place anything — degenerate. PLACE rewards
+    success-of-action heavily and damps DRC delta.
+  * **ROUTE** — same problem: each segment may introduce small
+    spacing violations. Reward each successful segment; damp DRC.
+  * **REPAIR** — every action either makes DRC strictly better or
+    strictly worse; here ``Δviolations`` is the right signal.
+
+Each phase has its own multiplier on the DRC-related terms, plus a
+phase-specific success bonus. Common terms (step penalty, terminal
+bonus, invalid / no-change penalties) stay shared.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 from layout_gen.drc.base import DRCViolation
 
 
+_PHASES = ("place", "route", "repair")
+
+
 @dataclass
 class RewardConfig:
-    drc_delta:  float = 1.0
-    value_delta: float = 0.05
+    """All weights for :func:`compute_reward`.
+
+    Phase-specific weights live in dicts keyed by phase name
+    (``"place"`` / ``"route"`` / ``"repair"``); missing entries fall
+    back to a sensible default at lookup time.
+    """
+
+    # ── Per-phase DRC delta weight ────────────────────────────────────
+    # REPAIR is the pure-repair task — full weight on Δviolations.
+    # PLACE / ROUTE attenuate so adding geometry doesn't get punished
+    # for re-resolving long-range rules.
+    drc_delta_per_phase: dict[str, float] = field(default_factory=lambda: {
+        "place":  0.05,
+        "route":  0.20,
+        "repair": 1.00,
+    })
+
+    # Per-phase value-delta weight — same idea, just for the sum of
+    # measured-µm deficits across violations.
+    value_delta_per_phase: dict[str, float] = field(default_factory=lambda: {
+        "place":  0.0,
+        "route":  0.05,
+        "repair": 0.05,
+    })
+
+    # ── Phase-specific success bonuses ────────────────────────────────
+    # Awarded when the action was valid AND changed the state. Damp
+    # them as the phase progresses (mostly to discourage no-op spam,
+    # but also because PPO tends to over-emphasise reward sources).
+    place_success: float = 1.0
+    route_success: float = 0.5
+
+    # ── Common terms ──────────────────────────────────────────────────
     step:       float = 0.05
-    terminal:   float = 5.0
+    terminal:   float = 5.0     # only fires in REPAIR phase
     invalid:    float = 0.5
     no_change:  float = 0.2
+
+    # ── Lookup helpers ────────────────────────────────────────────────
+    def drc_delta_weight(self, phase: str) -> float:
+        return float(self.drc_delta_per_phase.get(phase, 1.0))
+
+    def value_delta_weight(self, phase: str) -> float:
+        return float(self.value_delta_per_phase.get(phase, 0.0))
 
 
 @dataclass
 class RewardBreakdown:
     """Per-component reward returned alongside the scalar."""
-    drc_delta:   float = 0.0
-    value_delta: float = 0.0
-    step:        float = 0.0
-    terminal:    float = 0.0
-    invalid:     float = 0.0
-    no_change:   float = 0.0
+    drc_delta:     float = 0.0
+    value_delta:   float = 0.0
+    step:          float = 0.0
+    terminal:      float = 0.0
+    invalid:       float = 0.0
+    no_change:     float = 0.0
+    place_success: float = 0.0
+    route_success: float = 0.0
 
     @property
     def total(self) -> float:
         return (self.drc_delta + self.value_delta + self.step
-                + self.terminal + self.invalid + self.no_change)
+                + self.terminal + self.invalid + self.no_change
+                + self.place_success + self.route_success)
 
     def to_dict(self) -> dict[str, float]:
         return {
-            "drc_delta":   self.drc_delta,
-            "value_delta": self.value_delta,
-            "step":        self.step,
-            "terminal":    self.terminal,
-            "invalid":     self.invalid,
-            "no_change":   self.no_change,
-            "total":       self.total,
+            "drc_delta":     self.drc_delta,
+            "value_delta":   self.value_delta,
+            "step":          self.step,
+            "terminal":      self.terminal,
+            "invalid":       self.invalid,
+            "no_change":     self.no_change,
+            "place_success": self.place_success,
+            "route_success": self.route_success,
+            "total":         self.total,
         }
 
 
@@ -84,39 +124,45 @@ def compute_reward(
     violations_after:  Sequence[DRCViolation],
     state_changed:     bool,
     action_valid:      bool,
+    phase:             str = "repair",
     config:            RewardConfig | None = None,
 ) -> RewardBreakdown:
-    """Compute reward from before/after violation lists and action flags.
+    """Compute reward from before/after violation lists, action flags,
+    and the active episode phase.
 
     Parameters
     ----------
-    violations_before, violations_after :
-        DRC violations before and after applying the action.
-    state_changed :
-        True iff the geometry-hash of the LayoutState changed during the
-        step. False indicates a no-op edit (e.g. shrink past zero clamped
-        to a minimum that produced the same geometry, or apply raised
-        and the env rolled back).
-    action_valid :
-        False when the action was structurally invalid (target rid not
-        present, decoder returned None). True for all well-formed
-        attempts even if they degrade the layout.
+    phase :
+        ``"place"``, ``"route"``, or ``"repair"``. Drives the per-phase
+        DRC weight and which success bonus (if any) fires.
     """
     cfg = config or RewardConfig()
     rb  = RewardBreakdown()
 
     n_before = len(violations_before)
     n_after  = len(violations_after)
-    rb.drc_delta = cfg.drc_delta * (n_before - n_after)
+    rb.drc_delta = cfg.drc_delta_weight(phase) * (n_before - n_after)
 
     sv_before = _sum_values(violations_before)
     sv_after  = _sum_values(violations_after)
-    rb.value_delta = cfg.value_delta * (sv_before - sv_after)
+    rb.value_delta = cfg.value_delta_weight(phase) * (sv_before - sv_after)
 
     rb.step = -cfg.step
 
-    if n_after == 0 and n_before > 0:
+    # Terminal only fires in REPAIR (the env's own logic also gates this,
+    # but we double-check here so a misconfigured caller can't get a free
+    # +5 reward by reaching DRC-clean during PLACE on an empty layout).
+    if phase == "repair" and n_after == 0 and n_before > 0:
         rb.terminal = cfg.terminal
+
+    # Phase-specific success bonus: encourage the policy to actually
+    # add geometry during generative phases. Awarded only when the
+    # action was valid AND the geometry-hash actually changed.
+    if action_valid and state_changed:
+        if phase == "place":
+            rb.place_success = cfg.place_success
+        elif phase == "route":
+            rb.route_success = cfg.route_success
 
     if not action_valid:
         rb.invalid = -cfg.invalid

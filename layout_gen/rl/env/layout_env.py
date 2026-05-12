@@ -368,6 +368,7 @@ class LayoutEnv(gym.Env):
             violations_after=after,
             state_changed=state_changed,
             action_valid=action_valid,
+            phase=self._phase,
             config=self.reward_cfg,
         )
 
