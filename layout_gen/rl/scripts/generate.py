@@ -99,9 +99,16 @@ def rollout(
     deterministic: bool = True,
     max_total_steps: int = 64,
     verbose:     bool = True,
+    forbid_kinds: frozenset[str] = frozenset(),
 ) -> LayoutState:
-    """Run one episode and return the env's final :class:`LayoutState`."""
-    obs, info = env.reset()
+    """Run one episode and return the env's final :class:`LayoutState`.
+
+    ``forbid_kinds`` is forwarded into the env via ``reset(options=...)``
+    so the action mask suppresses those kinds for the whole episode.
+    Useful for untrained rollouts where (e.g.) ``delete_rect`` would
+    otherwise vandalise the PLACE phase's output.
+    """
+    obs, info = env.reset(options={"forbid_kinds": forbid_kinds})
     if verbose:
         print(f"[rollout] start  phase={info['phase']} polys={info['n_polygons']}")
     for step in range(max_total_steps):
@@ -194,6 +201,12 @@ def main(argv: list[str] | None = None) -> int:
                         "deterministic argmax tends to stack every device "
                         "at the same bin, producing visually-overlapping "
                         "geometry).")
+    p.add_argument("--forbid-delete", choices=("auto", "yes", "no"),
+                   default="auto",
+                   help="Forbid the REPAIR-phase delete_rect kind. "
+                        "'auto' = forbid when no --checkpoint is loaded "
+                        "(untrained policies tend to randomly delete the "
+                        "PLACE/ROUTE work otherwise).")
     p.add_argument("--device", default="cpu")
     p.add_argument("--seed",   type=int, default=0)
     p.add_argument("--quiet",  action="store_true")
@@ -306,10 +319,22 @@ def main(argv: list[str] | None = None) -> int:
     else:  # "auto"
         det = args.checkpoint is not None
 
+    if args.forbid_delete == "yes":
+        forbid = frozenset({"delete_rect"})
+    elif args.forbid_delete == "no":
+        forbid = frozenset()
+    else:  # "auto"
+        forbid = (frozenset({"delete_rect"})
+                   if args.checkpoint is None else frozenset())
+    if forbid and not args.quiet:
+        print(f"[forbid] {sorted(forbid)} — protects PLACE/ROUTE work "
+              "from an untrained REPAIR head")
+
     final_state = rollout(env, policy,
                            deterministic=det,
                            max_total_steps=args.max_steps,
-                           verbose=not args.quiet)
+                           verbose=not args.quiet,
+                           forbid_kinds=forbid)
 
     write_gds(final_state, rules,
               out_path=args.out, cell_name=args.cell_name)

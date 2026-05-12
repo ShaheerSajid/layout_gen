@@ -87,6 +87,10 @@ class CachedDRC:
         self._cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
         self._misses = 0
         self._hits   = 0
+        # gdsfactory's global Component namespace rejects duplicate
+        # cell names. Each DRC invocation creates a fresh Component, so
+        # we suffix a counter to keep names unique within the process.
+        self._invoke_count = 0
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -121,11 +125,16 @@ class CachedDRC:
     # ── Internals ────────────────────────────────────────────────────────────
 
     def _invoke_tool(self, state: LayoutState) -> list[DRCViolation]:
+        # Unique per-call name keeps gdsfactory's global cell namespace
+        # collision-free; the DRC tool only ever sees one cell per
+        # tempfile so the suffix is harmless to the violation report.
+        self._invoke_count += 1
+        unique_name = f"{self._cell_name}_drc{self._invoke_count}"
         with tempfile.TemporaryDirectory(prefix="rl_drc_") as td:
-            gds_path = Path(td) / f"{self._cell_name}.gds"
-            comp = state.to_component(self._rules, name=self._cell_name)
+            gds_path = Path(td) / f"{unique_name}.gds"
+            comp = state.to_component(self._rules, name=unique_name)
             comp.write_gds(str(gds_path), with_metadata=False)
-            return self._runner.run(gds_path, self._cell_name)
+            return self._runner.run(gds_path, unique_name)
 
 
 __all__ = ["CachedDRC", "geometry_key"]
