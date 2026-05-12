@@ -163,7 +163,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--device-cap",  type=int, default=16)
     p.add_argument("--position-bins", type=int, default=16)
     p.add_argument("--max-place-steps", type=int, default=8)
-    p.add_argument("--max-steps", type=int, default=24)
+    p.add_argument("--max-steps", type=int, default=32)
+
+    # Routing
+    p.add_argument("--no-route", action="store_true",
+                   help="Skip the ROUTE phase entirely (devices ship "
+                        "disconnected). Useful for debugging PLACE.")
+    p.add_argument("--net-cap", type=int, default=16)
+    p.add_argument("--route-size-bins", type=int, default=8)
+    p.add_argument("--max-route-steps", type=int, default=8)
 
     # Default sizing fallbacks for devices whose YAML omits w / l
     p.add_argument("--w-n", type=float, default=0.5)
@@ -213,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
     drc = _build_drc(args, rules)
     cache = TransistorCache(rules)
 
+    enable_route = not args.no_route
+
     # ── Env ──────────────────────────────────────────────────────────────
     env = LayoutEnv(
         drc=drc,
@@ -225,6 +235,13 @@ def main(argv: list[str] | None = None) -> int:
         cell_width_um=cell_w, cell_height_um=cell_h,
         max_place_steps=args.max_place_steps,
         topology_global=topology_global,
+        enable_route=enable_route,
+        net_cap=max(args.net_cap, graph.n_nets),
+        route_x_bins=args.position_bins,
+        route_y_bins=args.position_bins,
+        route_w_bins=args.route_size_bins,
+        route_h_bins=args.route_size_bins,
+        max_route_steps=args.max_route_steps,
     )
 
     # ── Policy ───────────────────────────────────────────────────────────
@@ -235,6 +252,10 @@ def main(argv: list[str] | None = None) -> int:
         use_topology=True, topology_dim=args.topology_dim,
         enable_place=True, device_cap=args.device_cap,
         x_bins=args.position_bins, y_bins=args.position_bins,
+        enable_route=enable_route,
+        net_cap=max(args.net_cap, graph.n_nets),
+        route_x_bins=args.position_bins, route_y_bins=args.position_bins,
+        route_w_bins=args.route_size_bins, route_h_bins=args.route_size_bins,
     )
 
     if args.checkpoint is not None:

@@ -95,14 +95,18 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
     def _flatten_logits(self, logits: ActionLogits) -> torch.Tensor:
         """Concat per-dim logits in MultiDiscrete order → (B, sum(nvec)).
 
-        PLACE-only heads (device / x_bin / y_bin / orient) carry zero-width
-        tensors when ``enable_place=False``, so the concat order is stable
-        regardless of config.
+        PLACE- and ROUTE-only heads carry zero-width tensors when their
+        phase is disabled, so the concat order is stable regardless of
+        config. The order matches :class:`ActionSpace`'s nvec layout:
+        REPAIR base → PLACE block → ROUTE block.
         """
         return torch.cat([
             logits.kind, logits.target, logits.edge,
             logits.sign_x, logits.sign_y, logits.mag,
             logits.device, logits.x_bin, logits.y_bin, logits.orient,
+            logits.net, logits.route_layer,
+            logits.route_x_bin, logits.route_y_bin,
+            logits.route_w_bin, logits.route_h_bin,
         ], dim=-1)
 
     def _logits_and_value(

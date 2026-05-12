@@ -59,13 +59,15 @@ from layout_gen.rl.env.place_action import (
 from layout_gen.rl.env.reward       import (
     RewardConfig, RewardBreakdown, compute_reward,
 )
+from layout_gen.rl.env.route_action import add_route_segment
 from layout_gen.rl.env.runner       import CachedDRC, geometry_key
 from layout_gen.rl.topology.parser  import TopologyGraph
 
 from layout_gen.rl.env.action_space import (
     DEFAULT_CELL_HEIGHT_UM, DEFAULT_CELL_WIDTH_UM,
-    DEFAULT_DEVICE_CAP, DEFAULT_POSITION_BINS,
+    DEFAULT_DEVICE_CAP, DEFAULT_NET_CAP, DEFAULT_POSITION_BINS,
 )
+from layout_gen.rl.env.route_action import DEFAULT_SIZE_BINS
 
 
 @dataclass
@@ -129,6 +131,14 @@ class LayoutEnv(gym.Env):
         cell_height_um:   float = DEFAULT_CELL_HEIGHT_UM,
         max_place_steps:  int   = 0,
         start_phase:      str   = "auto",
+        # ── ROUTE-phase additions ──────────────────────────────────────
+        enable_route:     bool = False,
+        net_cap:          int  = DEFAULT_NET_CAP,
+        route_x_bins:     int  = DEFAULT_POSITION_BINS,
+        route_y_bins:     int  = DEFAULT_POSITION_BINS,
+        route_w_bins:     int  = DEFAULT_SIZE_BINS,
+        route_h_bins:     int  = DEFAULT_SIZE_BINS,
+        max_route_steps:  int  = 0,
     ) -> None:
         super().__init__()
         self._drc = drc
@@ -172,12 +182,43 @@ class LayoutEnv(gym.Env):
                     f"device_cap is {device_cap}."
                 )
 
-        if start_phase not in ("auto", "place", "repair"):
-            raise ValueError(f"start_phase must be auto/place/repair, got {start_phase!r}")
+        if enable_route:
+            if topology_graph is None:
+                raise ValueError(
+                    "enable_route=True requires topology_graph (need the "
+                    "net list to address)."
+                )
+            if topology_graph.n_nets > net_cap:
+                raise ValueError(
+                    f"topology has {topology_graph.n_nets} nets but "
+                    f"net_cap is {net_cap}."
+                )
+
+        # ── ROUTE phase wiring (cache config used in mask + decode) ────
+        self.enable_route   = enable_route
+        self.net_cap        = net_cap
+        self.route_x_bins   = route_x_bins
+        self.route_y_bins   = route_y_bins
+        self.route_w_bins   = route_w_bins
+        self.route_h_bins   = route_h_bins
+        self.max_route_steps = max_route_steps
+
+        if start_phase not in ("auto", "place", "route", "repair"):
+            raise ValueError(
+                f"start_phase must be auto/place/route/repair, "
+                f"got {start_phase!r}"
+            )
         if start_phase == "auto":
-            start_phase = "place" if enable_place else "repair"
+            if enable_place:
+                start_phase = "place"
+            elif enable_route:
+                start_phase = "route"
+            else:
+                start_phase = "repair"
         if start_phase == "place" and not enable_place:
             raise ValueError("start_phase='place' requires enable_place=True.")
+        if start_phase == "route" and not enable_route:
+            raise ValueError("start_phase='route' requires enable_route=True.")
         self._default_start_phase = start_phase
 
         # ── Action / observation spaces ───────────────────────────────
@@ -190,6 +231,12 @@ class LayoutEnv(gym.Env):
             y_bins=y_bins,
             cell_width_um=cell_width_um,
             cell_height_um=cell_height_um,
+            enable_route=enable_route,
+            net_cap=net_cap,
+            route_x_bins=route_x_bins,
+            route_y_bins=route_y_bins,
+            route_w_bins=route_w_bins,
+            route_h_bins=route_h_bins,
         )
         self.action_space      = self._action_helper.gym_space
         self.observation_space = make_observation_space(
@@ -207,7 +254,9 @@ class LayoutEnv(gym.Env):
         self._last_rid_map: dict[int, int] = {}
         self._forbid_kinds: frozenset[str] = frozenset()
         self._phase: str = self._default_start_phase
-        self._placed_mask: np.ndarray = np.zeros(device_cap, dtype=bool)
+        self._placed_mask:  np.ndarray = np.zeros(device_cap, dtype=bool)
+        self._route_step_count: int = 0
+        self._routed_mask: np.ndarray = np.zeros(net_cap, dtype=bool)
 
     # ── Gymnasium API ────────────────────────────────────────────────────────
 
@@ -222,14 +271,29 @@ class LayoutEnv(gym.Env):
         start_phase = cfg.start_phase or self._default_start_phase
         if start_phase == "place" and not self.enable_place:
             raise ValueError("Cannot start in PLACE phase: enable_place=False.")
+        if start_phase == "route" and not self.enable_route:
+            raise ValueError("Cannot start in ROUTE phase: enable_route=False.")
         self._phase = start_phase
         self._placed_mask = np.zeros(self.device_cap, dtype=bool)
+        self._routed_mask = np.zeros(self.net_cap, dtype=bool)
         self._place_step_count = 0
+        self._route_step_count = 0
 
-        if self._phase == "place":
-            # PLACE episodes start with an empty layout. Devices land
-            # one-by-one as the policy issues PLACE actions.
-            self._state = LayoutState()
+        if self._phase in ("place", "route"):
+            # Generative episodes start with an empty layout. PLACE
+            # populates devices; ROUTE populates wires. (When the env
+            # was configured route-only, the caller is expected to
+            # have pre-placed devices via options['state'].)
+            if self._phase == "place":
+                self._state = LayoutState()
+            elif cfg.state is not None:
+                self._state = deepcopy(cfg.state)
+            elif cfg.state_factory is not None:
+                self._state = cfg.state_factory()
+            elif self._default_state_factory is not None:
+                self._state = self._default_state_factory()
+            else:
+                self._state = LayoutState()
         elif cfg.state is not None:
             self._state = deepcopy(cfg.state)
         elif cfg.state_factory is not None:
@@ -271,7 +335,15 @@ class LayoutEnv(gym.Env):
             self._place_step_count += 1
             if action_valid:
                 state_changed = geometry_key(self._state) != before_key
-        elif (not env_action.is_place) and self._phase == "repair":
+        elif env_action.is_route and self._phase == "route":
+            action_valid = self._apply_route(env_action)
+            self._route_step_count += 1
+            if action_valid:
+                state_changed = geometry_key(self._state) != before_key
+        elif (
+            (not env_action.is_place) and (not env_action.is_route)
+            and self._phase == "repair"
+        ):
             perturb_action = self._action_helper.to_perturb(env_action)
             action_valid = perturb_action is not None
             if action_valid:
@@ -299,18 +371,31 @@ class LayoutEnv(gym.Env):
             config=self.reward_cfg,
         )
 
-        # Phase transition: PLACE → REPAIR when every device is placed
-        # OR the per-phase step budget is exhausted.
+        # Phase transitions: PLACE → ROUTE (or → REPAIR if route disabled),
+        # then ROUTE → REPAIR. A phase ends when its work is done OR its
+        # per-phase budget is exhausted.
         phase_transitioned = False
         if self._phase == "place":
             if self._all_devices_placed() or (
                 self.max_place_steps > 0
                 and self._place_step_count >= self.max_place_steps
             ):
+                self._phase = "route" if self.enable_route else "repair"
+                phase_transitioned = True
+
+        if self._phase == "route":
+            # Routing phase has no "all-nets-routed" oracle in v1
+            # (LVS check would be needed); phase ends only on the
+            # explicit step budget. If max_route_steps==0 the user
+            # intended ROUTE-only experimentation — leave it open.
+            if (
+                self.max_route_steps > 0
+                and self._route_step_count >= self.max_route_steps
+            ):
                 self._phase = "repair"
                 phase_transitioned = True
 
-        # Termination: DRC-clean only counts once we're past PLACE phase
+        # Termination: DRC-clean only counts once we're in REPAIR phase
         # (otherwise empty / partial layouts trivially satisfy DRC).
         terminated = (
             self._phase == "repair"
@@ -364,6 +449,33 @@ class LayoutEnv(gym.Env):
         n = self._topology_graph.n_devices
         return bool(self._placed_mask[:n].all())
 
+    # ── ROUTE helpers ────────────────────────────────────────────────────────
+
+    def _apply_route(self, env_action: EnvAction) -> bool:
+        """Materialise one routing segment. Returns True iff valid."""
+        if self._topology_graph is None:
+            return False
+        n_idx = env_action.net_idx
+        if n_idx < 0 or n_idx >= self._topology_graph.n_nets:
+            return False
+        if n_idx >= self.net_cap:
+            return False
+        net_name = self._topology_graph.nets[n_idx].name
+        try:
+            add_route_segment(
+                self._state,
+                layer=env_action.route_layer,
+                x_um=env_action.route_x_um,
+                y_um=env_action.route_y_um,
+                w_um=env_action.route_w_um,
+                h_um=env_action.route_h_um,
+                net_name=net_name,
+            )
+        except Exception:
+            return False
+        self._routed_mask[n_idx] = True
+        return True
+
     # ── Internals ────────────────────────────────────────────────────────────
 
     def _coerce_options(self,
@@ -411,6 +523,7 @@ class LayoutEnv(gym.Env):
             "step":             self._step_count,
             "phase":            self._phase,
             "n_devices_placed": int(self._placed_mask.sum()),
+            "n_nets_routed":    int(self._routed_mask.sum()),
             "action_mask":      mask,
             "drc_cache_stats":  self._drc.stats(),
         }
@@ -423,10 +536,16 @@ class LayoutEnv(gym.Env):
                 "kind": env_action.kind, "rid": env_action.rid,
                 "edge": env_action.edge, "sign_x": env_action.sign_x,
                 "sign_y": env_action.sign_y, "mag": env_action.mag,
-                "device_idx": env_action.device_idx,
-                "x_um":       env_action.x_um,
-                "y_um":       env_action.y_um,
+                "device_idx":  env_action.device_idx,
+                "x_um":        env_action.x_um,
+                "y_um":        env_action.y_um,
                 "orientation": env_action.orientation,
+                "net_idx":     env_action.net_idx,
+                "route_layer": env_action.route_layer,
+                "route_x_um":  env_action.route_x_um,
+                "route_y_um":  env_action.route_y_um,
+                "route_w_um":  env_action.route_w_um,
+                "route_h_um":  env_action.route_h_um,
                 "valid": action_valid, "state_changed": state_changed,
             }
         return self._last_obs, info
@@ -434,6 +553,10 @@ class LayoutEnv(gym.Env):
     def _compute_action_mask(self) -> np.ndarray:
         n_devices = (
             self._topology_graph.n_devices
+            if self._topology_graph is not None else 0
+        )
+        n_nets = (
+            self._topology_graph.n_nets
             if self._topology_graph is not None else 0
         )
         return action_mask_for(
@@ -448,6 +571,13 @@ class LayoutEnv(gym.Env):
             placed_mask=self._placed_mask,
             x_bins=self.x_bins,
             y_bins=self.y_bins,
+            enable_route=self.enable_route,
+            net_cap=self.net_cap,
+            n_nets=n_nets,
+            route_x_bins=self.route_x_bins,
+            route_y_bins=self.route_y_bins,
+            route_w_bins=self.route_w_bins,
+            route_h_bins=self.route_h_bins,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────

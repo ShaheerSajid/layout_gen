@@ -61,6 +61,10 @@ from layout_gen.synth.geo.state import LayoutState
 from layout_gen.rl.env.place_action import (
     N_ORIENTATIONS, ORIENTATIONS, orientation_from_index,
 )
+from layout_gen.rl.env.route_action import (
+    DEFAULT_SIZE_BINS, N_ROUTE_LAYERS, ROUTE_LAYERS,
+    layer_from_index, size_bins,
+)
 
 
 # ── Vocabulary (REPAIR — Phase 1) ────────────────────────────────────────────
@@ -75,9 +79,13 @@ N_REPAIR_KINDS = len(REPAIR_KINDS)
 ACTION_KINDS: tuple[str, ...] = REPAIR_KINDS
 N_KINDS = N_REPAIR_KINDS
 
-# Vocabulary (PLACE — Phase 4)
+# Vocabulary (PLACE — Phase 4 part 2a)
 PLACE_KINDS: tuple[str, ...] = ("place_device",)
 N_PLACE_KINDS = len(PLACE_KINDS)
+
+# Vocabulary (ROUTE — Phase 4 part 2c)
+ROUTE_KINDS: tuple[str, ...] = ("route_segment",)
+N_ROUTE_KINDS = len(ROUTE_KINDS)
 
 EDGE_NAMES: tuple[str, ...] = ("left", "right", "bottom", "top")
 N_EDGES  = len(EDGE_NAMES)
@@ -86,6 +94,7 @@ N_EDGES  = len(EDGE_NAMES)
 DEFAULT_TARGET_CAP    = 256
 DEFAULT_MAG_BINS      = 16
 DEFAULT_DEVICE_CAP    = 32
+DEFAULT_NET_CAP       = 32
 DEFAULT_POSITION_BINS = 16
 DEFAULT_CELL_WIDTH_UM  = 4.0
 DEFAULT_CELL_HEIGHT_UM = 4.0
@@ -96,8 +105,19 @@ DELTA_MAX_UM = 0.10
 OFFGRID_SCALE = 0.1
 
 
-def combined_kinds(enable_place: bool) -> tuple[str, ...]:
-    return REPAIR_KINDS + PLACE_KINDS if enable_place else REPAIR_KINDS
+def combined_kinds(enable_place: bool,
+                    enable_route: bool = False) -> tuple[str, ...]:
+    """Concatenate the active per-phase kind vocabularies.
+
+    Order matters: REPAIR slots are first (so Phase 1–3 indices remain
+    stable), PLACE next, then ROUTE. New phases append, never insert.
+    """
+    out = REPAIR_KINDS
+    if enable_place:
+        out = out + PLACE_KINDS
+    if enable_route:
+        out = out + ROUTE_KINDS
+    return out
 
 
 # ── Magnitude binning ────────────────────────────────────────────────────────
@@ -115,9 +135,8 @@ def magnitude_bins(n_bins: int = DEFAULT_MAG_BINS,
 class EnvAction:
     """Decoded form of a raw MultiDiscrete sample.
 
-    For REPAIR kinds the ``rid`` / ``edge`` / ``sign_*`` / ``mag`` fields
-    carry the meaningful payload. For ``place_device`` the
-    ``device_idx`` / ``x_um`` / ``y_um`` / ``orientation`` fields do.
+    Only the field block matching the action's :attr:`kind` carries a
+    meaningful payload; the others stay at their dataclass defaults.
     """
     kind:        str
     # REPAIR payload
@@ -131,10 +150,21 @@ class EnvAction:
     x_um:        float = 0.0
     y_um:        float = 0.0
     orientation: str   = "R0"
+    # ROUTE payload
+    net_idx:     int   = -1
+    route_layer: str   = "met1"
+    route_x_um:  float = 0.0
+    route_y_um:  float = 0.0
+    route_w_um:  float = 0.0
+    route_h_um:  float = 0.0
 
     @property
     def is_place(self) -> bool:
         return self.kind in PLACE_KINDS
+
+    @property
+    def is_route(self) -> bool:
+        return self.kind in ROUTE_KINDS
 
 
 # ── Action space ─────────────────────────────────────────────────────────────
@@ -164,14 +194,21 @@ class ActionSpace:
 
     def __init__(self,
                  *,
-                 target_cap:     int   = DEFAULT_TARGET_CAP,
-                 mag_bins:       int   = DEFAULT_MAG_BINS,
-                 enable_place:   bool  = False,
-                 device_cap:     int   = DEFAULT_DEVICE_CAP,
-                 x_bins:         int   = DEFAULT_POSITION_BINS,
-                 y_bins:         int   = DEFAULT_POSITION_BINS,
-                 cell_width_um:  float = DEFAULT_CELL_WIDTH_UM,
-                 cell_height_um: float = DEFAULT_CELL_HEIGHT_UM,
+                 target_cap:        int   = DEFAULT_TARGET_CAP,
+                 mag_bins:          int   = DEFAULT_MAG_BINS,
+                 enable_place:      bool  = False,
+                 device_cap:        int   = DEFAULT_DEVICE_CAP,
+                 x_bins:            int   = DEFAULT_POSITION_BINS,
+                 y_bins:            int   = DEFAULT_POSITION_BINS,
+                 cell_width_um:     float = DEFAULT_CELL_WIDTH_UM,
+                 cell_height_um:    float = DEFAULT_CELL_HEIGHT_UM,
+                 # ── ROUTE knobs ─────────────────────────────────────
+                 enable_route:      bool  = False,
+                 net_cap:           int   = DEFAULT_NET_CAP,
+                 route_x_bins:      int   = DEFAULT_POSITION_BINS,
+                 route_y_bins:      int   = DEFAULT_POSITION_BINS,
+                 route_w_bins:      int   = DEFAULT_SIZE_BINS,
+                 route_h_bins:      int   = DEFAULT_SIZE_BINS,
                  ) -> None:
         self.target_cap     = target_cap
         self.mag_bins       = mag_bins
@@ -182,12 +219,24 @@ class ActionSpace:
         self.cell_width_um  = cell_width_um
         self.cell_height_um = cell_height_um
 
-        self._mag_table = magnitude_bins(mag_bins)
-        self._kinds     = combined_kinds(enable_place)
+        self.enable_route   = enable_route
+        self.net_cap        = net_cap
+        self.route_x_bins   = route_x_bins
+        self.route_y_bins   = route_y_bins
+        self.route_w_bins   = route_w_bins
+        self.route_h_bins   = route_h_bins
+
+        self._mag_table  = magnitude_bins(mag_bins)
+        self._size_table = size_bins(max(route_w_bins, route_h_bins))
+        self._kinds      = combined_kinds(enable_place, enable_route)
 
         nvec = [len(self._kinds), target_cap, N_EDGES, 2, 2, mag_bins]
         if enable_place:
             nvec += [device_cap, x_bins, y_bins, N_ORIENTATIONS]
+        if enable_route:
+            nvec += [net_cap, N_ROUTE_LAYERS,
+                     route_x_bins, route_y_bins,
+                     route_w_bins, route_h_bins]
         self.nvec = tuple(nvec)
         self.gym_space = spaces.MultiDiscrete(self.nvec)
 
@@ -217,8 +266,10 @@ class ActionSpace:
             sign_x=sign_x, sign_y=sign_y, mag=mag,
         )
 
-        if self.enable_place and len(raw) >= 10:
-            dev_i, xb_i, yb_i, or_i = raw[6:10]
+        cursor = 6
+        if self.enable_place and len(raw) >= cursor + 4:
+            dev_i, xb_i, yb_i, or_i = raw[cursor:cursor + 4]
+            cursor += 4
             action.device_idx = int(dev_i)
             action.x_um = self._bin_to_coord(xb_i, self.x_bins, self.cell_width_um)
             action.y_um = self._bin_to_coord(yb_i, self.y_bins, self.cell_height_um)
@@ -226,7 +277,28 @@ class ActionSpace:
                 or_i if 0 <= or_i < N_ORIENTATIONS else 0
             )
 
+        if self.enable_route and len(raw) >= cursor + 6:
+            net_i, lyr_i, rxb_i, ryb_i, wb_i, hb_i = raw[cursor:cursor + 6]
+            action.net_idx     = int(net_i)
+            action.route_layer = layer_from_index(
+                lyr_i if 0 <= lyr_i < N_ROUTE_LAYERS else 0
+            )
+            action.route_x_um  = self._bin_to_coord(
+                rxb_i, self.route_x_bins, self.cell_width_um,
+            )
+            action.route_y_um  = self._bin_to_coord(
+                ryb_i, self.route_y_bins, self.cell_height_um,
+            )
+            action.route_w_um  = self._size_bin(wb_i, self.route_w_bins)
+            action.route_h_um  = self._size_bin(hb_i, self.route_h_bins)
+
         return action
+
+    def _size_bin(self, idx: int, n_bins: int) -> float:
+        idx = max(0, min(int(idx), n_bins - 1))
+        # _size_table is shared across w/h; both pull from the log-spaced
+        # range [ROUTE_SIZE_MIN_UM, ROUTE_SIZE_MAX_UM].
+        return float(self._size_table[idx])
 
     @staticmethod
     def _bin_to_coord(bin_idx: int, n_bins: int, span_um: float) -> float:
@@ -278,46 +350,69 @@ def action_mask_for(
     placed_mask:  np.ndarray | None = None,
     x_bins:       int = DEFAULT_POSITION_BINS,
     y_bins:       int = DEFAULT_POSITION_BINS,
+    # ── ROUTE-phase ────────────────────────────────────────────────────
+    enable_route: bool = False,
+    net_cap:      int = DEFAULT_NET_CAP,
+    n_nets:       int = 0,
+    route_x_bins: int = DEFAULT_POSITION_BINS,
+    route_y_bins: int = DEFAULT_POSITION_BINS,
+    route_w_bins: int = DEFAULT_SIZE_BINS,
+    route_h_bins: int = DEFAULT_SIZE_BINS,
 ) -> np.ndarray:
     """Produce the per-dim action mask consumed by MaskablePPO.
 
     Parameters
     ----------
     phase :
-        ``"repair"`` (default) or ``"place"``. When the env is in
-        ``"place"`` phase, kind is constrained to PLACE-only and the
-        REPAIR-only kind slots are off.
+        ``"repair"`` (default), ``"place"``, or ``"route"``. The kind
+        dim is constrained to the kinds for the active phase; the
+        per-phase blocks (PLACE, ROUTE) keep their dims masked-down
+        when their phase is inactive.
     n_devices :
         Number of real devices in the topology graph (≥ this index in
         the device dim is always masked).
     placed_mask :
         Optional boolean array of length ``device_cap`` where True
-        means *already placed* — those device indices are masked off
-        during PLACE phase so the policy can't place the same device
-        twice.
+        means *already placed* — masked off during PLACE phase.
+    n_nets :
+        Number of real nets in the topology graph (≥ this index in
+        the net dim is always masked).
     """
     parts: list[np.ndarray] = []
 
-    n_kinds_total = N_REPAIR_KINDS + (N_PLACE_KINDS if enable_place else 0)
-    kind_m = np.ones(n_kinds_total, dtype=bool)
+    n_kinds_total = (
+        N_REPAIR_KINDS
+        + (N_PLACE_KINDS if enable_place else 0)
+        + (N_ROUTE_KINDS if enable_route else 0)
+    )
+    kind_m = np.zeros(n_kinds_total, dtype=bool)
+    place_offset = N_REPAIR_KINDS
+    route_offset = place_offset + (N_PLACE_KINDS if enable_place else 0)
 
-    if enable_place and phase == "place":
-        # PLACE phase: only PLACE kinds allowed.
-        for i in range(N_REPAIR_KINDS):
-            kind_m[i] = False
-    else:
-        # REPAIR phase (or non-place env): PLACE kinds masked off.
+    if phase == "place":
         if enable_place:
-            for i in range(N_REPAIR_KINDS, n_kinds_total):
-                kind_m[i] = False
+            kind_m[place_offset:place_offset + N_PLACE_KINDS] = True
+    elif phase == "route":
+        if enable_route:
+            kind_m[route_offset:route_offset + N_ROUTE_KINDS] = True
+    else:
+        # REPAIR phase (or no per-phase machine): only REPAIR kinds.
+        kind_m[:N_REPAIR_KINDS] = True
+
     for fk in forbid_kinds:
         if fk in REPAIR_KINDS:
             kind_m[REPAIR_KINDS.index(fk)] = False
+
+    if not kind_m.any():
+        # Defensive: never emit a fully-False kind mask (the
+        # categorical distribution would be undefined). The env will
+        # treat this as a no-op anyway since the action's kind won't
+        # match the active phase.
+        kind_m[0] = True
     parts.append(kind_m)
 
-    # Target dim: live polygons (only matters in REPAIR phase, but
-    # mask must be valid in PLACE too — keep at least slot 0 selectable
-    # so the action vector is well-formed).
+    # Target dim: live polygons (REPAIR phase needs them; other phases
+    # just keep slot 0 selectable so the vector is well-formed).
     n_live = min(len(rid_to_idx), target_cap)
     tgt_m = np.zeros(target_cap, dtype=bool)
     if n_live > 0:
@@ -333,17 +428,12 @@ def action_mask_for(
     parts.append(np.ones(mag_bins, dtype=bool))
 
     if enable_place:
-        # Device dim: in PLACE phase, valid = (i < n_devices) and not
-        # already placed. In REPAIR phase the head is unused, but the
-        # mask must still pick at least one slot so the distribution
-        # is well-defined — we just allow slot 0.
         dev_m = np.zeros(device_cap, dtype=bool)
         if phase == "place" and n_devices > 0:
             limit = min(n_devices, device_cap)
             dev_m[:limit] = True
             if placed_mask is not None:
                 placed = np.asarray(placed_mask, dtype=bool)[:device_cap]
-                # mask out the already-placed devices
                 dev_m[: len(placed)] &= ~placed
             if not dev_m.any():
                 dev_m[0] = True
@@ -354,15 +444,31 @@ def action_mask_for(
         parts.append(np.ones(y_bins, dtype=bool))
         parts.append(np.ones(N_ORIENTATIONS, dtype=bool))
 
+    if enable_route:
+        # Net dim: in ROUTE phase, valid = i < n_nets. Otherwise just
+        # slot 0 is selectable so the categorical is well-defined.
+        net_m = np.zeros(net_cap, dtype=bool)
+        if phase == "route" and n_nets > 0:
+            limit = min(n_nets, net_cap)
+            net_m[:limit] = True
+        else:
+            net_m[0] = True
+        parts.append(net_m)
+        parts.append(np.ones(N_ROUTE_LAYERS, dtype=bool))
+        parts.append(np.ones(route_x_bins,   dtype=bool))
+        parts.append(np.ones(route_y_bins,   dtype=bool))
+        parts.append(np.ones(route_w_bins,   dtype=bool))
+        parts.append(np.ones(route_h_bins,   dtype=bool))
+
     return np.concatenate(parts)
 
 
 __all__ = [
-    "REPAIR_KINDS", "PLACE_KINDS", "ACTION_KINDS",
-    "N_REPAIR_KINDS", "N_PLACE_KINDS", "N_KINDS",
+    "REPAIR_KINDS", "PLACE_KINDS", "ROUTE_KINDS", "ACTION_KINDS",
+    "N_REPAIR_KINDS", "N_PLACE_KINDS", "N_ROUTE_KINDS", "N_KINDS",
     "EDGE_NAMES", "N_EDGES",
     "DEFAULT_TARGET_CAP", "DEFAULT_MAG_BINS",
-    "DEFAULT_DEVICE_CAP", "DEFAULT_POSITION_BINS",
+    "DEFAULT_DEVICE_CAP", "DEFAULT_NET_CAP", "DEFAULT_POSITION_BINS",
     "DEFAULT_CELL_WIDTH_UM", "DEFAULT_CELL_HEIGHT_UM",
     "DELTA_MIN_UM", "DELTA_MAX_UM", "OFFGRID_SCALE",
     "combined_kinds", "magnitude_bins",

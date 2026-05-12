@@ -49,11 +49,12 @@ import torch.nn.functional as F
 
 from layout_gen.repair.features import POLY_FEAT_DIM
 from layout_gen.rl.env.action_space import (
-    DEFAULT_DEVICE_CAP, DEFAULT_MAG_BINS, DEFAULT_POSITION_BINS,
-    DEFAULT_TARGET_CAP,
-    N_EDGES, N_PLACE_KINDS, N_REPAIR_KINDS,
+    DEFAULT_DEVICE_CAP, DEFAULT_MAG_BINS, DEFAULT_NET_CAP,
+    DEFAULT_POSITION_BINS, DEFAULT_TARGET_CAP,
+    N_EDGES, N_PLACE_KINDS, N_REPAIR_KINDS, N_ROUTE_KINDS,
 )
 from layout_gen.rl.env.place_action import N_ORIENTATIONS
+from layout_gen.rl.env.route_action import DEFAULT_SIZE_BINS, N_ROUTE_LAYERS
 from layout_gen.rl.env.observation import (
     DEFAULT_POLY_CAP, DEFAULT_VIOL_CAP, N_GLOBAL, V_FEAT_DIM,
 )
@@ -82,7 +83,7 @@ class LayoutPolicyConfig:
     use_topology:  bool = False
     topology_dim:  int  = 64
 
-    # ── PLACE action heads (Phase 4 part 2) ────────────────────────────
+    # ── PLACE action heads (Phase 4 part 2a) ───────────────────────────
     # When True, the policy emits four additional heads
     # (device / x_bin / y_bin / orient) and the kind head's output
     # grows by N_PLACE_KINDS. Default False keeps Phase 1–3 + Phase 4
@@ -92,20 +93,37 @@ class LayoutPolicyConfig:
     x_bins:        int  = DEFAULT_POSITION_BINS
     y_bins:        int  = DEFAULT_POSITION_BINS
 
+    # ── ROUTE action heads (Phase 4 part 2c) ───────────────────────────
+    # When True, the policy emits six additional heads
+    # (net / route_layer / route_x_bin / route_y_bin / route_w_bin /
+    # route_h_bin) and the kind head grows by N_ROUTE_KINDS.
+    enable_route:  bool = False
+    net_cap:       int  = DEFAULT_NET_CAP
+    route_x_bins:  int  = DEFAULT_POSITION_BINS
+    route_y_bins:  int  = DEFAULT_POSITION_BINS
+    route_w_bins:  int  = DEFAULT_SIZE_BINS
+    route_h_bins:  int  = DEFAULT_SIZE_BINS
+
     # Loss weights for BC. Keyed by action dim name; defaults are
     # equal-weight on the dims that always matter (kind, target) and
     # half-weight on conditional dims (edge / sign / mag).
     loss_weights: dict[str, float] = field(default_factory=lambda: {
-        "kind":   1.0,
-        "target": 1.0,
-        "edge":   0.5,
-        "sign_x": 0.5,
-        "sign_y": 0.5,
-        "mag":    0.5,
-        "device": 1.0,
-        "x_bin":  0.5,
-        "y_bin":  0.5,
-        "orient": 0.5,
+        "kind":         1.0,
+        "target":       1.0,
+        "edge":         0.5,
+        "sign_x":       0.5,
+        "sign_y":       0.5,
+        "mag":          0.5,
+        "device":       1.0,
+        "x_bin":        0.5,
+        "y_bin":        0.5,
+        "orient":       0.5,
+        "net":          1.0,
+        "route_layer":  0.5,
+        "route_x_bin":  0.5,
+        "route_y_bin":  0.5,
+        "route_w_bin":  0.5,
+        "route_h_bin":  0.5,
     })
 
 
@@ -114,21 +132,29 @@ class LayoutPolicyConfig:
 class ActionLogits(NamedTuple):
     """Per-dim logits.
 
-    ``device``, ``x_bin``, ``y_bin``, ``orient`` are populated only when
-    the policy was built with ``enable_place=True``. Otherwise they hold
-    zero-element placeholders (so the NamedTuple shape stays stable
-    across configs but contributes nothing to a flat-concat).
+    PLACE-only fields (``device``, ``x_bin``, ``y_bin``, ``orient``)
+    and ROUTE-only fields (``net``, ``route_layer``, ``route_x_bin``,
+    ``route_y_bin``, ``route_w_bin``, ``route_h_bin``) carry
+    zero-width tensors when their phase is disabled, so
+    :func:`MaskableLayoutPolicy._flatten_logits` can concat them
+    unconditionally.
     """
-    kind:   torch.Tensor   # (B, n_kinds_total)
-    target: torch.Tensor   # (B, target_cap)
-    edge:   torch.Tensor   # (B, N_EDGES)
-    sign_x: torch.Tensor   # (B, 2)
-    sign_y: torch.Tensor   # (B, 2)
-    mag:    torch.Tensor   # (B, mag_bins)
-    device: torch.Tensor   # (B, device_cap) or (B, 0) when PLACE disabled
-    x_bin:  torch.Tensor   # (B, x_bins)     or (B, 0)
-    y_bin:  torch.Tensor   # (B, y_bins)     or (B, 0)
-    orient: torch.Tensor   # (B, N_ORIENTATIONS) or (B, 0)
+    kind:         torch.Tensor   # (B, n_kinds_total)
+    target:       torch.Tensor   # (B, target_cap)
+    edge:         torch.Tensor   # (B, N_EDGES)
+    sign_x:       torch.Tensor   # (B, 2)
+    sign_y:       torch.Tensor   # (B, 2)
+    mag:          torch.Tensor   # (B, mag_bins)
+    device:       torch.Tensor   # (B, device_cap) or (B, 0)
+    x_bin:        torch.Tensor   # (B, x_bins)     or (B, 0)
+    y_bin:        torch.Tensor   # (B, y_bins)     or (B, 0)
+    orient:       torch.Tensor   # (B, N_ORIENTATIONS) or (B, 0)
+    net:          torch.Tensor   # (B, net_cap) or (B, 0)
+    route_layer:  torch.Tensor   # (B, N_ROUTE_LAYERS) or (B, 0)
+    route_x_bin:  torch.Tensor   # (B, route_x_bins) or (B, 0)
+    route_y_bin:  torch.Tensor   # (B, route_y_bins) or (B, 0)
+    route_w_bin:  torch.Tensor   # (B, route_w_bins) or (B, 0)
+    route_h_bin:  torch.Tensor   # (B, route_h_bins) or (B, 0)
 
 
 # ── Module ───────────────────────────────────────────────────────────────────
@@ -186,7 +212,11 @@ class LayoutPolicy(nn.Module):
         self.target_query = nn.Linear(self.cfg.d_trunk, d)
 
         # Plain heads
-        kind_out_dim = N_REPAIR_KINDS + (N_PLACE_KINDS if self.cfg.enable_place else 0)
+        kind_out_dim = (
+            N_REPAIR_KINDS
+            + (N_PLACE_KINDS if self.cfg.enable_place else 0)
+            + (N_ROUTE_KINDS if self.cfg.enable_route else 0)
+        )
         self.kind_head   = nn.Linear(self.cfg.d_trunk, kind_out_dim)
         self.edge_head   = nn.Linear(self.cfg.d_trunk, N_EDGES)
         self.signx_head  = nn.Linear(self.cfg.d_trunk, 2)
@@ -200,6 +230,15 @@ class LayoutPolicy(nn.Module):
             self.x_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.x_bins)
             self.y_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.y_bins)
             self.orient_head = nn.Linear(self.cfg.d_trunk, N_ORIENTATIONS)
+
+        # ROUTE heads — same gating story.
+        if self.cfg.enable_route:
+            self.net_head         = nn.Linear(self.cfg.d_trunk, self.cfg.net_cap)
+            self.route_layer_head = nn.Linear(self.cfg.d_trunk, N_ROUTE_LAYERS)
+            self.route_x_head     = nn.Linear(self.cfg.d_trunk, self.cfg.route_x_bins)
+            self.route_y_head     = nn.Linear(self.cfg.d_trunk, self.cfg.route_y_bins)
+            self.route_w_head     = nn.Linear(self.cfg.d_trunk, self.cfg.route_w_bins)
+            self.route_h_head     = nn.Linear(self.cfg.d_trunk, self.cfg.route_h_bins)
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
@@ -261,29 +300,47 @@ class LayoutPolicy(nn.Module):
         target_logits = target_logits.masked_fill(poly_pad, float("-inf"))
         target_logits = _resize_logits(target_logits, self.cfg.target_cap)
 
+        empty = ctx.new_zeros((ctx.shape[0], 0))
         if self.cfg.enable_place:
             device_logits = self.device_head(ctx)
             x_bin_logits  = self.x_bin_head(ctx)
             y_bin_logits  = self.y_bin_head(ctx)
             orient_logits = self.orient_head(ctx)
         else:
-            empty = ctx.new_zeros((ctx.shape[0], 0))
             device_logits = empty
             x_bin_logits  = empty
             y_bin_logits  = empty
             orient_logits = empty
 
+        if self.cfg.enable_route:
+            net_logits          = self.net_head(ctx)
+            route_layer_logits  = self.route_layer_head(ctx)
+            route_x_logits      = self.route_x_head(ctx)
+            route_y_logits      = self.route_y_head(ctx)
+            route_w_logits      = self.route_w_head(ctx)
+            route_h_logits      = self.route_h_head(ctx)
+        else:
+            net_logits = route_layer_logits = empty
+            route_x_logits = route_y_logits = empty
+            route_w_logits = route_h_logits = empty
+
         return ActionLogits(
-            kind   = self.kind_head(ctx),
-            target = target_logits,
-            edge   = self.edge_head(ctx),
-            sign_x = self.signx_head(ctx),
-            sign_y = self.signy_head(ctx),
-            mag    = self.mag_head(ctx),
-            device = device_logits,
-            x_bin  = x_bin_logits,
-            y_bin  = y_bin_logits,
-            orient = orient_logits,
+            kind         = self.kind_head(ctx),
+            target       = target_logits,
+            edge         = self.edge_head(ctx),
+            sign_x       = self.signx_head(ctx),
+            sign_y       = self.signy_head(ctx),
+            mag          = self.mag_head(ctx),
+            device       = device_logits,
+            x_bin        = x_bin_logits,
+            y_bin        = y_bin_logits,
+            orient       = orient_logits,
+            net          = net_logits,
+            route_layer  = route_layer_logits,
+            route_x_bin  = route_x_logits,
+            route_y_bin  = route_y_logits,
+            route_w_bin  = route_w_logits,
+            route_h_bin  = route_h_logits,
         )
 
     def forward(self, obs: dict[str, torch.Tensor]) -> ActionLogits:
