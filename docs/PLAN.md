@@ -174,11 +174,130 @@ gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
 
 ---
 
+## Where this sits vs the field (2025–2026 SOTA)
+
+Surveyed in May 2026 — see Sources at the bottom of this doc.
+
+**Closest related work:**
+
+- **AlphaChip** (Google DeepMind, Nature 2021 + 2024 addendum) — edge-based
+  GNN + CNN-on-canvas encoder, PPO over sequential macro placement on a
+  discretised grid. Trained on 20 prior TPU blocks then fine-tuned. Only
+  commercial RL-for-placement in production; macro-only. We're at
+  transistor level, which is harder and less explored.
+- **MaskPlace** (NeurIPS 2022) — drops the GNN; encodes state as
+  pixel masks (`wiremask`, `viewmask`, `positionmask`). CNN policy with
+  dense per-step HPWL-delta reward. Lesson: for small canvases the GNN
+  may be overkill.
+- **R-GCN + PPO for analog floorplanning** (DATE 2025, arXiv 2411.15212)
+  — closest to our use case. **Relational GCN** with typed edges
+  (`connected`, `h-align`, `v-align`, `h-symmetric`, `v-symmetric`).
+  PPO over sequential device placement. Reward = HPWL + symmetry +
+  area penalty.
+- **DTCO standard-cell RL** (MDPI Electronics 2025) — also closest. RL
+  for transistor placement on **poly-pitch grid**. Action space
+  snapped to poly multiples — the policy can't propose non-gate-aligned
+  positions by construction.
+- **MaskRegulate** (NeurIPS 2024) — RL only for *refinement* (swap /
+  shift) of an analytic placement, not from scratch. Reduces episode
+  length 10×. Structurally aligned with our REPAIR phase.
+- **DSO.ai / Cerebrus / NVIDIA hybrid-RL** — RL over *tool recipes*
+  (Innovus knobs), not placement actions. Different problem; validates
+  that direct RL on placement remains a research frontier.
+
+**Where we already match or exceed SOTA:**
+
+- ✅ Phase-aware reward (PLACE/ROUTE/REPAIR with different weights) —
+  more sophisticated than the single weighted-sum used in most papers
+- ✅ MaskablePPO + per-dim action masking (standard recipe; we have it)
+- ✅ Topology GNN conditioning (bipartite device↔net; everyone does this)
+- ✅ **Transitive electrical connectivity** via union-find — most
+  papers use HPWL proxies; we have actual net-completion signal
+- ✅ **Real klayout in the reward loop** — most analog/cell papers use
+  proxy DRC (RUDY, etc.); we run the actual tool
+- ✅ BC warm-start from rule-based demos — exactly the IBRL recipe
+  (arXiv 2311.02198), already wired through `train_bc --demos` →
+  `train_ppo --bc-init`
+
+**Where SOTA does things we don't yet:**
+
+Five concrete improvements, ranked by ROI. Each replaces a row in
+"What's next" below.
+
+1. **HPWL reward term** *(~1 hour, biggest impact)*. Every paper in
+   the field uses Δ-HPWL (half-perimeter wirelength) as a dense
+   per-step signal. We have `connectivity_delta` ("did you touch a
+   terminal") and `electrical_delta` ("is the net connected") but no
+   "are wires short" signal. Add `compute_hpwl_score(state, topology,
+   terminals)` returning negated sum of per-net bbox perimeters; add
+   `hpwl_delta` weight to `RewardConfig`. Files: `rl/env/connectivity.py`,
+   `rl/env/reward.py`, `rl/env/layout_env.py`.
+
+2. **Poly-pitch-aligned position bins** *(~1 hour, high impact)*. The
+   MDPI DTCO paper snaps x-bins to poly pitch — the policy *cannot*
+   produce a non-gate-aligned placement. Sky130 poly pitch ≈ 0.46 µm;
+   over a 4 µm cell, valid X positions become 9 discrete points.
+   Files: `rl/env/action_space.py:ActionSpace._bin_to_coord` — quantise
+   to nearest poly-pitch multiple from `rules.poly`.
+
+3. **Typed-edge GNN (R-GCN)** *(~half day, medium-high impact)*. The
+   DATE 2025 paper uses edge types (`connected`, `h-align`,
+   `v-align`, symmetry, abut) and aggregates per-type with separate
+   weight matrices. Our YAMLs already specify these via
+   `placement_logic` (`align_gate`, `abut_x`, `mirror_x`); the
+   alignment-reward consumes them but the GNN doesn't. Files:
+   `rl/topology/parser.py` (extract edge types from directives),
+   `rl/topology/encoder.py` (per-type weight matrices in `_GraphConv`).
+
+4. **True IBRL** *(~3 hours, medium impact)*. We currently use BC just
+   to initialise PPO weights, then discard the BC policy. IBRL
+   (arXiv 2311.02198) keeps the BC policy frozen and mixes its action
+   proposals into the rollout buffer at a decaying rate. PPO learns
+   from clean expert trajectories for longer. Files:
+   `rl/training/ppo_train.py` — add `bc_proposer` arg, sample BC
+   actions with probability β(step) decaying 0.5 → 0.
+
+5. **MaskPlace-style wiremask channel in observation** *(~half day,
+   speculative impact)*. State includes an (x_bins, y_bins) image
+   per net showing "if I place a terminal here, what's the HPWL
+   increment". For our 8×8 grid this is trivially small. Files:
+   `rl/env/observation.py` — add `wiremask` Dict entry; `policy/network.py`
+   — small CNN branch into trunk.
+
+**What we should NOT copy** (validated against our context):
+
+- **Pure CNN encoders** (MaskPlace) — overkill for transistor-level
+  layouts with ≤50 polygons; transformer over polys is fine.
+- **Decision-transformer offline RL** (ChiPFormer) — needs a large
+  trajectory corpus we don't have.
+- **DSO.ai/Cerebrus recipe optimisation** — solves a different problem
+  (tool-knob tuning, not placement).
+
+---
+
 ## What's next
 
-In rough decreasing order of impact. Pick one per session.
+In rough decreasing order of impact. Pick one per session. The first
+three items come from the SOTA comparison above; the rest were already
+on the roadmap.
 
-### 1. Real-DRC PPO training run (~hours, no new code)
+### 1. HPWL reward term (~1 hour) — SOTA gap
+
+See "Where SOTA does things we don't yet" #1. Smallest change with
+the biggest expected signal-density improvement.
+
+### 2. Poly-pitch-aligned position bins (~1 hour) — SOTA gap
+
+See "Where SOTA does things we don't yet" #2. Makes gate alignment a
+hard constraint instead of a learned soft one.
+
+### 3. Typed-edge GNN / R-GCN (~half day) — SOTA gap
+
+See "Where SOTA does things we don't yet" #3. Lets the topology GNN
+encode symmetry / alignment / abutment intent that today only enters
+through the reward.
+
+### 4. Real-DRC PPO training run (~hours, no new code)
 
 ```bash
 .venv/bin/python -m layout_gen.rl.scripts.train_ppo \
@@ -194,7 +313,7 @@ In rough decreasing order of impact. Pick one per session.
 20k steps × ~0.5 s/step ≈ 3 hours. Run overnight, then `generate.py`
 + `inspect_gds.py --strict` for the verdict.
 
-### 2. ROUTE demos from the synth router (~1 day)
+### 5. ROUTE demos from the synth router (~1 day)
 
 Currently `demo_extract.py` only emits PLACE actions. The synth pipeline
 also produces routing geometry; we can attribute each metal rect to a
@@ -208,7 +327,7 @@ Files to touch:
 - `rl/training/demo_dataset.py` — encode ROUTE labels (currently only
   PLACE samples are emitted).
 
-### 3. Multi-cell training (~1 day)
+### 6. Multi-cell training (~1 day)
 
 Right now `train_ppo --topology X` trains on one cell. Add
 `--topologies X,Y,Z` and a vec-env that rotates cells per episode.
@@ -222,7 +341,7 @@ Files to touch:
 - Maybe `rl/training/ppo_train.py` — the trainer is already vec-env
   capable; just need to pass a list of factories.
 
-### 4. LVS reward via magic (~1 day)
+### 7. LVS reward via magic (~1 day)
 
 Replace the geometric heuristics in `connectivity.py` with calls to a
 real LVS extractor. We have `layout_gen/lvs/magic_runner.py` from the
@@ -232,13 +351,22 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 5. Eval harness (~half day)
+### 8. Eval harness (~half day)
 
 `rl/scripts/eval.py` that runs N episodes, reports mean ep_rew,
 DRC-clean rate, alignment score, electrical score, inspector pass
 rate. Useful for tracking progress quantitatively.
 
-### 6. Decommission rule-based `synth/placer.py` + `synth/router.py`
+### 9. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
+
+See "Where SOTA does things we don't yet" #4.
+
+### 10. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
+
+See "Where SOTA does things we don't yet" #5. Speculative — try after
+the simpler items.
+
+### 11. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
 Only after RL reaches parity on all template cells. Long-term goal.
 
@@ -339,6 +467,36 @@ layout_gen/rl/
 │   └── train_ppo.py        ← PPO training CLI
 └── tests/                  ← 106 tests; keep green
 ```
+
+---
+
+## Sources (SOTA survey, May 2026)
+
+- [A graph placement methodology for fast chip design — Nature 2021](https://www.nature.com/articles/s41586-021-03544-w)
+- [Addendum: A graph placement methodology — Nature 2024](https://www.nature.com/articles/s41586-024-08032-5)
+- [How AlphaChip transformed computer chip design — DeepMind blog](https://deepmind.google/blog/how-alphachip-transformed-computer-chip-design/)
+- [google-research/circuit_training](https://github.com/google-research/circuit_training)
+- [That Chip Has Sailed (Markov, arXiv 2411.10053)](https://arxiv.org/pdf/2411.10053)
+- [Reevaluating Google's RL for IC Macro Placement — CACM](https://cacm.acm.org/research/reevaluating-googles-reinforcement-learning-for-ic-macro-placement/)
+- [TILOS MacroPlacement benchmarks](https://github.com/TILOS-AI-Institute/MacroPlacement)
+- [MaskPlace (arXiv 2211.13382)](https://arxiv.org/abs/2211.13382)
+- [ChiPFormer (ICML 2023)](https://proceedings.mlr.press/v202/lai23c/lai23c.pdf)
+- [Chip Placement with Deep RL (arXiv 2004.10746)](https://arxiv.org/pdf/2004.10746)
+- [RL Policy as Macro Regulator — NeurIPS 2024](https://proceedings.neurips.cc/paper_files/paper/2024/file/fe224a60b878e79d5b3d79d7f113f76b-Paper-Conference.pdf)
+- [Hierarchical RL for chip-macro placement — PRL 2024](https://www.sciencedirect.com/science/article/abs/pii/S0167865524000357)
+- [DeepPlace: joint placement & routing (arXiv 2111.00234)](https://arxiv.org/pdf/2111.00234)
+- [R-GCN + PPO for Analog IC Floorplanning — DATE 2025, arXiv 2411.15212](https://arxiv.org/abs/2411.15212)
+- [Enhancing Analog Floorplanning with Beam Search — arXiv 2505.05059](https://arxiv.org/abs/2505.05059)
+- [Fast ML Analog Layout via RL + Steiner Trees — arXiv 2405.16951](https://arxiv.org/abs/2405.16951)
+- [Standard Cell Layout in DTCO via RL — MDPI Electronics 2025](https://www.mdpi.com/2079-9292/14/3/529)
+- [MAGICAL: Silicon-Proven Open-Source Analog Layout](https://par.nsf.gov/servlets/purl/10356326)
+- [Survey of ML/DL in Analog IC Layout — MDPI 2025](https://www.mdpi.com/3042-5344/1/1/2)
+- [Imitation Bootstrapped RL — IBRL (arXiv 2311.02198)](https://arxiv.org/pdf/2311.02198v3)
+- [Benchmarking End-to-End AI Chip Placement (arXiv 2407.15026)](https://arxiv.org/html/2407.15026v2)
+- [BBOPlace-Bench (arXiv 2510.23472)](https://arxiv.org/html/2510.23472)
+- [Synopsys DSO.ai](https://www.synopsys.com/ai/ai-powered-eda/dso-ai.html)
+- [NVIDIA Hybrid RL for EDA tuning — TODAES 2025](https://research.nvidia.com/labs/electronic-design-automation/papers/thomas_RL-tuning_todaes25.pdf)
+- [ML for Macro Placement: The Saga (Iyer)](https://vighneshiyer.com/research/eda-cad-vlsi/machine-learning-for-macro-placement-alphachip-the-saga/)
 
 ---
 
