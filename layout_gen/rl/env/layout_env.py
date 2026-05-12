@@ -54,8 +54,9 @@ from layout_gen.rl.env.observation  import (
     build_observation, make_observation_space,
 )
 from layout_gen.rl.env.place_action import (
-    TransistorCache, place_device,
+    TransistorCache, place_device_full,
 )
+from layout_gen.rl.env.connectivity import compute_connectivity_score
 from layout_gen.rl.env.reward       import (
     RewardConfig, RewardBreakdown, compute_reward,
 )
@@ -257,6 +258,12 @@ class LayoutEnv(gym.Env):
         self._placed_mask:  np.ndarray = np.zeros(device_cap, dtype=bool)
         self._route_step_count: int = 0
         self._routed_mask: np.ndarray = np.zeros(net_cap, dtype=bool)
+        # Per-terminal global positions populated by PLACE actions:
+        #   {(device_idx, terminal_name): (x_um, y_um, layer)}
+        # Used by the connectivity reward to score whether route segments
+        # actually touch the terminals of the net they claim.
+        self._terminals: dict[tuple[int, str],
+                              tuple[float, float, str]] = {}
 
     # ── Gymnasium API ────────────────────────────────────────────────────────
 
@@ -278,6 +285,7 @@ class LayoutEnv(gym.Env):
         self._routed_mask = np.zeros(self.net_cap, dtype=bool)
         self._place_step_count = 0
         self._route_step_count = 0
+        self._terminals = {}
 
         if self._phase in ("place", "route"):
             # Generative episodes start with an empty layout. PLACE
@@ -323,6 +331,7 @@ class LayoutEnv(gym.Env):
 
         self._step_count += 1
         before = self._violations
+        connectivity_before = self._connectivity_score()
 
         env_action = self._action_helper.decode(action, self._last_rid_map)
 
@@ -363,6 +372,8 @@ class LayoutEnv(gym.Env):
         after = list(self._drc.run(self._state))
         self._violations = after
 
+        connectivity_after = self._connectivity_score()
+
         rb = compute_reward(
             violations_before=before,
             violations_after=after,
@@ -370,6 +381,8 @@ class LayoutEnv(gym.Env):
             action_valid=action_valid,
             phase=self._phase,
             config=self.reward_cfg,
+            connectivity_before=connectivity_before,
+            connectivity_after=connectivity_after,
         )
 
         # Phase transitions: PLACE → ROUTE (or → REPAIR if route disabled),
@@ -432,7 +445,7 @@ class LayoutEnv(gym.Env):
         if device.w_um <= 0 or device.l_um <= 0:
             return False
         try:
-            place_device(
+            _, ports = place_device_full(
                 self._state, device,
                 x_um=env_action.x_um,
                 y_um=env_action.y_um,
@@ -442,7 +455,24 @@ class LayoutEnv(gym.Env):
         except Exception:
             return False
         self._placed_mask[d_idx] = True
+        # Record terminal global positions for the connectivity reward.
+        for term_name, (px, py, layer) in ports.items():
+            self._terminals[(d_idx, term_name)] = (px, py, layer)
         return True
+
+    def _connectivity_score(self) -> float:
+        """Per-net connectivity score against the cached topology.
+
+        Returns 0 when the env has no topology graph (e.g. REPAIR-only
+        runs); otherwise sums the per-net "fraction of terminals
+        touched by a wire on the right net" — bounded by
+        ``topology.n_nets``.
+        """
+        if self._topology_graph is None:
+            return 0.0
+        return compute_connectivity_score(
+            self._state, self._topology_graph, self._terminals,
+        )
 
     def _all_devices_placed(self) -> bool:
         if self._topology_graph is None:
@@ -525,6 +555,7 @@ class LayoutEnv(gym.Env):
             "phase":            self._phase,
             "n_devices_placed": int(self._placed_mask.sum()),
             "n_nets_routed":    int(self._routed_mask.sum()),
+            "connectivity":     self._connectivity_score(),
             "action_mask":      mask,
             "drc_cache_stats":  self._drc.stats(),
         }

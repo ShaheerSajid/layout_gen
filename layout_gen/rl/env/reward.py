@@ -64,6 +64,15 @@ class RewardConfig:
     place_success: float = 1.0
     route_success: float = 0.5
 
+    # ── Connectivity ──────────────────────────────────────────────────
+    # Multiplier on Δ(per-net-fraction of terminals touched). With
+    # connectivity_score in [0, n_nets], a Δ of +1.0 means "an entire
+    # net's worth of terminals just got connected by this action".
+    # Most useful in ROUTE phase but applied across all phases (a
+    # PLACE action that lands a device at the right spot for an
+    # already-routed net should count too).
+    connectivity_delta: float = 2.0
+
     # ── Common terms ──────────────────────────────────────────────────
     step:       float = 0.05
     terminal:   float = 5.0     # only fires in REPAIR phase
@@ -81,32 +90,35 @@ class RewardConfig:
 @dataclass
 class RewardBreakdown:
     """Per-component reward returned alongside the scalar."""
-    drc_delta:     float = 0.0
-    value_delta:   float = 0.0
-    step:          float = 0.0
-    terminal:      float = 0.0
-    invalid:       float = 0.0
-    no_change:     float = 0.0
-    place_success: float = 0.0
-    route_success: float = 0.0
+    drc_delta:          float = 0.0
+    value_delta:        float = 0.0
+    step:               float = 0.0
+    terminal:           float = 0.0
+    invalid:            float = 0.0
+    no_change:          float = 0.0
+    place_success:      float = 0.0
+    route_success:      float = 0.0
+    connectivity_delta: float = 0.0
 
     @property
     def total(self) -> float:
         return (self.drc_delta + self.value_delta + self.step
                 + self.terminal + self.invalid + self.no_change
-                + self.place_success + self.route_success)
+                + self.place_success + self.route_success
+                + self.connectivity_delta)
 
     def to_dict(self) -> dict[str, float]:
         return {
-            "drc_delta":     self.drc_delta,
-            "value_delta":   self.value_delta,
-            "step":          self.step,
-            "terminal":      self.terminal,
-            "invalid":       self.invalid,
-            "no_change":     self.no_change,
-            "place_success": self.place_success,
-            "route_success": self.route_success,
-            "total":         self.total,
+            "drc_delta":          self.drc_delta,
+            "value_delta":        self.value_delta,
+            "step":               self.step,
+            "terminal":           self.terminal,
+            "invalid":            self.invalid,
+            "no_change":          self.no_change,
+            "place_success":      self.place_success,
+            "route_success":      self.route_success,
+            "connectivity_delta": self.connectivity_delta,
+            "total":              self.total,
         }
 
 
@@ -120,12 +132,14 @@ def _sum_values(viols: Sequence[DRCViolation]) -> float:
 
 def compute_reward(
     *,
-    violations_before: Sequence[DRCViolation],
-    violations_after:  Sequence[DRCViolation],
-    state_changed:     bool,
-    action_valid:      bool,
-    phase:             str = "repair",
-    config:            RewardConfig | None = None,
+    violations_before:    Sequence[DRCViolation],
+    violations_after:     Sequence[DRCViolation],
+    state_changed:        bool,
+    action_valid:         bool,
+    phase:                str = "repair",
+    config:               RewardConfig | None = None,
+    connectivity_before:  float = 0.0,
+    connectivity_after:   float = 0.0,
 ) -> RewardBreakdown:
     """Compute reward from before/after violation lists, action flags,
     and the active episode phase.
@@ -135,6 +149,12 @@ def compute_reward(
     phase :
         ``"place"``, ``"route"``, or ``"repair"``. Drives the per-phase
         DRC weight and which success bonus (if any) fires.
+    connectivity_before, connectivity_after :
+        Per-net connectivity score (see :mod:`layout_gen.rl.env.connectivity`)
+        sampled before and after the action. The Δ between them
+        contributes ``connectivity_delta * (after - before)`` to the
+        reward — strongly rewards ROUTE actions that newly touch a
+        terminal of the net they claim.
     """
     cfg = config or RewardConfig()
     rb  = RewardBreakdown()
@@ -163,6 +183,10 @@ def compute_reward(
             rb.place_success = cfg.place_success
         elif phase == "route":
             rb.route_success = cfg.route_success
+
+    rb.connectivity_delta = (
+        cfg.connectivity_delta * (connectivity_after - connectivity_before)
+    )
 
     if not action_valid:
         rb.invalid = -cfg.invalid

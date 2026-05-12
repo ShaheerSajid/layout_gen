@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from layout_gen.synth.geo.state import LayoutState, Rect
-from layout_gen.transistor import draw_transistor
+from layout_gen.transistor import draw_transistor, transistor_geom
 
 from layout_gen.rl.topology.parser import DeviceNode
 
@@ -75,6 +75,19 @@ def orient_rect(
     return nx0, ny0, nx1, ny1
 
 
+def orient_point(x: float, y: float, orientation: str) -> tuple[float, float]:
+    """Transform a single point by *orientation* about the origin.
+
+    Used to map a transistor port's local coordinates into the
+    post-orient frame; :func:`place_device` then translates to global.
+    """
+    if orientation == "R0":   return (x, y)
+    if orientation == "MX":   return (x, -y)
+    if orientation == "MY":   return (-x, y)
+    if orientation == "R180": return (-x, -y)
+    raise ValueError(f"Unknown orientation: {orientation!r}")
+
+
 # ── Rect template ────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -87,6 +100,20 @@ class _RectTemplate:
     y1:         float
     net:        str = ""
     shape_type: str = ""
+
+
+@dataclass(frozen=True)
+class _PortTemplate:
+    """Per-terminal access point in the device's local coordinate frame.
+
+    ``layer`` is the logical layer the port lives on (li1 for source/drain,
+    poly for the gate). Connectivity scoring uses these positions to
+    decide whether a routing rect actually touches a terminal.
+    """
+    name:  str        # "G" / "S" / "D"
+    x:     float
+    y:     float
+    layer: str
 
 
 # ── Cache ────────────────────────────────────────────────────────────────────
@@ -108,7 +135,8 @@ class TransistorCache:
 
     def __init__(self, rules) -> None:
         self._rules = rules
-        self._cache: dict[tuple, list[_RectTemplate]] = {}
+        # Each entry is (rect_templates, port_templates).
+        self._cache: dict[tuple, tuple[list[_RectTemplate], list[_PortTemplate]]] = {}
 
     def get(
         self,
@@ -117,6 +145,16 @@ class TransistorCache:
         l_um:        float,
         fingers:     int = 0,
     ) -> list[_RectTemplate]:
+        return self.get_full(device_type, w_um, l_um, fingers)[0]
+
+    def get_full(
+        self,
+        device_type: str,
+        w_um:        float,
+        l_um:        float,
+        fingers:     int = 0,
+    ) -> tuple[list[_RectTemplate], list[_PortTemplate]]:
+        """Returns (rect templates, port templates) for the device variant."""
         key = (device_type, round(w_um, 6), round(l_um, 6), int(fingers))
         cached = self._cache.get(key)
         if cached is not None:
@@ -131,7 +169,7 @@ class TransistorCache:
         # LayoutState.from_component to reuse the layer-mapping logic
         # already validated by the synth pipeline.
         tmp = LayoutState.from_component(comp, self._rules)
-        templates = [
+        rect_templates = [
             _RectTemplate(
                 layer=r.layer,
                 x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1,
@@ -139,8 +177,27 @@ class TransistorCache:
             )
             for r in tmp
         ]
-        self._cache[key] = templates
-        return templates
+
+        # Port positions are derivable from TransistorGeom; we don't try to
+        # extract them from the gdsfactory Component (whose Port API has
+        # changed shape across releases).
+        geom = transistor_geom(w_um, l_um, device_type, self._rules)
+        endcap = self._rules.poly["endcap_over_diff_um"]
+        diff_y_mid = endcap + geom.w_finger_um / 2
+        # First-finger gate centre.
+        gate_x = geom.sd_length_um + geom.l_um / 2
+        # Source = leftmost S/D; drain = rightmost.
+        source_x = geom.sd_length_um / 2
+        drain_x  = geom.n_fingers * (geom.sd_length_um + geom.l_um) \
+                   + geom.sd_length_um / 2
+        port_templates = [
+            _PortTemplate(name="G", x=gate_x,   y=geom.total_y_um, layer="poly"),
+            _PortTemplate(name="S", x=source_x, y=diff_y_mid,      layer="li1"),
+            _PortTemplate(name="D", x=drain_x,  y=diff_y_mid,      layer="li1"),
+        ]
+
+        self._cache[key] = (rect_templates, port_templates)
+        return rect_templates, port_templates
 
 
 # ── Placement ────────────────────────────────────────────────────────────────
@@ -157,42 +214,45 @@ def place_device(
 ) -> list[Rect]:
     """Materialise *device* into *state* at ``(x_um, y_um)`` with *orientation*.
 
-    Parameters
-    ----------
-    state :
-        Target :class:`LayoutState`. Rects are appended via
-        :meth:`LayoutState.add`, which assigns fresh rids.
-    device :
-        :class:`DeviceNode` from the cell's topology graph. Provides
-        ``device_type``, ``w_um``, ``l_um``, ``fingers``.
-    x_um, y_um :
-        Origin offset applied after orientation. The device's local
-        ``(0, 0)`` lands at this point in cell coordinates.
-    orientation :
-        One of :data:`ORIENTATIONS`.
-    cache :
-        :class:`TransistorCache` (constructed once per env).
-    net_lookup :
-        Optional mapping ``terminal_name → net_name`` for tagging the
-        new rects with their logical net. Currently passed-through to
-        ``shape_type`` annotations in a Phase 4-part-2 stub manner —
-        proper terminal-to-rect attribution lives in the routing phase.
+    Returns the newly-added rects. Use :func:`place_device_full` if you
+    also need the per-terminal global positions (needed by the
+    connectivity reward in :mod:`layout_gen.rl.env.connectivity`).
+    """
+    return place_device_full(
+        state, device, x_um=x_um, y_um=y_um,
+        orientation=orientation, cache=cache, net_lookup=net_lookup,
+    )[0]
+
+
+def place_device_full(
+    state:       LayoutState,
+    device:      DeviceNode,
+    *,
+    x_um:        float,
+    y_um:        float,
+    orientation: str,
+    cache:       TransistorCache,
+    net_lookup:  dict[str, str] | None = None,
+) -> tuple[list[Rect], dict[str, tuple[float, float, str]]]:
+    """Like :func:`place_device` but also returns per-terminal positions.
 
     Returns
     -------
-    list[Rect] :
-        The newly-added rects (in insertion order). Useful for the
-        env to record what was placed this step.
+    rects :
+        Newly-added rectangles (insertion order).
+    ports :
+        ``{terminal_name: (x_um, y_um, layer)}`` in cell-global
+        coordinates after orientation + translation.
     """
     if orientation not in _ORIENT_INDEX:
         raise ValueError(f"Unknown orientation: {orientation!r}")
 
-    templates = cache.get(
+    rect_templates, port_templates = cache.get_full(
         device.device_type, device.w_um, device.l_um, device.fingers,
     )
 
     new_rects: list[Rect] = []
-    for t in templates:
+    for t in rect_templates:
         ox0, oy0, ox1, oy1 = orient_rect(t.x0, t.y0, t.x1, t.y1, orientation)
         r = state.add(
             layer=t.layer,
@@ -202,7 +262,12 @@ def place_device(
             shape_type=t.shape_type,
         )
         new_rects.append(r)
-    return new_rects
+
+    ports: dict[str, tuple[float, float, str]] = {}
+    for p in port_templates:
+        px, py = orient_point(p.x, p.y, orientation)
+        ports[p.name] = (px + x_um, py + y_um, p.layer)
+    return new_rects, ports
 
 
 def orientation_index(orientation: str) -> int:
@@ -215,7 +280,8 @@ def orientation_from_index(idx: int) -> str:
 
 __all__ = [
     "ORIENTATIONS", "N_ORIENTATIONS",
-    "orient_rect", "orientation_index", "orientation_from_index",
+    "orient_rect", "orient_point",
+    "orientation_index", "orientation_from_index",
     "TransistorCache",
-    "place_device",
+    "place_device", "place_device_full",
 ]
