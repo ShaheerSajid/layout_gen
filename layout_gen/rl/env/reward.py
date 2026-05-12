@@ -73,6 +73,13 @@ class RewardConfig:
     # already-routed net should count too).
     connectivity_delta: float = 2.0
 
+    # ── Placement-intent alignment ────────────────────────────────────
+    # Multiplier on Δ(sum-of-clipped-linears against the YAML's
+    # placement_logic directives). Pulls PLACE actions toward gate-
+    # aligned / abutted layouts that match the cell template's
+    # intended structure rather than discovering an axis from scratch.
+    alignment_delta: float = 1.5
+
     # ── Common terms ──────────────────────────────────────────────────
     step:       float = 0.05
     terminal:   float = 5.0     # only fires in REPAIR phase
@@ -99,13 +106,14 @@ class RewardBreakdown:
     place_success:      float = 0.0
     route_success:      float = 0.0
     connectivity_delta: float = 0.0
+    alignment_delta:    float = 0.0
 
     @property
     def total(self) -> float:
         return (self.drc_delta + self.value_delta + self.step
                 + self.terminal + self.invalid + self.no_change
                 + self.place_success + self.route_success
-                + self.connectivity_delta)
+                + self.connectivity_delta + self.alignment_delta)
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -118,6 +126,7 @@ class RewardBreakdown:
             "place_success":      self.place_success,
             "route_success":      self.route_success,
             "connectivity_delta": self.connectivity_delta,
+            "alignment_delta":    self.alignment_delta,
             "total":              self.total,
         }
 
@@ -140,6 +149,8 @@ def compute_reward(
     config:               RewardConfig | None = None,
     connectivity_before:  float = 0.0,
     connectivity_after:   float = 0.0,
+    alignment_before:     float = 0.0,
+    alignment_after:      float = 0.0,
 ) -> RewardBreakdown:
     """Compute reward from before/after violation lists, action flags,
     and the active episode phase.
@@ -186,6 +197,9 @@ def compute_reward(
 
     rb.connectivity_delta = (
         cfg.connectivity_delta * (connectivity_after - connectivity_before)
+    )
+    rb.alignment_delta = (
+        cfg.alignment_delta * (alignment_after - alignment_before)
     )
 
     if not action_valid:

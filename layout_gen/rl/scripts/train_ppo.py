@@ -115,21 +115,24 @@ def _build_real_env_factory(args, env_seed: int):
         topo_global = enc.encode_graphs([graph]).global_embedding[0].cpu().numpy()
     topo_global = topo_global.astype(np.float32)
 
-    if args.real_drc:
+    if args.no_drc:
+        print("[warn] --no-drc set; using fake spacing-only DRC. PPO "
+              "will train against zero-violation lies for most steps.",
+              file=sys.stderr)
+        def _drc_factory():
+            return _DirectFakeDRC(threshold_um=0.20)
+    else:
         from layout_gen.drc import get_runner
         from layout_gen.rl.env.runner import CachedDRC
         runner = get_runner(rules)
         if runner is None:
-            raise RuntimeError(
-                "--real-drc was requested but no DRC tool was found "
-                "(install klayout or set KLAYOUT_BIN/MAGIC_BIN)."
+            raise SystemExit(
+                "error: no DRC tool found. Install klayout or magic, or "
+                "set KLAYOUT_BIN / MAGIC_BIN. Pass --no-drc to bypass "
+                "(not recommended)."
             )
-
         def _drc_factory():
             return CachedDRC(runner, rules, cell_name=args.topology)
-    else:
-        def _drc_factory():
-            return _DirectFakeDRC(threshold_um=0.20)
 
     cache = TransistorCache(rules)
 
@@ -158,6 +161,7 @@ def _build_real_env_factory(args, env_seed: int):
             route_w_bins=args.route_size_bins,
             route_h_bins=args.route_size_bins,
             max_route_steps=args.max_route_steps,
+            placement_directives=template.placement_directives,
         )
     return _make, graph
 
@@ -212,8 +216,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mag-bins",   type=int, default=8)
 
     # Real / topology mode
-    p.add_argument("--real-drc", action="store_true",
-                   help="Use klayout / magic for DRC (requires --topology).")
+    p.add_argument("--no-drc", action="store_true",
+                   help="OPT OUT of real DRC and use the fake spacing "
+                        "checker. Default is to dispatch to the auto-"
+                        "detected klayout/magic runner — fake DRC "
+                        "trains the policy against zero-violation lies "
+                        "and is a smoke-test convenience only.")
     p.add_argument("--enable-place", action="store_true",
                    help="Turn on the PLACE phase.")
     p.add_argument("--enable-route", action="store_true",
@@ -236,8 +244,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--device", type=str, default="cpu")
     args = p.parse_args(argv)
 
-    if args.real_drc and not args.topology:
-        raise SystemExit("error: --real-drc requires --topology <name>")
+    # Real DRC needs a real cell topology to run on.
+    if not args.synthetic and not args.topology:
+        raise SystemExit("error: pass --synthetic or --topology <name>")
 
     layout_cfg = LayoutPolicyConfig(
         poly_cap=args.poly_cap,

@@ -57,6 +57,7 @@ from layout_gen.rl.env.place_action import (
     TransistorCache, place_device_full,
 )
 from layout_gen.rl.env.connectivity import compute_connectivity_score
+from layout_gen.rl.env.placement_intent import score_alignment
 from layout_gen.rl.env.reward       import (
     RewardConfig, RewardBreakdown, compute_reward,
 )
@@ -140,6 +141,8 @@ class LayoutEnv(gym.Env):
         route_w_bins:     int  = DEFAULT_SIZE_BINS,
         route_h_bins:     int  = DEFAULT_SIZE_BINS,
         max_route_steps:  int  = 0,
+        # ── Placement-intent reward ────────────────────────────────────
+        placement_directives: list | None = None,
     ) -> None:
         super().__init__()
         self._drc = drc
@@ -264,6 +267,10 @@ class LayoutEnv(gym.Env):
         # actually touch the terminals of the net they claim.
         self._terminals: dict[tuple[int, str],
                               tuple[float, float, str]] = {}
+        # YAML placement_logic directives — drive the alignment_delta
+        # reward term so PLACE learns the cell's intended axis (e.g.
+        # gates aligned vertically for an inverter).
+        self._placement_directives: list = list(placement_directives or [])
 
     # ── Gymnasium API ────────────────────────────────────────────────────────
 
@@ -332,6 +339,7 @@ class LayoutEnv(gym.Env):
         self._step_count += 1
         before = self._violations
         connectivity_before = self._connectivity_score()
+        alignment_before    = self._alignment_score()
 
         env_action = self._action_helper.decode(action, self._last_rid_map)
 
@@ -373,6 +381,7 @@ class LayoutEnv(gym.Env):
         self._violations = after
 
         connectivity_after = self._connectivity_score()
+        alignment_after    = self._alignment_score()
 
         rb = compute_reward(
             violations_before=before,
@@ -383,6 +392,8 @@ class LayoutEnv(gym.Env):
             config=self.reward_cfg,
             connectivity_before=connectivity_before,
             connectivity_after=connectivity_after,
+            alignment_before=alignment_before,
+            alignment_after=alignment_after,
         )
 
         # Phase transitions: PLACE → ROUTE (or → REPAIR if route disabled),
@@ -474,6 +485,18 @@ class LayoutEnv(gym.Env):
             self._state, self._topology_graph, self._terminals,
         )
 
+    def _alignment_score(self) -> float:
+        """Sum-of-clipped-linears score against the YAML's
+        ``placement_logic`` directives. Zero when the env has no
+        topology / no directives loaded."""
+        if self._topology_graph is None or not self._placement_directives:
+            return 0.0
+        return score_alignment(
+            self._topology_graph,
+            self._placement_directives,
+            self._terminals,
+        )
+
     def _all_devices_placed(self) -> bool:
         if self._topology_graph is None:
             return True
@@ -556,6 +579,7 @@ class LayoutEnv(gym.Env):
             "n_devices_placed": int(self._placed_mask.sum()),
             "n_nets_routed":    int(self._routed_mask.sum()),
             "connectivity":     self._connectivity_score(),
+            "alignment":        self._alignment_score(),
             "action_mask":      mask,
             "drc_cache_stats":  self._drc.stats(),
         }

@@ -32,6 +32,7 @@ def test_inspector_reports_nmos_and_pmos_after_generate(tmp_path: Path):
         "--net-cap", "8",
         "--route-size-bins", "4",
         "--seed", "42",
+        "--no-drc",         # tests use the no-op DRC for speed
         "--quiet",
     ])
     assert rc == 0, f"generate.main failed: {rc}"

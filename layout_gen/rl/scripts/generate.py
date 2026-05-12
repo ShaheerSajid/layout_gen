@@ -68,16 +68,20 @@ class _NoOpDRC:
 
 
 def _build_drc(args, rules):
-    if args.real_drc:
-        from layout_gen.drc import get_runner
-        from layout_gen.rl.env.runner import CachedDRC
-        runner = get_runner(rules)
-        if runner is None:
-            print("[warn] --real-drc requested but no DRC tool found; "
-                  "falling back to no-op DRC", file=sys.stderr)
-            return _NoOpDRC()
-        return CachedDRC(runner, rules, cell_name=args.cell_name or "synth")
-    return _NoOpDRC()
+    if args.no_drc:
+        print("[warn] --no-drc set; using no-op DRC. Generated geometry "
+              "will not be checked against any rules.", file=sys.stderr)
+        return _NoOpDRC()
+    from layout_gen.drc import get_runner
+    from layout_gen.rl.env.runner import CachedDRC
+    runner = get_runner(rules)
+    if runner is None:
+        raise SystemExit(
+            "error: no DRC tool found. Install klayout or magic, or set "
+            "KLAYOUT_BIN / MAGIC_BIN. Pass --no-drc to bypass (not "
+            "recommended; fake DRC produces misleading runs)."
+        )
+    return CachedDRC(runner, rules, cell_name=args.cell_name or "synth")
 
 
 # ── Cell-bbox helper ─────────────────────────────────────────────────────────
@@ -198,9 +202,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--d-token", type=int, default=64)
     p.add_argument("--d-trunk", type=int, default=128)
 
-    p.add_argument("--real-drc", action="store_true",
-                   help="Use a real klayout/magic DRC runner instead of "
-                        "the no-op stub.")
+    p.add_argument("--no-drc", action="store_true",
+                   help="OPT OUT of real DRC and use the no-op stub. "
+                        "Default behaviour is to dispatch to the auto-"
+                        "detected klayout/magic runner — fake DRC "
+                        "produces misleading zero-violation runs and "
+                        "should only be used for pipeline smoke testing.")
     p.add_argument("--deterministic", choices=("auto", "yes", "no"),
                    default="auto",
                    help="Sampling mode for the policy. 'auto' = "
@@ -272,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         route_w_bins=args.route_size_bins,
         route_h_bins=args.route_size_bins,
         max_route_steps=args.max_route_steps,
+        placement_directives=template.placement_directives,
     )
 
     # ── Policy ───────────────────────────────────────────────────────────

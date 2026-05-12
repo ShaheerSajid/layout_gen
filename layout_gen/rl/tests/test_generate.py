@@ -27,6 +27,7 @@ def test_generate_inverter_smoke(tmp_path: Path):
         "--max-steps", "10",
         "--device-cap", "8",
         "--position-bins", "8",
+        "--no-drc",         # tests use the no-op DRC for speed
         "--quiet",
     ])
     assert rc == 0, f"generate.main returned {rc}"
