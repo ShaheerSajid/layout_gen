@@ -169,6 +169,14 @@ def main(argv: list[str] | None = None) -> int:
     # Topology / cell sizing
     p.add_argument("--device-cap",  type=int, default=16)
     p.add_argument("--position-bins", type=int, default=16)
+    p.add_argument("--mag-bins", type=int, default=16,
+                   help="REPAIR-phase magnitude bin count. Must match the "
+                        "value used at training time when loading a "
+                        "checkpoint, otherwise MaskablePPO.load will reject "
+                        "the action-space mismatch.")
+    p.add_argument("--poly-cap",   type=int, default=128)
+    p.add_argument("--viol-cap",   type=int, default=32)
+    p.add_argument("--target-cap", type=int, default=128)
     p.add_argument("--max-place-steps", type=int, default=8)
     p.add_argument("--max-steps", type=int, default=32)
 
@@ -247,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     # ── Env ──────────────────────────────────────────────────────────────
     env = LayoutEnv(
         drc=drc,
-        poly_cap=128, viol_cap=32, target_cap=128, mag_bins=16,
+        poly_cap=args.poly_cap, viol_cap=args.viol_cap,
+        target_cap=args.target_cap, mag_bins=args.mag_bins,
         max_steps=args.max_steps,
         enable_place=True,
         topology_graph=graph, transistor_cache=cache,
@@ -267,7 +276,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Policy ───────────────────────────────────────────────────────────
     layout_cfg = LayoutPolicyConfig(
-        poly_cap=128, viol_cap=32, target_cap=128, mag_bins=16,
+        poly_cap=args.poly_cap, viol_cap=args.viol_cap,
+        target_cap=args.target_cap, mag_bins=args.mag_bins,
         d_token=args.d_token, d_trunk=args.d_trunk,
         n_layers=2, n_heads=4, dim_ff=128,
         use_topology=True, topology_dim=args.topology_dim,
