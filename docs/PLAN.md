@@ -180,10 +180,14 @@ gate-aligned layouts.
 | 5.12: IBRL via BC distillation (β-decayed KL-to-BC in PPO loss; last SOTA gap) | ✅ | this session |
 | 5.13: ablation harness (`ablation.py` — train N variants → eval each → diff table + CSV) | ✅ | this session |
 | 5.14: env-side no-stacking guard in `_apply_place` (rejects PLACE within ε of an existing device origin) | ✅ | this session |
-| 5.15: full-template demo extraction (10 YAMLs vs 3) — bumps demo corpus 26 → 119 actions | ✅ | this session |
-| 5.16: sky130 SCL demo miner (`mine_scl_demos.py`) — reverse-engineers PLACE actions from real stdcells | ✅ | this session |
+| 5.15: full-template demo extraction (10 YAMLs vs 3) — bumps demo corpus 26 → 119 actions | ✅ | prev session |
+| 5.16: sky130 SCL demo miner (`mine_scl_demos.py`) — reverse-engineers PLACE actions from real stdcells | ✅ | prev session |
+| 5.17: CLI position-bins default 8 → 16; LVS plumbed through train_ppo/eval/generate; SPICE-ref auto-emit | ✅ | this session |
+| 5.18: row-alignment reward (`compute_row_score` + `RewardConfig.row_delta=1.0`, driven by `device.device_type`) | ✅ | this session |
+| 5.19: strict row-alignment env guard (`--strict-row-alignment` rejects PLACE w/ wrong-row y) | ✅ | this session |
+| 5.20: RL_GUIDE.md teaching doc (concept-by-concept walkthrough tied to code) | ✅ | this session |
 
-**Test count:** 165 passing.
+**Test count:** 173 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -203,7 +207,53 @@ stacked-device layout because all expected layers are present
 (multiple devices at the same coords contribute to one cluster).
 The new inspector check (``_stacked_device_count``) flags this.
 
-**Reproduce**:
+**Real-DRC + GPU iteration (2026-05-13)**:
+
+10k PPO timesteps on the same 3 cells, real klayout in the reward
+loop, GPU policy. ``ep_rew_mean`` rose 5.3 → 11.5 over training,
+suggesting healthy learning. But the deterministic-rollout output
+collapsed to *one device per cell*:
+
+```
+cell        polys  inspect                          lvs
+inverter    13     0 NMOS, 0 PMOS, 1 cluster        DIRTY
+nand2       13     0 NMOS, 0 PMOS, 1 cluster        DIRTY
+nor2        13     0 NMOS, 0 PMOS, 1 cluster        DIRTY
+```
+
+Diagnostic from per-step trace (one device placed, then PLACE
+rejected 3× before phase transition):
+
+```
+step 1 place_device  device=0 x=0.230 y=0.062  valid=True
+step 2 place_device  device=1 x=0.230 y=0.062  valid=False   ← collision
+step 3 place_device  device=1 x=0.230 y=0.062  valid=False
+step 4 place_device  device=1 x=0.230 y=0.062  valid=False   ← phase transitions
+```
+
+The action mask correctly picks ``device_idx=1`` (PMOS) on step 2,
+but the (x, y) heads emit the same bin as step 1 because they are
+*factored independent* of the device head. The no-stacking guard
+rejects the duplicate, the policy never recovers.
+
+This is RL_GUIDE §9.1 — factored-action-dim coupling — observed
+directly in production. Mitigations queued, in order of expected
+ROI:
+
+  1. **strict-row-alignment** (just shipped 5.19) — rejects PMOS
+     placements in the bottom half so the policy is forced to learn
+     y-on-device coupling. Follow-up training run launched.
+  2. **Couple position to device** via an auto-regressive head
+     decomposition: sample ``device`` first, then sample
+     ``(x_bin, y_bin)`` conditioned on the chosen device. Requires
+     a custom action distribution; ~half-day of work. (RL_GUIDE
+     §9.1 option C.)
+  3. **Joint device-position embedding** — a small MLP that maps
+     ``(device_idx, x_bin, y_bin) → logit`` so the policy directly
+     models the joint distribution. Larger output head but no
+     architectural surgery on PPO.
+
+**Reproduce baseline**:
 
 ```bash
 .venv/bin/python -m layout_gen.rl.scripts.extract_demos \
@@ -323,33 +373,27 @@ In rough decreasing order of impact. Pick one per session. All
 remaining SOTA-gap items are batched at the bottom; the items below
 are the next concrete things to ship.
 
-### 1. Real-DRC PPO training run (~hours, no new code)
+### 1. Couple position to device (RL_GUIDE §9.1 option C, ~half day)
 
-```bash
-.venv/bin/python -m layout_gen.rl.scripts.train_ppo \
-    --topology inverter --enable-place --enable-route \
-    --bc-init checkpoints/bc_inv.pt \
-    --total-timesteps 20000 \
-    --max-place-steps 4 --max-route-steps 6 --max-steps 16 \
-    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
-    --mag-bins 8 --ent-coef 0.005 \
-    --out checkpoints/ppo_inv_realdrc.zip
-```
+**Highest-leverage item.** The diagnostic in "Real-DRC + GPU
+iteration" above shows the factored-action policy can pick the
+right device on step 2 but emits the same (x, y) bins as step 1 —
+no learned coupling. Strict-row-alignment (5.19) is a partial fix
+(forces y-on-device) but doesn't help x.
 
-20k steps × ~0.5 s/step ≈ 3 hours. Run overnight, then `generate.py`
-+ `inspect_gds.py --strict` for the verdict.
+Path: implement an auto-regressive action distribution. Sample
+``device_idx`` from the device head, then condition the (x_bin,
+y_bin, orient) heads on the sampled device via a one-hot
+concat. Same total parameter count; bigger structural fix.
 
-### 2. LVS reward via magic (~1 day)
+Alternative (RL_GUIDE §9.1 option E): a joint
+``(device, x_bin, y_bin) → logit`` MLP. Larger head but no PPO
+distribution surgery.
 
-Replace the geometric heuristics in `connectivity.py` with calls to a
-real LVS extractor. We have `layout_gen/lvs/magic_runner.py` from the
-pre-RL work.
+Files to touch: `rl/policy/network.py` (heads),
+`rl/policy/sb3.py` (custom distribution).
 
-Files to touch:
-- `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
-- `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
-
-### 3. Richer BC corpus (paths a + c done; b open)
+### 2. Richer BC corpus (paths a + c done; b open)
 
 This session shipped two of the three paths from the previous plan:
 
@@ -390,18 +434,7 @@ still emits an NMOS for it. Either the position heads need more
 data per row, or device + (x_bin, y_bin) decisions need to be
 coupled (joint action distribution rather than independent dims).
 
-### 4. PLACE coordinate discretisation: bump position_bins
-
-This session showed an 8-bin (cell_w=4, bin=0.5 µm) discretisation
-collapses N_A (x=0.0) and N_B (x=0.44) to the same bin —
-both then collide under the no-stacking guard. Use
-``--position-bins 16`` everywhere (extract_demos uses cell_w/bin
-ratio implicitly via the demo's continuous coords; train_bc /
-train_ppo / generate / eval all need matching ``--position-bins``).
-A finer bin grid is also a prerequisite for the wiremask channel to
-carry useful spatial signal.
-
-### 4. Real ablation experiments (~runtime, no new code)
+### 3. Real ablation experiments (~runtime, no new code)
 
 The `ablation.py` harness is in. Pick a preset:
 
@@ -580,5 +613,7 @@ layout_gen/rl/
 
 ---
 
-*Last updated by Claude Code session 2026-05-13 (ROUTE-action BC
-demos + sky130 stdcell CPP in PDK YAML).*
+*Last updated by Claude Code session 2026-05-13 (real-DRC + LVS
+training infra, row-alignment reward + strict-row guard,
+RL_GUIDE teaching doc, diagnosis of factored-action coupling
+bottleneck observed on 10k-step run).*
