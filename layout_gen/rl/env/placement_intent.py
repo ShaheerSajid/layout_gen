@@ -178,50 +178,65 @@ def compute_row_score(
     placed_origins:  dict[int, tuple[float, float]],
     cell_height_um:  float,
     *,
-    threshold_frac:  float = 0.25,
+    margin_frac:     float = 0.25,
 ) -> float:
-    """Sum-of-clipped-linears row-alignment score.
+    """Per-device row-alignment score.
 
-    For each placed device, computes how close its origin-y sits to
-    the row that's *expected* for its device type. In a sky130-style
-    digital standard cell:
+    For each placed device, awards full credit when the device's
+    origin-y sits anywhere in the *correct* row for its type, and a
+    linearly-decaying partial credit when it sits in the wrong row.
+    In a sky130-style digital standard cell:
 
-      * **NMOS** (``device.in_nwell == False``) → bottom row
-        (``y_expected = cell_height * 0.25``).
-      * **PMOS** (``device.in_nwell == True``)  → top row
-        (``y_expected = cell_height * 0.75``).
+      * **NMOS** (``device.in_nwell == False``) → bottom half
+        (``y < cell_height / 2``).
+      * **PMOS** (``device.in_nwell == True``)  → top half
+        (``y ≥ cell_height / 2``).
 
     Per-device contribution::
 
-        s_i = max(0, 1 − |y_actual − y_expected| / (cell_height · threshold_frac))
+        if on_correct_side(y): s_i = 1.0
+        else:                  s_i = max(0, 1 − margin_frac⁻¹ ·
+                                       (distance_into_wrong_side / cell_height))
 
-    Total = Σ_i s_i. Bounded by the number of placed devices.
+    The wrong-side decay reaches 0 at ``margin_frac × cell_height``
+    past the row boundary (default 25% of cell height). Total =
+    Σ_i s_i, bounded by the number of placed devices.
 
-    Why
-    ---
-    The policy's PLACE action factorises ``(device_idx, x_bin, y_bin)``
-    as independent dims; the position head can therefore put an NMOS
-    at the PMOS row's y (the documented nand2/nor2 stacking bug).
-    Real-DRC training would *eventually* catch this via missing-nwell
-    violations, but adding a dense row-aware signal gives the policy
-    a direct gradient toward the structurally-correct row before the
-    DRC penalty kicks in. PD-correct for the digital-stdcell flow;
-    set ``row_delta=0`` in :class:`RewardConfig` for analog layouts
-    where row assignment is free.
+    Why this shape
+    --------------
+    The canonical synth layout puts NMOS at ``y_origin = 0`` (bottom
+    rail) and PMOS near ``y_origin = cell_h − device_h``; both are
+    *anywhere* in the correct half, so they should both score 1.0.
+    A "distance from centre of row" formula would unfairly penalise
+    these correct layouts. The wrong-side decay still gives the
+    policy a gradient when it lands a device in the wrong half.
+
+    PD-correct for the digital-stdcell flow; set ``row_delta=0`` in
+    :class:`RewardConfig` for analog layouts where row assignment is
+    free.
     """
     if cell_height_um <= 0:
         return 0.0
-    threshold = cell_height_um * threshold_frac
-    if threshold <= 0:
+    midline = cell_height_um / 2.0
+    decay = cell_height_um * margin_frac
+    if decay <= 0:
         return 0.0
     total = 0.0
     for d_idx, (_x, y) in placed_origins.items():
         if d_idx >= topology.n_devices:
             continue
         device = topology.devices[d_idx]
-        y_expected = cell_height_um * (0.75 if device.in_nwell else 0.25)
-        dist = abs(float(y) - y_expected)
-        total += max(0.0, 1.0 - dist / threshold)
+        wants_top = bool(device.in_nwell)
+        if wants_top:
+            on_correct = float(y) >= midline
+            distance_wrong = max(0.0, midline - float(y))
+        else:
+            on_correct = float(y) < midline
+            distance_wrong = max(0.0, float(y) - midline)
+        if on_correct:
+            total += 1.0
+        else:
+            total += max(0.0, 1.0 - distance_wrong / decay)
     return float(total)
 
 
