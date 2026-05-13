@@ -173,8 +173,9 @@ gate-aligned layouts.
 | 5.5: typed-edge R-GCN (align_gate/abut_x/shared_diffusion) | ✅ | prev session |
 | 5.6: ROUTE demos from synth (BC pretrains route heads) | ✅ | this session |
 | 5.7: sky130 stdcell CPP (`poly.pitch_um: 0.46`) in PDK YAML | ✅ | this session |
+| 5.8: eval harness (DRC-clean / inspector / hpwl / electrical / ep_rew, multi-topology breakdown) | ✅ | this session |
 
-**Test count:** 143 passing.
+**Test count:** 147 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -320,22 +321,16 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 4. Eval harness (~half day)
-
-`rl/scripts/eval.py` that runs N episodes, reports mean ep_rew,
-DRC-clean rate, alignment score, electrical score, inspector pass
-rate. Useful for tracking progress quantitatively.
-
-### 5. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
+### 4. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
 
 See "Where SOTA does things we don't yet" #1.
 
-### 6. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
+### 5. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
 
 See "Where SOTA does things we don't yet" #2. Speculative — try after
 the simpler items.
 
-### 7. Decommission rule-based `synth/placer.py` + `synth/router.py`
+### 6. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
 Only after RL reaches parity on all template cells. Long-term goal.
 
@@ -379,6 +374,18 @@ Only after RL reaches parity on all template cells. Long-term goal.
 # layers, ASCII top-down sketch. --strict exits non-zero on issues.
 .venv/bin/python -m layout_gen.rl.scripts.inspect_gds \
     out/cell.gds --ascii --strict
+
+# Quantitative eval — N rollouts, aggregated metrics. Per-topology
+# breakdown when --topologies lists more than one cell. Produces an
+# A/B comparison number for "did this change help?" questions.
+.venv/bin/python -m layout_gen.rl.scripts.eval \
+    --topologies inverter,nand2,nor2 \
+    --checkpoint checkpoints/ppo.zip \
+    --episodes 8 \
+    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --mag-bins 8 --out-json out/eval.json
+# Add --no-drc to skip real DRC for fast iteration.
+# Drop --checkpoint to score an untrained policy as a baseline.
 ```
 
 ---
@@ -429,12 +436,13 @@ layout_gen/rl/
 │   ├── demo_extract.py     ← synth → PLACE demos
 │   └── ppo_train.py        ← PPOTrainer
 ├── scripts/
+│   ├── eval.py             ← quantitative eval (N rollouts, aggregated metrics)
 │   ├── extract_demos.py    ← bulk demo extraction CLI
 │   ├── generate.py         ← topology YAML → GDS
 │   ├── inspect_gds.py      ← verification CLI
 │   ├── train_bc.py         ← BC training CLI
 │   └── train_ppo.py        ← PPO training CLI
-└── tests/                  ← 106 tests; keep green
+└── tests/                  ← 147 tests; keep green
 ```
 
 ---
