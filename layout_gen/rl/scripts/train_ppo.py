@@ -379,6 +379,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p.add_argument("--bc-init", type=Path, default=None,
                    help="Path to a BC checkpoint to warm-start the actor.")
+    p.add_argument("--ibrl-bc-init", type=Path, default=None,
+                   help="Path to a BC checkpoint to use as the IBRL "
+                        "distillation reference. When set, PPO's loss "
+                        "adds β·KL(π_PPO || π_BC) with β decaying linearly "
+                        "from --ibrl-beta-start to --ibrl-beta-end. Pairs "
+                        "naturally with --bc-init (use the same path).")
+    p.add_argument("--ibrl-beta-start", type=float, default=1.0,
+                   help="Initial KL-to-BC weight at training start.")
+    p.add_argument("--ibrl-beta-end",   type=float, default=0.0,
+                   help="Final KL-to-BC weight at training end.")
     p.add_argument("--total-timesteps", type=int, default=20000)
     p.add_argument("--n-envs", type=int, default=1)
     p.add_argument("--n-steps", type=int, default=128)
@@ -509,6 +519,9 @@ def main(argv: list[str] | None = None) -> int:
         layout_config=layout_cfg,
         bc_init=args.bc_init,
         tensorboard_log=args.tb_log,
+        ibrl_bc_checkpoint=args.ibrl_bc_init,
+        ibrl_beta_start=args.ibrl_beta_start,
+        ibrl_beta_end=args.ibrl_beta_end,
     )
     trainer.learn(total_timesteps=args.total_timesteps)
     trainer.save(args.out)

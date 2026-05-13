@@ -178,8 +178,9 @@ gate-aligned layouts.
 | 5.10: short-circuit reward + CachedLVS adapter + magic+netgen SPICE-ref emitter | ✅ | this session |
 | 5.11: wiremask-style proximity channel in obs (MaskPlace gap closed) | ✅ | this session |
 | 5.12: IBRL via BC distillation (β-decayed KL-to-BC in PPO loss; last SOTA gap) | ✅ | this session |
+| 5.13: ablation harness (`ablation.py` — train N variants → eval each → diff table + CSV) | ✅ | this session |
 
-**Test count:** 161 passing.
+**Test count:** 162 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -305,13 +306,23 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 3. Ablation experiments via the eval harness (~half day each)
+### 3. Run real ablation experiments (~runtime, no new code)
 
-All five new signals (HPWL, alignment, electrical, short, LVS, IBRL,
-wiremask) are wired but their *individual* contribution to final
-inspector-pass-rate / electrical-clean rate hasn't been measured.
-Recipe: train two checkpoints differing only in one config flag,
-eval both with `--episodes 16`, diff the per-cell metrics.
+The `ablation.py` harness is in. Now we need actual numbers. Pick a
+preset:
+
+```bash
+.venv/bin/python -m layout_gen.rl.scripts.ablation \
+    --variants ibrl --bc-init checkpoints/bc_inv.pt \
+    --topologies inverter,nand2,nor2 \
+    --total-timesteps 10000 --episodes 16 \
+    --out-dir runs/ibrl_v1 --out-csv runs/ibrl_v1.csv
+```
+
+Add new presets to `PRESETS` in `ablation.py` for each design choice
+worth measuring (HPWL on/off, wiremask on/off, short_delta weight
+sweep, …). 1.5k-step pilot ran cleanly; a real ablation needs
+≥10k steps + multi-cell to see separation.
 
 ### 4. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
@@ -433,13 +444,14 @@ layout_gen/rl/
 │   ├── demo_extract.py     ← synth → PLACE demos
 │   └── ppo_train.py        ← PPOTrainer
 ├── scripts/
+│   ├── ablation.py         ← train N variants → eval each → diff table
 │   ├── eval.py             ← quantitative eval (N rollouts, aggregated metrics)
 │   ├── extract_demos.py    ← bulk demo extraction CLI
 │   ├── generate.py         ← topology YAML → GDS
 │   ├── inspect_gds.py      ← verification CLI
 │   ├── train_bc.py         ← BC training CLI
-│   └── train_ppo.py        ← PPO training CLI
-└── tests/                  ← 147 tests; keep green
+│   └── train_ppo.py        ← PPO training CLI (with --ibrl-bc-init for distillation)
+└── tests/                  ← 162 tests; keep green
 ```
 
 ---
