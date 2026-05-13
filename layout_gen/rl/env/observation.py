@@ -75,7 +75,8 @@ class Observation:
     viol_mask:    np.ndarray   # (VIOL_CAP,)
     global_feats: np.ndarray   # (N_GLOBAL,)
     rid_to_idx:   dict[int, int]   # not part of gym obs; used by action decode
-    topology_global: np.ndarray | None = None   # (topology_dim,) or None
+    topology_global: np.ndarray | None = None     # (topology_dim,)
+    proximity_map:   np.ndarray | None = None     # (1, y_bins, x_bins)
 
     def to_dict(self) -> dict[str, np.ndarray]:
         out = {
@@ -87,13 +88,17 @@ class Observation:
         }
         if self.topology_global is not None:
             out["topology_global"] = self.topology_global
+        if self.proximity_map is not None:
+            out["proximity_map"] = self.proximity_map
         return out
 
 
 def make_observation_space(*,
                             poly_cap:     int = DEFAULT_POLY_CAP,
                             viol_cap:     int = DEFAULT_VIOL_CAP,
-                            topology_dim: int | None = None) -> spaces.Dict:
+                            topology_dim: int | None = None,
+                            proximity_shape: tuple[int, int] | None = None,
+                            ) -> spaces.Dict:
     """Build the gymnasium Dict space matching :func:`build_observation`.
 
     Parameters
@@ -123,6 +128,17 @@ def make_observation_space(*,
             low=-np.inf, high=np.inf,
             shape=(topology_dim,), dtype=np.float32,
         )
+    if proximity_shape is not None:
+        # Single-channel image: distance (in cell-fractions) from each
+        # bin centre to the nearest already-placed device terminal.
+        # Range [0, 1]; 1 means "no terminals placed yet anywhere".
+        # Shape laid out (1, H, W) so a CNN branch can consume it
+        # directly via Conv2d.
+        h, w = proximity_shape
+        components["proximity_map"] = spaces.Box(
+            low=0.0, high=1.0,
+            shape=(1, h, w), dtype=np.float32,
+        )
     return spaces.Dict(components)
 
 
@@ -137,6 +153,9 @@ def build_observation(
     cell_bbox:   tuple[float, float, float, float] | None = None,
     step_progress: float = 0.0,
     topology_global: np.ndarray | None = None,
+    proximity_shape: tuple[int, int] | None = None,
+    terminal_positions: list[tuple[float, float]] | None = None,
+    cell_dimensions:    tuple[float, float] | None = None,
 ) -> Observation:
     """Build a padded observation from the current env state."""
     rects = [
@@ -192,7 +211,15 @@ def build_observation(
     if topology_global is not None:
         topology_arr = np.asarray(topology_global, dtype=np.float32).reshape(-1)
 
+    proximity_arr: np.ndarray | None = None
+    if proximity_shape is not None:
+        proximity_arr = _build_proximity_map(
+            proximity_shape, terminal_positions or [],
+            cell_dimensions=cell_dimensions or (4.0, 2.0),
+        )
+
     return Observation(
+        proximity_map=proximity_arr,
         poly_feats=poly_feats,
         poly_mask=poly_mask,
         viol_feats=viol_feats,
@@ -201,6 +228,46 @@ def build_observation(
         rid_to_idx=rid_to_idx,
         topology_global=topology_arr,
     )
+
+
+def _build_proximity_map(
+    shape:           tuple[int, int],
+    terminal_points: list[tuple[float, float]],
+    *,
+    cell_dimensions: tuple[float, float],
+) -> np.ndarray:
+    """One-channel image showing distance from each bin centre to the
+    nearest already-placed terminal.
+
+    MaskPlace-flavoured *positionmask* / wiremask shortcut: a tiny
+    image-shaped state channel that gives the policy a "what's nearby
+    already?" signal per candidate position. For PLACE actions this
+    is the cheapest version of MaskPlace's wiremask (true wiremask
+    needs per-net HPWL increments; we use simple Euclidean proximity
+    for v1 and let the encoder figure out the rest).
+
+    Distance is normalised to the cell's diagonal so values land in
+    [0, 1] and the CNN doesn't see µm scale.
+    """
+    h, w = shape
+    cell_w, cell_h = cell_dimensions
+    diag = max((cell_w ** 2 + cell_h ** 2) ** 0.5, 1e-6)
+    out = np.ones((1, h, w), dtype=np.float32)   # 1.0 = no terminals
+    if not terminal_points:
+        return out
+    # Bin centres in µm.
+    xs = (np.arange(w) + 0.5) / w * cell_w
+    ys = (np.arange(h) + 0.5) / h * cell_h
+    # For each (y, x) bin, nearest terminal distance.
+    for ti, ty in enumerate(ys):
+        for tj, tx in enumerate(xs):
+            best = float("inf")
+            for (px, py) in terminal_points:
+                d = ((tx - px) ** 2 + (ty - py) ** 2) ** 0.5
+                if d < best:
+                    best = d
+            out[0, ti, tj] = min(best / diag, 1.0)
+    return out
 
 
 def _encode_violation(v: DRCViolation,

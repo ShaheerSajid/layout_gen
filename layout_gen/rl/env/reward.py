@@ -97,6 +97,23 @@ class RewardConfig:
     # MaskPlace / AlphaChip / R-GCN-PPO.
     hpwl_delta: float = 0.5
 
+    # ── Short-circuit penalty (cheap geometric heuristic) ─────────────
+    # Multiplier on -Δ(short_count). A new wire that bridges two nets
+    # introduces shorts; punish proportional to count. Only fires when
+    # delta is non-zero so an already-shorted episode doesn't keep
+    # bleeding reward.
+    short_delta: float = 2.0
+
+    # ── LVS reward (truth signal via magic + netgen) ──────────────────
+    # Per-step delta in number of LVS mismatches reported by
+    # MagicNetgenLVSRunner. ``+Δ(prev_mismatches - curr_mismatches)``
+    # so reducing mismatches gives positive reward. Only active when
+    # the env is constructed with an ``lvs_runner`` (gated on magic +
+    # netgen + a reference SPICE netlist being available).
+    lvs_delta: float = 1.0
+    # Bonus when crossing the LVS-clean threshold (any → 0 mismatches).
+    lvs_clean_bonus: float = 5.0
+
     # ── Common terms ──────────────────────────────────────────────────
     step:       float = 0.05
     terminal:   float = 5.0     # only fires in REPAIR phase
@@ -126,6 +143,9 @@ class RewardBreakdown:
     alignment_delta:    float = 0.0
     electrical_delta:   float = 0.0
     hpwl_delta:         float = 0.0
+    short_delta:        float = 0.0
+    lvs_delta:          float = 0.0
+    lvs_clean_bonus:    float = 0.0
 
     @property
     def total(self) -> float:
@@ -133,7 +153,9 @@ class RewardBreakdown:
                 + self.terminal + self.invalid + self.no_change
                 + self.place_success + self.route_success
                 + self.connectivity_delta + self.alignment_delta
-                + self.electrical_delta + self.hpwl_delta)
+                + self.electrical_delta + self.hpwl_delta
+                + self.short_delta + self.lvs_delta
+                + self.lvs_clean_bonus)
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -149,6 +171,9 @@ class RewardBreakdown:
             "alignment_delta":    self.alignment_delta,
             "electrical_delta":   self.electrical_delta,
             "hpwl_delta":         self.hpwl_delta,
+            "short_delta":        self.short_delta,
+            "lvs_delta":          self.lvs_delta,
+            "lvs_clean_bonus":    self.lvs_clean_bonus,
             "total":              self.total,
         }
 
@@ -177,6 +202,10 @@ def compute_reward(
     electrical_after:     float = 0.0,
     hpwl_before:          float = 0.0,
     hpwl_after:           float = 0.0,
+    short_before:         int   = 0,
+    short_after:          int   = 0,
+    lvs_mismatches_before: int | None = None,
+    lvs_mismatches_after:  int | None = None,
 ) -> RewardBreakdown:
     """Compute reward from before/after violation lists, action flags,
     and the active episode phase.
@@ -233,6 +262,19 @@ def compute_reward(
     rb.hpwl_delta = (
         cfg.hpwl_delta * (hpwl_after - hpwl_before)
     )
+
+    # Short-circuit penalty (geometric heuristic, always-on).
+    rb.short_delta = -cfg.short_delta * (short_after - short_before)
+
+    # LVS reward (truth signal). lvs_mismatches_* are None when the env
+    # was constructed without an LVS runner — in that case skip both
+    # the delta and the bonus.
+    if lvs_mismatches_before is not None and lvs_mismatches_after is not None:
+        rb.lvs_delta = (
+            cfg.lvs_delta * (lvs_mismatches_before - lvs_mismatches_after)
+        )
+        if lvs_mismatches_after == 0 and lvs_mismatches_before > 0:
+            rb.lvs_clean_bonus = cfg.lvs_clean_bonus
 
     if not action_valid:
         rb.invalid = -cfg.invalid

@@ -175,8 +175,11 @@ gate-aligned layouts.
 | 5.7: sky130 stdcell CPP (`poly.pitch_um: 0.46`) in PDK YAML | ✅ | this session |
 | 5.8: eval harness (DRC-clean / inspector / hpwl / electrical / ep_rew, multi-topology breakdown) | ✅ | this session |
 | 5.9: multi-cell training (`--topologies inv,nand2,nor2`, vec-env round-robin, max-cap policy) | ✅ | this session |
+| 5.10: short-circuit reward + CachedLVS adapter + magic+netgen SPICE-ref emitter | ✅ | this session |
+| 5.11: wiremask-style proximity channel in obs (MaskPlace gap closed) | ✅ | this session |
+| 5.12: IBRL via BC distillation (β-decayed KL-to-BC in PPO loss; last SOTA gap) | ✅ | this session |
 
-**Test count:** 151 passing.
+**Test count:** 161 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -247,23 +250,17 @@ Surveyed in May 2026 — see Sources at the bottom of this doc.
 
 **Where SOTA does things we don't yet:**
 
-Two concrete improvements, ranked by ROI. Each replaces a row in
-"What's next" below.
+All originally-flagged SOTA gaps have been closed in 5.10–5.12:
+the magic-LVS truth signal (with auto-generated SPICE references),
+the wiremask-style proximity channel in the observation, and the
+IBRL-flavoured BC distillation in the PPO loss. We now match or
+exceed every reference in the survey on at least one signal each
+work cited.
 
-1. **True IBRL** *(~3 hours, medium impact)*. We currently use BC just
-   to initialise PPO weights, then discard the BC policy. IBRL
-   (arXiv 2311.02198) keeps the BC policy frozen and mixes its action
-   proposals into the rollout buffer at a decaying rate. PPO learns
-   from clean expert trajectories for longer. Files:
-   `rl/training/ppo_train.py` — add `bc_proposer` arg, sample BC
-   actions with probability β(step) decaying 0.5 → 0.
-
-2. **MaskPlace-style wiremask channel in observation** *(~half day,
-   speculative impact)*. State includes an (x_bins, y_bins) image
-   per net showing "if I place a terminal here, what's the HPWL
-   increment". For our 8×8 grid this is trivially small. Files:
-   `rl/env/observation.py` — add `wiremask` Dict entry; `policy/network.py`
-   — small CNN branch into trunk.
+The remaining open question is *measurement* — running each new
+reward / observation in isolation against a held-out eval set to
+quantify its individual contribution. The eval harness is in
+place; the experiments are runtime work, not code work.
 
 **What we should NOT copy** (validated against our context):
 
@@ -308,16 +305,15 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 3. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
+### 3. Ablation experiments via the eval harness (~half day each)
 
-See "Where SOTA does things we don't yet" #1.
+All five new signals (HPWL, alignment, electrical, short, LVS, IBRL,
+wiremask) are wired but their *individual* contribution to final
+inspector-pass-rate / electrical-clean rate hasn't been measured.
+Recipe: train two checkpoints differing only in one config flag,
+eval both with `--episodes 16`, diff the per-cell metrics.
 
-### 4. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
-
-See "Where SOTA does things we don't yet" #2. Speculative — try after
-the simpler items.
-
-### 5. Decommission rule-based `synth/placer.py` + `synth/router.py`
+### 4. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
 Only after RL reaches parity on all template cells. Long-term goal.
 

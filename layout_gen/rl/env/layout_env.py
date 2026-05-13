@@ -58,7 +58,7 @@ from layout_gen.rl.env.place_action import (
 )
 from layout_gen.rl.env.connectivity import (
     compute_connectivity_score, compute_electrical_score,
-    compute_hpwl_score,
+    compute_hpwl_score, compute_short_count,
 )
 from layout_gen.rl.env.placement_intent import score_alignment
 from layout_gen.rl.env.reward       import (
@@ -150,9 +150,14 @@ class LayoutEnv(gym.Env):
         poly_pitch_um:    float | None = None,
         metal_pitch_um_per_layer: dict[str, float] | None = None,
         metal_direction_per_layer: dict[str, str] | None = None,
+        # ── LVS reward (truth signal via magic + netgen) ──────────────
+        lvs = None,   # CachedLVS-shaped: .run(state) → LVSResult
+        # ── Wiremask-style proximity channel ──────────────────────────
+        proximity_shape: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self._drc = drc
+        self._lvs = lvs
         self.poly_cap   = poly_cap
         self.viol_cap   = viol_cap
         self.target_cap = target_cap or poly_cap
@@ -253,9 +258,11 @@ class LayoutEnv(gym.Env):
             route_h_bins=route_h_bins,
         )
         self.action_space      = self._action_helper.gym_space
+        self._proximity_shape  = proximity_shape
         self.observation_space = make_observation_space(
             poly_cap=poly_cap, viol_cap=viol_cap,
             topology_dim=topology_dim_for_space,
+            proximity_shape=proximity_shape,
         )
 
         # ── Mutable per-episode state ─────────────────────────────────
@@ -352,6 +359,8 @@ class LayoutEnv(gym.Env):
         alignment_before    = self._alignment_score()
         electrical_before   = self._electrical_score()
         hpwl_before         = self._hpwl_score()
+        short_before        = compute_short_count(self._state)
+        lvs_before = self._lvs_mismatch_count()
 
         env_action = self._action_helper.decode(action, self._last_rid_map)
 
@@ -396,6 +405,8 @@ class LayoutEnv(gym.Env):
         alignment_after    = self._alignment_score()
         electrical_after   = self._electrical_score()
         hpwl_after         = self._hpwl_score()
+        short_after        = compute_short_count(self._state)
+        lvs_after = self._lvs_mismatch_count()
 
         rb = compute_reward(
             violations_before=before,
@@ -412,6 +423,10 @@ class LayoutEnv(gym.Env):
             electrical_after=electrical_after,
             hpwl_before=hpwl_before,
             hpwl_after=hpwl_after,
+            short_before=short_before,
+            short_after=short_after,
+            lvs_mismatches_before=lvs_before,
+            lvs_mismatches_after=lvs_after,
         )
 
         # Phase transitions: PLACE → ROUTE (or → REPAIR if route disabled),
@@ -535,6 +550,22 @@ class LayoutEnv(gym.Env):
             self._state, self._topology_graph, self._terminals,
         )
 
+    def _lvs_mismatch_count(self) -> int | None:
+        """Number of LVS mismatches reported by the magic+netgen runner.
+
+        Returns ``None`` when the env was constructed without an
+        ``lvs`` runner — the reward layer treats ``None`` as "skip the
+        LVS terms for this step" so envs without LVS pay no overhead
+        and emit no spurious LVS signal.
+        """
+        if self._lvs is None:
+            return None
+        try:
+            result = self._lvs.run(self._state)
+        except Exception:
+            return None
+        return len(result.mismatches)
+
     def _all_devices_placed(self) -> bool:
         if self._topology_graph is None:
             return True
@@ -596,6 +627,14 @@ class LayoutEnv(gym.Env):
     ) -> tuple[dict, dict]:
         progress = (self._step_count / self.max_steps
                     if self.max_steps > 0 else 0.0)
+        # Per-terminal global positions for the proximity map
+        # (only computed when the env was built with proximity_shape).
+        terminal_points: list[tuple[float, float]] | None = None
+        cell_dims: tuple[float, float] | None = None
+        if self._proximity_shape is not None:
+            terminal_points = [(x, y) for (x, y, _layer)
+                               in self._terminals.values()]
+            cell_dims = (self.cell_width_um, self.cell_height_um)
         obs_struct = build_observation(
             self._state, self._violations,
             poly_cap=self.poly_cap,
@@ -603,6 +642,9 @@ class LayoutEnv(gym.Env):
             cell_bbox=self._cell_bbox,
             step_progress=progress,
             topology_global=self._topology_global,
+            proximity_shape=self._proximity_shape,
+            terminal_positions=terminal_points,
+            cell_dimensions=cell_dims,
         )
         self._last_obs     = obs_struct.to_dict()
         self._last_rid_map = obs_struct.rid_to_idx
@@ -620,6 +662,8 @@ class LayoutEnv(gym.Env):
             "alignment":        self._alignment_score(),
             "electrical":       self._electrical_score(),
             "hpwl":             self._hpwl_score(),
+            "shorts":           compute_short_count(self._state),
+            "lvs_mismatches":   self._lvs_mismatch_count(),
             "action_mask":      mask,
             "drc_cache_stats":  self._drc.stats(),
         }

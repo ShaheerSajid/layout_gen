@@ -269,9 +269,47 @@ def compute_hpwl_score(
     return -float(total)
 
 
+# ── Short-circuit detection (LVS-flavoured truth signal) ────────────────────
+
+def compute_short_count(
+    state:   LayoutState,
+    *,
+    tol_um:  float = DEFAULT_TOUCH_TOL_UM,
+) -> int:
+    """Count electrical shorts: same-layer wire rects from *different*
+    nets whose bboxes overlap.
+
+    This is the structural analogue of "LVS short" — two wires that
+    should be on different nets touching on the same layer are
+    electrically merged in physical reality, which any LVS run would
+    flag. Detecting it geometrically is O(N²) over routing rects;
+    cells stay small enough that this is fine.
+
+    Returns
+    -------
+    int : number of shorting pairs found.
+
+    The reward layer multiplies Δshorts by ``short_delta`` (negative
+    weight) so adding a wire that bridges two nets is punished
+    proportional to how many shorts it introduces.
+    """
+    wires = [r for r in state if r.shape_type == "wire" and r.net]
+    n = 0
+    for i in range(len(wires)):
+        a = wires[i]
+        for j in range(i + 1, len(wires)):
+            b = wires[j]
+            if a.net == b.net or a.layer != b.layer:
+                continue
+            if _bbox_overlap(a, b, tol=tol_um):
+                n += 1
+    return n
+
+
 __all__ = [
     "DEFAULT_TOUCH_TOL_UM",
     "compute_connectivity_score",
     "compute_electrical_score",
     "compute_hpwl_score",
+    "compute_short_count",
 ]

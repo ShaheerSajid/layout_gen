@@ -67,6 +67,10 @@ class DeviceNode:
     l_um:        float
     fingers:     int
     in_nwell:    bool
+    # Per-terminal net assignments from the YAML (e.g. {"G": "IN",
+    # "D": "OUT", "S": "VSS"}). Carried for the SPICE-reference
+    # emitter that the LVS reward consumes; the GNN doesn't need it.
+    terminal_nets: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -162,6 +166,7 @@ def graph_from_template(
             l_um=float(l),
             fingers=fingers,
             in_nwell=bool(getattr(spec, "in_nwell", False)),
+            terminal_nets=dict(spec.terminals or {}),
         ))
         name_to_idx[name] = i
 

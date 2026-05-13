@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from sb3_contrib import MaskablePPO
+
+from layout_gen.rl.training.ibrl import MaskableBCDistillPPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import BaseCallback
@@ -123,6 +125,14 @@ class PPOTrainer:
         layout_config: LayoutPolicyConfig | None = None,
         bc_init:      str | Path | None = None,
         tensorboard_log: str | Path | None = None,
+        # ── IBRL via BC distillation (arXiv 2311.02198 spirit) ───────
+        # When set, PPO's loss adds β·KL(π_PPO || π_BC) with β decaying
+        # linearly from ``ibrl_beta_start`` to ``ibrl_beta_end`` over
+        # the full training run. Pairs naturally with ``bc_init`` —
+        # use the same checkpoint for both.
+        ibrl_bc_checkpoint: str | Path | None = None,
+        ibrl_beta_start:    float = 1.0,
+        ibrl_beta_end:      float = 0.0,
     ) -> None:
         self.cfg = config or PPOConfig()
         self.layout_config = layout_config or LayoutPolicyConfig()
@@ -137,7 +147,7 @@ class PPOTrainer:
         ]
         vec_env = DummyVecEnv(masked_factories)
 
-        self.model = MaskablePPO(
+        ppo_kwargs = dict(
             policy=MaskableLayoutPolicy,
             env=vec_env,
             learning_rate=self.cfg.learning_rate,
@@ -157,6 +167,19 @@ class PPOTrainer:
             tensorboard_log=str(tensorboard_log) if tensorboard_log else None,
             policy_kwargs={"layout_config": self.layout_config},
         )
+        if ibrl_bc_checkpoint is not None:
+            self.model = MaskableBCDistillPPO(
+                **ppo_kwargs,
+                bc_checkpoint=ibrl_bc_checkpoint,
+                bc_policy_config=self.layout_config,
+                beta_start=ibrl_beta_start,
+                beta_end=ibrl_beta_end,
+            )
+            if self.cfg.verbose:
+                print(f"[ibrl] BC distillation enabled "
+                      f"(β: {ibrl_beta_start} → {ibrl_beta_end})")
+        else:
+            self.model = MaskablePPO(**ppo_kwargs)
 
         if bc_init is not None:
             loaded, missing = load_bc_into_sb3_policy(

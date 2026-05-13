@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from layout_gen.drc.base import DRCRunner, DRCViolation
+from layout_gen.lvs.base import LVSResult, LVSRunner
 from layout_gen.synth.geo.state import LayoutState
 
 
@@ -137,4 +138,93 @@ class CachedDRC:
             return self._runner.run(gds_path, unique_name)
 
 
-__all__ = ["CachedDRC", "geometry_key"]
+# ── Cached LVS ─────────────────────────────────────────────────────────────
+
+@dataclass
+class _LVSCacheEntry:
+    result: LVSResult
+    hits:   int = 0
+
+
+class CachedLVS:
+    """LRU-cached front-end for an :class:`LVSRunner`.
+
+    Same caching contract as :class:`CachedDRC`: identical layout
+    geometries hit the cache, novel ones invoke magic+netgen.
+
+    Parameters
+    ----------
+    runner :
+        Concrete :class:`LVSRunner` (today: :class:`MagicNetgenLVSRunner`).
+    rules :
+        :class:`PDKRules` for ``LayoutState.to_component`` GDS export.
+    cell_name :
+        Top cell name; must match the reference netlist's ``.subckt``.
+    ref_netlist :
+        Path to the reference SPICE netlist
+        (auto-emitted from the topology graph by
+        :func:`layout_gen.rl.env.spice_ref.write_spice_subckt`).
+    capacity :
+        Max distinct layouts to remember.
+    """
+
+    def __init__(
+        self,
+        runner:       LVSRunner,
+        rules:        Any,
+        *,
+        cell_name:    str,
+        ref_netlist:  Path,
+        capacity:     int = 1024,
+    ) -> None:
+        self._runner       = runner
+        self._rules        = rules
+        self._cell_name    = cell_name
+        self._ref_netlist  = Path(ref_netlist)
+        self._capacity     = capacity
+        self._cache: OrderedDict[tuple, _LVSCacheEntry] = OrderedDict()
+        self._misses = 0
+        self._hits   = 0
+        self._invoke_count = 0
+
+    def run(self, state: LayoutState) -> LVSResult:
+        key = geometry_key(state)
+        entry = self._cache.get(key)
+        if entry is not None:
+            entry.hits += 1
+            self._hits += 1
+            self._cache.move_to_end(key)
+            return entry.result
+        result = self._invoke_tool(state)
+        self._cache[key] = _LVSCacheEntry(result=result)
+        self._misses += 1
+        if len(self._cache) > self._capacity:
+            self._cache.popitem(last=False)
+        return result
+
+    def stats(self) -> dict[str, int]:
+        return {"hits": self._hits, "misses": self._misses,
+                "size": len(self._cache), "capacity": self._capacity}
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._hits = self._misses = 0
+
+    def _invoke_tool(self, state: LayoutState) -> LVSResult:
+        self._invoke_count += 1
+        unique_name = f"{self._cell_name}_lvs{self._invoke_count}"
+        with tempfile.TemporaryDirectory(prefix="rl_lvs_") as td:
+            gds_path = Path(td) / f"{unique_name}.gds"
+            comp = state.to_component(self._rules, name=unique_name)
+            comp.write_gds(str(gds_path), with_metadata=False)
+            try:
+                return self._runner.run(gds_path, self._ref_netlist, unique_name)
+            except Exception as exc:
+                # LVS tool errored (e.g. magic crashed on degenerate
+                # geometry). Return a failed-but-non-crashing result so
+                # the env keeps training.
+                return LVSResult(clean=False,
+                                  mismatches=[], log=f"runner exception: {exc}")
+
+
+__all__ = ["CachedDRC", "CachedLVS", "geometry_key"]
