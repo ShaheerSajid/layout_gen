@@ -276,6 +276,17 @@ class LayoutEnv(gym.Env):
         self._forbid_kinds: frozenset[str] = frozenset()
         self._phase: str = self._default_start_phase
         self._placed_mask:  np.ndarray = np.zeros(device_cap, dtype=bool)
+        # Per-device placement origins (x_um, y_um) populated by
+        # _apply_place. Used to reject placements that collide with an
+        # already-placed device — closes the "stack two devices at the
+        # same X bin" failure mode that the trained multi-cell policy
+        # falls into otherwise.
+        self._placed_origins: dict[int, tuple[float, float]] = {}
+        # Minimum distance between two placed devices' origins, in µm.
+        # Smaller than the smallest transistor width we emit (~0.7 µm
+        # for w=0.5 nmos) so adjacent gate-aligned devices in a real
+        # bitcell are not falsely flagged.
+        self._origin_separation_um: float = 0.20
         self._route_step_count: int = 0
         self._routed_mask: np.ndarray = np.zeros(net_cap, dtype=bool)
         # Per-terminal global positions populated by PLACE actions:
@@ -306,6 +317,7 @@ class LayoutEnv(gym.Env):
             raise ValueError("Cannot start in ROUTE phase: enable_route=False.")
         self._phase = start_phase
         self._placed_mask = np.zeros(self.device_cap, dtype=bool)
+        self._placed_origins = {}
         self._routed_mask = np.zeros(self.net_cap, dtype=bool)
         self._place_step_count = 0
         self._route_step_count = 0
@@ -488,17 +500,31 @@ class LayoutEnv(gym.Env):
         # draw_transistor — treat as invalid so the reward penalises it.
         if device.w_um <= 0 or device.l_um <= 0:
             return False
+
+        # No-stacking guard: a placement within ε of an already-placed
+        # device's origin is rejected (treated as invalid). Stops the
+        # multi-cell failure mode where the trained policy puts both
+        # NMOSes of a NAND2 at the same (x_bin, y_bin), which the old
+        # inspector hid because the merged cluster still had every
+        # expected layer. The reward layer charges the invalid-action
+        # penalty so PPO learns to avoid these collisions.
+        nx, ny = float(env_action.x_um), float(env_action.y_um)
+        eps = self._origin_separation_um
+        for (ox, oy) in self._placed_origins.values():
+            if abs(nx - ox) < eps and abs(ny - oy) < eps:
+                return False
+
         try:
             _, ports = place_device_full(
                 self._state, device,
-                x_um=env_action.x_um,
-                y_um=env_action.y_um,
+                x_um=nx, y_um=ny,
                 orientation=env_action.orientation,
                 cache=self._tx_cache,
             )
         except Exception:
             return False
         self._placed_mask[d_idx] = True
+        self._placed_origins[d_idx] = (nx, ny)
         # Record terminal global positions for the connectivity reward.
         for term_name, (px, py, layer) in ports.items():
             self._terminals[(d_idx, term_name)] = (px, py, layer)

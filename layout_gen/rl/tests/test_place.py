@@ -269,13 +269,15 @@ def test_env_place_action_grows_state(rules, cache):
 def test_env_transitions_to_repair_when_all_placed(rules, cache):
     env = _inverter_env(rules, cache, max_place_steps=8, max_steps=12)
     env.reset()
-    # Place both devices.
-    for d_idx in (0, 1):
+    # Place both devices at *distinct* y bins so the no-stacking guard
+    # in _apply_place doesn't reject the second one (canonical inverter
+    # has gate-aligned X but different rows).
+    for d_idx, y_bin in zip((0, 1), (1, 5)):
         raw = np.zeros(env.action_space.nvec.shape, dtype=np.int64)
         raw[0] = 6
         raw[6] = d_idx
         raw[7] = 4
-        raw[8] = 4
+        raw[8] = y_bin
         raw[9] = 0
         obs, _, terminated, truncated, info = env.step(raw)
         if info.get("phase_transitioned"):

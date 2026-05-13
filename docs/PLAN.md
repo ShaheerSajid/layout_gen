@@ -179,8 +179,9 @@ gate-aligned layouts.
 | 5.11: wiremask-style proximity channel in obs (MaskPlace gap closed) | ✅ | this session |
 | 5.12: IBRL via BC distillation (β-decayed KL-to-BC in PPO loss; last SOTA gap) | ✅ | this session |
 | 5.13: ablation harness (`ablation.py` — train N variants → eval each → diff table + CSV) | ✅ | this session |
+| 5.14: env-side no-stacking guard in `_apply_place` (rejects PLACE within ε of an existing device origin) | ✅ | this session |
 
-**Test count:** 162 passing.
+**Test count:** 165 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -346,27 +347,45 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 3. Stop the policy from stacking devices in multi-device cells (HIGH PRIORITY)
+### 3. Richer BC corpus (HIGH PRIORITY)
 
-The 6k-step multi-cell run revealed a real failure mode: the trained
-policy correctly places inverters (gates aligned) but **stacks both
-NMOSes at the same X bin** in nand2 / nor2. Inspector flags it as
-``STACKED: 3 diffs but only 1 poly column``. Two attack paths, in
-order of expected ROI:
+The no-stacking guard (5.14, this session) made device collisions
+impossible at the env layer. Re-training revealed the next gap:
+the BC corpus is too thin. With only inverter + nand2 + nor2 as
+demos (≈ 12 PLACE actions total), the device-pointer head can't
+generalise — the trained policy places NMOS reliably but often
+fails to place PMOS in nand2/nor2 because there aren't enough
+positive PMOS examples for it to learn.
 
-a) **Tighten the PLACE action mask**: when poly_pitch_um is set,
-   forbid x_bin values whose snapped X is within ε of a previously-
-   placed device's X. Implementation in
-   ``rl/env/action_space.py:action_mask_for`` — needs the env to
-   pass in the list of already-placed device X positions.
+Options, in order of effort:
 
-b) **Add an overlap-penalty reward**: per-step, count pairs of
-   placed device diff rects that overlap; multiply by negative
-   weight in ``RewardConfig.diff_overlap_delta``. Cheap to compute,
-   gives PPO a direct gradient against stacking.
+a) **Add more cell templates** to the demo corpus
+   (`bit_cell_6t`, `row_driver`, `dido`, `aoi21`, `oai21`,
+   `nand3`, `nor3`, `tap_cell`, `buffer`).
+   ``extract_demos --templates inv,nand2,nor2,nand3,nor3,bit_cell_6t,...``
+   produces 50+ PLACE actions; PPO can recover from that.
 
-(a) is structural (the policy *cannot* propose a stack) and should
-ship first. (b) is a softer regulariser as backup.
+b) **Trajectory augmentation**: for each demo, generate variants by
+   D4 rotations / mirrorings (the existing
+   `repair/augment_trajectories.py` already does this for repair
+   actions; extend to PLACE).
+
+c) **Mine real SCL placements** (sky130_fd_sc_hd is on the user's
+   machine — `seeds.py` already discovers them). Reverse-engineer
+   PLACE actions from the rect clusters via the inspector's
+   classification logic. Most expensive but produces hundreds of
+   demos at once.
+
+### 4. PLACE coordinate discretisation: bump position_bins
+
+This session showed an 8-bin (cell_w=4, bin=0.5 µm) discretisation
+collapses N_A (x=0.0) and N_B (x=0.44) to the same bin —
+both then collide under the no-stacking guard. Use
+``--position-bins 16`` everywhere (extract_demos uses cell_w/bin
+ratio implicitly via the demo's continuous coords; train_bc /
+train_ppo / generate / eval all need matching ``--position-bins``).
+A finer bin grid is also a prerequisite for the wiremask channel to
+carry useful spatial signal.
 
 ### 4. Real ablation experiments (~runtime, no new code)
 
