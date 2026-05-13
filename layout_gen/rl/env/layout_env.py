@@ -60,7 +60,9 @@ from layout_gen.rl.env.connectivity import (
     compute_connectivity_score, compute_electrical_score,
     compute_hpwl_score, compute_short_count,
 )
-from layout_gen.rl.env.placement_intent import score_alignment
+from layout_gen.rl.env.placement_intent import (
+    compute_row_score, score_alignment,
+)
 from layout_gen.rl.env.reward       import (
     RewardConfig, RewardBreakdown, compute_reward,
 )
@@ -371,6 +373,7 @@ class LayoutEnv(gym.Env):
         alignment_before    = self._alignment_score()
         electrical_before   = self._electrical_score()
         hpwl_before         = self._hpwl_score()
+        row_before          = self._row_score()
         short_before        = compute_short_count(self._state)
         lvs_before = self._lvs_mismatch_count()
 
@@ -417,6 +420,7 @@ class LayoutEnv(gym.Env):
         alignment_after    = self._alignment_score()
         electrical_after   = self._electrical_score()
         hpwl_after         = self._hpwl_score()
+        row_after          = self._row_score()
         short_after        = compute_short_count(self._state)
         lvs_after = self._lvs_mismatch_count()
 
@@ -435,6 +439,8 @@ class LayoutEnv(gym.Env):
             electrical_after=electrical_after,
             hpwl_before=hpwl_before,
             hpwl_after=hpwl_after,
+            row_before=row_before,
+            row_after=row_after,
             short_before=short_before,
             short_after=short_after,
             lvs_mismatches_before=lvs_before,
@@ -576,6 +582,17 @@ class LayoutEnv(gym.Env):
             self._state, self._topology_graph, self._terminals,
         )
 
+    def _row_score(self) -> float:
+        """Per-device row-alignment score (NMOS→bottom, PMOS→top).
+        Zero when no topology is bound or no devices have been placed."""
+        if self._topology_graph is None or not self._placed_origins:
+            return 0.0
+        return compute_row_score(
+            self._topology_graph,
+            self._placed_origins,
+            self.cell_height_um,
+        )
+
     def _lvs_mismatch_count(self) -> int | None:
         """Number of LVS mismatches reported by the magic+netgen runner.
 
@@ -688,6 +705,7 @@ class LayoutEnv(gym.Env):
             "alignment":        self._alignment_score(),
             "electrical":       self._electrical_score(),
             "hpwl":             self._hpwl_score(),
+            "row":              self._row_score(),
             "shorts":           compute_short_count(self._state),
             "lvs_mismatches":   self._lvs_mismatch_count(),
             "action_mask":      mask,

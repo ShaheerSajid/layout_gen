@@ -71,7 +71,10 @@ def main(argv: list[str] | None = None) -> int:
                         "PlacementDemoDataset (PLACE-action BC) instead "
                         "of the perturb-trajectory dataset.")
     p.add_argument("--device-cap",      type=int, default=16)
-    p.add_argument("--position-bins",   type=int, default=8)
+    p.add_argument("--position-bins",   type=int, default=16,
+                   help="Must match the PPO env that consumes the BC "
+                        "checkpoint. 16 over a 4 µm cell separates "
+                        "adjacent gate columns; 8 collides nand2/nor2.")
     p.add_argument("--enable-place",    action="store_true",
                    help="When training with --demos, build the policy "
                         "with enable_place=True so the PLACE heads exist.")

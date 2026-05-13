@@ -171,8 +171,63 @@ def score_alignment(
     return float(total)
 
 
+# ── Row-type alignment (NMOS=bottom row, PMOS=top row) ─────────────────────
+
+def compute_row_score(
+    topology:        TopologyGraph,
+    placed_origins:  dict[int, tuple[float, float]],
+    cell_height_um:  float,
+    *,
+    threshold_frac:  float = 0.25,
+) -> float:
+    """Sum-of-clipped-linears row-alignment score.
+
+    For each placed device, computes how close its origin-y sits to
+    the row that's *expected* for its device type. In a sky130-style
+    digital standard cell:
+
+      * **NMOS** (``device.in_nwell == False``) → bottom row
+        (``y_expected = cell_height * 0.25``).
+      * **PMOS** (``device.in_nwell == True``)  → top row
+        (``y_expected = cell_height * 0.75``).
+
+    Per-device contribution::
+
+        s_i = max(0, 1 − |y_actual − y_expected| / (cell_height · threshold_frac))
+
+    Total = Σ_i s_i. Bounded by the number of placed devices.
+
+    Why
+    ---
+    The policy's PLACE action factorises ``(device_idx, x_bin, y_bin)``
+    as independent dims; the position head can therefore put an NMOS
+    at the PMOS row's y (the documented nand2/nor2 stacking bug).
+    Real-DRC training would *eventually* catch this via missing-nwell
+    violations, but adding a dense row-aware signal gives the policy
+    a direct gradient toward the structurally-correct row before the
+    DRC penalty kicks in. PD-correct for the digital-stdcell flow;
+    set ``row_delta=0`` in :class:`RewardConfig` for analog layouts
+    where row assignment is free.
+    """
+    if cell_height_um <= 0:
+        return 0.0
+    threshold = cell_height_um * threshold_frac
+    if threshold <= 0:
+        return 0.0
+    total = 0.0
+    for d_idx, (_x, y) in placed_origins.items():
+        if d_idx >= topology.n_devices:
+            continue
+        device = topology.devices[d_idx]
+        y_expected = cell_height_um * (0.75 if device.in_nwell else 0.25)
+        dist = abs(float(y) - y_expected)
+        total += max(0.0, 1.0 - dist / threshold)
+    return float(total)
+
+
 __all__ = [
     "DEFAULT_THRESHOLD_UM",
     "DirectiveScore",
     "score_alignment",
+    "compute_row_score",
 ]

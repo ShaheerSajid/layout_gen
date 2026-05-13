@@ -219,6 +219,27 @@ def evaluate(
             drc_factory = lambda: CachedDRC(runner, rules,
                                               cell_name=topology_name)
 
+        # LVS factory (optional): only built when --lvs is set and
+        # magic+netgen are available. Each cell gets its own auto-
+        # emitted SPICE reference netlist.
+        lvs_factory = None
+        if getattr(args, "lvs", False):
+            from layout_gen.lvs           import get_runner as get_lvs_runner
+            from layout_gen.rl.env.runner import CachedLVS
+            from layout_gen.rl.env.spice_ref import write_spice_subckt
+            _lvs_runner = get_lvs_runner(rules)
+            if _lvs_runner is not None and _lvs_runner.is_available():
+                _ref_dir = Path(args.out_json).parent if args.out_json else Path("out")
+                _ref_path = _ref_dir / "lvs_refs" / f"{topology_name}.ref.spice"
+                write_spice_subckt(graph, topology_name, _ref_path)
+                lvs_factory = lambda: CachedLVS(
+                    _lvs_runner, rules,
+                    cell_name=topology_name, ref_netlist=_ref_path,
+                )
+            else:
+                print(f"[warn] --lvs set but no usable backend for "
+                      f"{topology_name}; skipping.", file=sys.stderr)
+
         def _make_env() -> LayoutEnv:
             return LayoutEnv(
                 drc=drc_factory(),
@@ -243,6 +264,7 @@ def evaluate(
                 poly_pitch_um=poly_pitch_um,
                 metal_pitch_um_per_layer=metal_pitches,
                 metal_direction_per_layer=metal_dirs,
+                lvs=lvs_factory() if lvs_factory is not None else None,
             )
 
         env = _make_env()
@@ -396,7 +418,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Mirror generate.py / train_ppo.py knobs so the env can be built.
     p.add_argument("--device-cap",      type=int, default=16)
-    p.add_argument("--position-bins",   type=int, default=8)
+    p.add_argument("--position-bins",   type=int, default=16,
+                   help="Must match training. 16 over a 4 µm cell "
+                        "separates adjacent gate columns; 8 collides "
+                        "nand2/nor2.")
     p.add_argument("--mag-bins",        type=int, default=8)
     p.add_argument("--poly-cap",        type=int, default=128)
     p.add_argument("--viol-cap",        type=int, default=32)
@@ -419,6 +444,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-drc", action="store_true",
                    help="Use the no-op DRC stub. Default dispatches to "
                         "klayout/magic; eval should normally NOT use this.")
+    p.add_argument("--lvs", action="store_true",
+                   help="Enable the magic+netgen LVS truth signal during "
+                        "rollouts. Auto-emits a SPICE reference netlist "
+                        "per topology. Slow (~1s/distinct geometry) but "
+                        "the only signal that verifies device connectivity.")
     p.add_argument("--deterministic", choices=("auto", "yes", "no"),
                    default="auto")
     p.add_argument("--device", default="cpu")

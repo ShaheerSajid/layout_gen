@@ -186,5 +186,49 @@ def test_env_alignment_reward_fires_on_placement(rules, cache):
     assert info_p["reward"]["alignment_delta"] > 0.0, info_p["reward"]
 
 
+# ── Row-type alignment ─────────────────────────────────────────────────────
+
+def test_row_score_nmos_at_bottom_pmos_at_top():
+    """Cell height 2 µm; NMOS expected at y=0.5, PMOS at y=1.5."""
+    from layout_gen.rl.env.placement_intent import compute_row_score
+    g = _two_device_graph()
+    origins = {0: (0.0, 0.5), 1: (0.0, 1.5)}   # canonical layout
+    s = compute_row_score(g, origins, cell_height_um=2.0)
+    assert s == pytest.approx(2.0)             # 1.0 per device
+
+
+def test_row_score_zero_when_swapped():
+    """NMOS at top + PMOS at bottom → both miss by cell_h/2 = 1.0,
+    threshold = 0.25 * cell_h = 0.5 → both score 0."""
+    from layout_gen.rl.env.placement_intent import compute_row_score
+    g = _two_device_graph()
+    origins = {0: (0.0, 1.5), 1: (0.0, 0.5)}   # swapped rows
+    s = compute_row_score(g, origins, cell_height_um=2.0)
+    assert s == pytest.approx(0.0)
+
+
+def test_row_score_partial_when_off_centre():
+    """NMOS at y=0.6 (0.1 µm off-centre); threshold=0.5 → score 0.8."""
+    from layout_gen.rl.env.placement_intent import compute_row_score
+    g = _two_device_graph()
+    origins = {0: (0.0, 0.6)}                  # NMOS only, slightly high
+    s = compute_row_score(g, origins, cell_height_um=2.0)
+    assert s == pytest.approx(0.8, abs=1e-6)
+
+
+def test_row_score_zero_when_no_origins():
+    from layout_gen.rl.env.placement_intent import compute_row_score
+    g = _two_device_graph()
+    assert compute_row_score(g, {}, cell_height_um=2.0) == 0.0
+
+
+def test_row_score_zero_height_returns_zero():
+    """Degenerate cell_height shouldn't crash."""
+    from layout_gen.rl.env.placement_intent import compute_row_score
+    g = _two_device_graph()
+    s = compute_row_score(g, {0: (0.0, 0.0)}, cell_height_um=0.0)
+    assert s == 0.0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

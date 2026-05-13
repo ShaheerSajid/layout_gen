@@ -244,6 +244,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--d-token", type=int, default=64)
     p.add_argument("--d-trunk", type=int, default=128)
 
+    p.add_argument("--lvs-check", action="store_true",
+                   help="After writing the GDS, run a one-shot "
+                        "magic+netgen LVS check against an auto-"
+                        "emitted SPICE reference netlist and report "
+                        "clean/dirty + mismatch count.")
     p.add_argument("--no-drc", action="store_true",
                    help="OPT OUT of real DRC and use the no-op stub. "
                         "Default behaviour is to dispatch to the auto-"
@@ -404,7 +409,42 @@ def main(argv: list[str] | None = None) -> int:
               out_path=args.out, cell_name=args.cell_name)
     if not args.quiet:
         print(f"[done] wrote {args.out}  ({len(final_state)} polygons)")
+
+    if args.lvs_check:
+        _run_lvs_check(args, rules, graph)
     return 0
+
+
+def _run_lvs_check(args, rules, graph) -> None:
+    """One-shot magic+netgen LVS check on the written GDS. Auto-emits a
+    SPICE reference netlist from the topology graph and reports the
+    verdict + mismatch count. Failures don't raise — they print and
+    return so the user can still inspect the GDS."""
+    from layout_gen.lvs           import get_runner as get_lvs_runner
+    from layout_gen.rl.env.spice_ref import write_spice_subckt
+
+    lvs_runner = get_lvs_runner(rules)
+    if lvs_runner is None or not lvs_runner.is_available():
+        print("[lvs] no usable LVS backend (need magic + netgen); skipping.",
+              file=sys.stderr)
+        return
+
+    ref_path = args.out.with_suffix(".ref.spice")
+    write_spice_subckt(graph, args.cell_name, ref_path)
+    try:
+        result = lvs_runner.run(args.out, ref_path, args.cell_name)
+    except Exception as exc:
+        print(f"[lvs] runner crashed: {exc}", file=sys.stderr)
+        return
+
+    if result.clean:
+        print(f"[lvs] CLEAN  ref={ref_path.name}")
+    else:
+        n_mm = len(result.mismatches)
+        print(f"[lvs] DIRTY  {n_mm} mismatch(es) vs {ref_path.name}",
+              file=sys.stderr)
+        for mm in result.mismatches[:10]:
+            print(f"        {mm}", file=sys.stderr)
 
 
 if __name__ == "__main__":

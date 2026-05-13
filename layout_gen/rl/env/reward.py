@@ -88,6 +88,17 @@ class RewardConfig:
     # intended structure rather than discovering an axis from scratch.
     alignment_delta: float = 1.5
 
+    # ── Row-type alignment (NMOS=bottom, PMOS=top) ────────────────────
+    # Multiplier on Δ(per-device row-row-match score). Per-device
+    # contribution is 1.0 when the device sits at the y of the row its
+    # type expects (NMOS → bottom half, PMOS → top half), tapering
+    # linearly to 0 at threshold_frac × cell_height misalignment.
+    # Closes the documented nand2/nor2 stacking failure mode where the
+    # policy puts the wrong-type device at the right-type row without
+    # waiting for the DRC missing-nwell signal to penalise it.
+    # Set to 0 for analog layouts where row-assignment is free.
+    row_delta: float = 1.0
+
     # ── Half-perimeter wirelength ─────────────────────────────────────
     # Multiplier on Δ(-Σ HPWL_net). HPWL is negated so "shorter is
     # better" (more positive). Δ is mostly negative during PLACE (each
@@ -143,6 +154,7 @@ class RewardBreakdown:
     alignment_delta:    float = 0.0
     electrical_delta:   float = 0.0
     hpwl_delta:         float = 0.0
+    row_delta:          float = 0.0
     short_delta:        float = 0.0
     lvs_delta:          float = 0.0
     lvs_clean_bonus:    float = 0.0
@@ -154,6 +166,7 @@ class RewardBreakdown:
                 + self.place_success + self.route_success
                 + self.connectivity_delta + self.alignment_delta
                 + self.electrical_delta + self.hpwl_delta
+                + self.row_delta
                 + self.short_delta + self.lvs_delta
                 + self.lvs_clean_bonus)
 
@@ -171,6 +184,7 @@ class RewardBreakdown:
             "alignment_delta":    self.alignment_delta,
             "electrical_delta":   self.electrical_delta,
             "hpwl_delta":         self.hpwl_delta,
+            "row_delta":          self.row_delta,
             "short_delta":        self.short_delta,
             "lvs_delta":          self.lvs_delta,
             "lvs_clean_bonus":    self.lvs_clean_bonus,
@@ -202,6 +216,8 @@ def compute_reward(
     electrical_after:     float = 0.0,
     hpwl_before:          float = 0.0,
     hpwl_after:           float = 0.0,
+    row_before:           float = 0.0,
+    row_after:            float = 0.0,
     short_before:         int   = 0,
     short_after:          int   = 0,
     lvs_mismatches_before: int | None = None,
@@ -261,6 +277,9 @@ def compute_reward(
     )
     rb.hpwl_delta = (
         cfg.hpwl_delta * (hpwl_after - hpwl_before)
+    )
+    rb.row_delta = (
+        cfg.row_delta * (row_after - row_before)
     )
 
     # Short-circuit penalty (geometric heuristic, always-on).

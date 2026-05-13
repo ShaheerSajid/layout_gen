@@ -265,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-steps", type=int, default=14)
     p.add_argument("--device-cap", type=int, default=8)
     p.add_argument("--net-cap", type=int, default=8)
-    p.add_argument("--position-bins", type=int, default=8)
+    p.add_argument("--position-bins", type=int, default=16)
     p.add_argument("--route-size-bins", type=int, default=4)
     p.add_argument("--mag-bins", type=int, default=8)
     p.add_argument("--ent-coef", type=float, default=0.005)

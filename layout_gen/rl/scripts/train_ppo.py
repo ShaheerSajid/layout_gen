@@ -142,6 +142,7 @@ def _build_real_env_factory(args, env_seed: int):
 
     cache = TransistorCache(rules)
     poly_pitch_um, metal_pitches, metal_dirs = _resolve_pitches(args, rules)
+    lvs_factory = _maybe_build_lvs_factory(args, rules, graph)
 
     def _make():
         return LayoutEnv(
@@ -172,8 +173,46 @@ def _build_real_env_factory(args, env_seed: int):
             poly_pitch_um=poly_pitch_um,
             metal_pitch_um_per_layer=metal_pitches,
             metal_direction_per_layer=metal_dirs,
+            lvs=lvs_factory() if lvs_factory is not None else None,
         )
     return _make, graph
+
+
+def _maybe_build_lvs_factory(args, rules, graph):
+    """If ``--lvs`` was passed, build a per-env :class:`CachedLVS`
+    factory backed by magic+netgen and an auto-emitted SPICE reference
+    netlist for *graph*. Returns ``None`` when LVS is disabled or no
+    runner is available."""
+    if not getattr(args, "lvs", False):
+        return None
+    from layout_gen.lvs           import get_runner as get_lvs_runner
+    from layout_gen.rl.env.runner import CachedLVS
+    from layout_gen.rl.env.spice_ref import write_spice_subckt
+
+    lvs_runner = get_lvs_runner(rules)
+    if lvs_runner is None:
+        print("[warn] --lvs set but no LVS backend available (need "
+              "magic + netgen). Continuing without LVS.",
+              file=sys.stderr)
+        return None
+    if not lvs_runner.is_available():
+        print(f"[warn] --lvs set but {type(lvs_runner).__name__} reports "
+              "not-available. Continuing without LVS.", file=sys.stderr)
+        return None
+
+    # One SPICE reference per topology, persisted next to the checkpoint
+    # so the user can inspect what the policy is being judged against.
+    ref_dir = Path(args.out).parent / "lvs_refs"
+    ref_path = ref_dir / f"{args.topology or 'cell'}.ref.spice"
+    write_spice_subckt(graph, args.topology or "cell", ref_path)
+
+    def _factory():
+        return CachedLVS(
+            lvs_runner, rules,
+            cell_name=args.topology or "cell",
+            ref_netlist=ref_path,
+        )
+    return _factory
 
 
 def _resolve_pitches(args, rules):
@@ -319,10 +358,15 @@ def _build_multi_topology_factories(args, env_seed: int):
             def _drc_factory(_n=name, _r=rules, _runner=runner):
                 return CachedDRC(_runner, _r, cell_name=_n)
 
+        # Build a per-cell LVS factory: same magic+netgen runner, but
+        # each cell has its own auto-emitted SPICE reference netlist.
+        lvs_factory = _maybe_build_lvs_factory_named(args, rules, graph, name)
+
         # Bind the per-cell vars at definition time via default args so
         # the factory closure isn't fooled by the loop iteration.
         def _make(_g=graph, _t=template, _w=cell_w, _h=cell_h,
-                  _topo=topo_global, _drc=_drc_factory) -> LayoutEnv:
+                  _topo=topo_global, _drc=_drc_factory,
+                  _lvs=lvs_factory) -> LayoutEnv:
             return LayoutEnv(
                 drc=_drc(),
                 poly_cap=args.poly_cap,
@@ -351,11 +395,39 @@ def _build_multi_topology_factories(args, env_seed: int):
                 poly_pitch_um=poly_pitch_um,
                 metal_pitch_um_per_layer=metal_pitches,
                 metal_direction_per_layer=metal_dirs,
+                lvs=_lvs() if _lvs is not None else None,
             )
         factories.append(_make)
         graphs.append(graph)
 
     return factories, graphs
+
+
+def _maybe_build_lvs_factory_named(args, rules, graph, cell_name: str):
+    """Multi-cell variant of :func:`_maybe_build_lvs_factory` — takes
+    an explicit *cell_name* (the single-cell helper uses ``args.topology``
+    which is None when ``--topologies`` is set)."""
+    if not getattr(args, "lvs", False):
+        return None
+    from layout_gen.lvs           import get_runner as get_lvs_runner
+    from layout_gen.rl.env.runner import CachedLVS
+    from layout_gen.rl.env.spice_ref import write_spice_subckt
+
+    lvs_runner = get_lvs_runner(rules)
+    if lvs_runner is None or not lvs_runner.is_available():
+        print(f"[warn] --lvs set but no usable LVS backend; skipping for "
+              f"{cell_name}.", file=sys.stderr)
+        return None
+
+    ref_dir = Path(args.out).parent / "lvs_refs"
+    ref_path = ref_dir / f"{cell_name}.ref.spice"
+    write_spice_subckt(graph, cell_name, ref_path)
+
+    def _factory():
+        return CachedLVS(
+            lvs_runner, rules, cell_name=cell_name, ref_netlist=ref_path,
+        )
+    return _factory
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -409,6 +481,13 @@ def main(argv: list[str] | None = None) -> int:
                         "detected klayout/magic runner — fake DRC "
                         "trains the policy against zero-violation lies "
                         "and is a smoke-test convenience only.")
+    p.add_argument("--lvs", action="store_true",
+                   help="Enable the LVS truth signal (magic+netgen). "
+                        "Auto-emits a SPICE reference netlist from the "
+                        "topology graph next to the checkpoint and uses "
+                        "CachedLVS to score Δ-mismatches per step. Slow "
+                        "(~1s/extraction) but the only signal that "
+                        "verifies the layout encodes the right netlist.")
     p.add_argument("--enable-place", action="store_true",
                    help="Turn on the PLACE phase.")
     p.add_argument("--enable-route", action="store_true",
@@ -416,7 +495,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--topology-dim", type=int, default=64)
     p.add_argument("--device-cap",   type=int, default=16)
     p.add_argument("--net-cap",      type=int, default=16)
-    p.add_argument("--position-bins", type=int, default=8)
+    p.add_argument("--position-bins", type=int, default=16,
+                   help="PLACE/ROUTE x/y bin count. 16 over a 4 µm cell "
+                        "gives 0.25 µm/bin — fine enough to separate "
+                        "adjacent gate columns under the sky130 poly "
+                        "pitch (0.46 µm). 8 collides nand2/nor2's two "
+                        "in-row devices.")
     p.add_argument("--route-size-bins", type=int, default=4)
     p.add_argument("--max-place-steps", type=int, default=4)
     p.add_argument("--max-route-steps", type=int, default=4)

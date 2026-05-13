@@ -36,7 +36,7 @@ mkdir -p demos checkpoints out
 .venv/bin/python -m layout_gen.rl.scripts.train_bc \
     --demos demos/ --epochs 30 --batch-size 16 --lr 1e-3 \
     --enable-place --enable-route --use-topology --topology-dim 64 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --poly-cap 128 --viol-cap 32 --target-cap 128 \
     --out checkpoints/bc_inv.pt
 
@@ -45,7 +45,7 @@ mkdir -p demos checkpoints out
     --bc-init checkpoints/bc_inv.pt \
     --total-timesteps 5000 \
     --max-place-steps 4 --max-route-steps 6 --max-steps 16 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --ent-coef 0.005 \
     --out checkpoints/ppo_inv_full.zip
 
@@ -54,7 +54,7 @@ mkdir -p demos checkpoints out
     --checkpoint checkpoints/ppo_inv_full.zip \
     --cell-name inv_full --out out/inv_full.gds \
     --max-place-steps 4 --max-route-steps 6 --max-steps 16 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --poly-cap 128 --viol-cap 32 --target-cap 128
 
 .venv/bin/python -m layout_gen.rl.scripts.inspect_gds \
@@ -212,7 +212,7 @@ The new inspector check (``_stacked_device_count``) flags this.
 .venv/bin/python -m layout_gen.rl.scripts.train_bc \
     --demos demos/multi3/ --epochs 50 --batch-size 8 --lr 1e-3 \
     --enable-place --enable-route --use-topology --topology-dim 64 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --poly-cap 128 --viol-cap 32 --target-cap 128 \
     --out checkpoints/bc_multi3.pt
 
@@ -223,7 +223,7 @@ The new inspector check (``_stacked_device_count``) flags this.
     --ibrl-bc-init checkpoints/bc_multi3.pt \
     --ibrl-beta-start 0.5 --ibrl-beta-end 0.0 \
     --total-timesteps 6000 --n-envs 3 --n-steps 256 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --routing-mode std_cell \
     --out checkpoints/ppo_multi3.zip
 ```
@@ -331,7 +331,7 @@ are the next concrete things to ship.
     --bc-init checkpoints/bc_inv.pt \
     --total-timesteps 20000 \
     --max-place-steps 4 --max-route-steps 6 --max-steps 16 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --ent-coef 0.005 \
     --out checkpoints/ppo_inv_realdrc.zip
 ```
@@ -437,7 +437,7 @@ Only after RL reaches parity on all template cells. Long-term goal.
 .venv/bin/python -m layout_gen.rl.scripts.train_bc \
     --demos demos/ --epochs 30 --batch-size 16 --lr 1e-3 \
     --enable-place --enable-route --use-topology \
-    --device-cap 16 --net-cap 16 --position-bins 8 \
+    --device-cap 16 --net-cap 16 --position-bins 16 \
     --out checkpoints/bc.pt
 
 # PPO. --no-drc for fast iteration; drop it for real klayout.
@@ -445,7 +445,7 @@ Only after RL reaches parity on all template cells. Long-term goal.
     --topology inverter --enable-place --enable-route \
     --bc-init checkpoints/bc.pt \
     --total-timesteps 10000 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 \
     --out checkpoints/ppo.zip
 # Add --no-drc for fast iteration; default is real klayout/magic.
@@ -459,7 +459,7 @@ Only after RL reaches parity on all template cells. Long-term goal.
     --bc-init checkpoints/bc.pt \
     --total-timesteps 30000 \
     --n-envs 3 --n-steps 256 --batch-size 64 --n-epochs 4 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 \
     --out checkpoints/ppo_multi.zip
 # Then eval --topologies for the per-cell breakdown.
@@ -468,7 +468,7 @@ Only after RL reaches parity on all template cells. Long-term goal.
 .venv/bin/python -m layout_gen.rl.scripts.generate \
     --topology inverter --checkpoint checkpoints/ppo.zip \
     --cell-name out_cell --out out/cell.gds \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --poly-cap 128 --viol-cap 32 --target-cap 128
 # Add --no-drc for fast iteration; default is real klayout/magic.
 
@@ -484,7 +484,7 @@ Only after RL reaches parity on all template cells. Long-term goal.
     --topologies inverter,nand2,nor2 \
     --checkpoint checkpoints/ppo.zip \
     --episodes 8 \
-    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --device-cap 8 --net-cap 8 --position-bins 16 --route-size-bins 4 \
     --mag-bins 8 --out-json out/eval.json
 # Add --no-drc to skip real DRC for fast iteration.
 # Drop --checkpoint to score an untrained policy as a baseline.
