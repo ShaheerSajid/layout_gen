@@ -174,6 +174,7 @@ def _build_real_env_factory(args, env_seed: int):
             metal_pitch_um_per_layer=metal_pitches,
             metal_direction_per_layer=metal_dirs,
             lvs=lvs_factory() if lvs_factory is not None else None,
+            strict_row_alignment=args.strict_row_alignment,
         )
     return _make, graph
 
@@ -396,6 +397,7 @@ def _build_multi_topology_factories(args, env_seed: int):
                 metal_pitch_um_per_layer=metal_pitches,
                 metal_direction_per_layer=metal_dirs,
                 lvs=_lvs() if _lvs is not None else None,
+                strict_row_alignment=args.strict_row_alignment,
             )
         factories.append(_make)
         graphs.append(graph)
@@ -524,6 +526,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--no-pitch-snap", action="store_true",
         help="Disable all pitch snapping (equivalent to --routing-mode off).")
+    p.add_argument(
+        "--strict-row-alignment", action="store_true",
+        help="Reject PLACE actions where the device's type disagrees "
+             "with the row implied by y (NMOS in bottom half, PMOS in "
+             "top half). Hard backstop to the soft row_delta reward; "
+             "PD-correct for digital stdcells, off for analog.")
 
     p.add_argument("--out", type=Path, default=Path("checkpoints/ppo.zip"))
     p.add_argument("--tb-log", type=Path, default=None,

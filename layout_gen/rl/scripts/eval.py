@@ -265,6 +265,7 @@ def evaluate(
                 metal_pitch_um_per_layer=metal_pitches,
                 metal_direction_per_layer=metal_dirs,
                 lvs=lvs_factory() if lvs_factory is not None else None,
+                strict_row_alignment=getattr(args, "strict_row_alignment", False),
             )
 
         env = _make_env()
@@ -449,6 +450,9 @@ def main(argv: list[str] | None = None) -> int:
                         "rollouts. Auto-emits a SPICE reference netlist "
                         "per topology. Slow (~1s/distinct geometry) but "
                         "the only signal that verifies device connectivity.")
+    p.add_argument("--strict-row-alignment", action="store_true",
+                   help="Reject PLACE actions whose device type disagrees "
+                        "with the row implied by y. Should match training.")
     p.add_argument("--deterministic", choices=("auto", "yes", "no"),
                    default="auto")
     p.add_argument("--device", default="cpu")

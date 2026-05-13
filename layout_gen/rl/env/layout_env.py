@@ -156,6 +156,17 @@ class LayoutEnv(gym.Env):
         lvs = None,   # CachedLVS-shaped: .run(state) → LVSResult
         # ── Wiremask-style proximity channel ──────────────────────────
         proximity_shape: tuple[int, int] | None = None,
+        # ── Strict row alignment ──────────────────────────────────────
+        # When True, PLACE rejects any placement whose y is on the
+        # wrong side of cell_height/2 for the device's type (NMOS in
+        # the bottom half, PMOS in the top half). Treats the rejection
+        # as an invalid action → reward penalty. This is the env-side
+        # backstop to the soft row_delta reward; it closes RL_GUIDE
+        # §9.1 (factored-action-dim type-row coupling) at small
+        # implementation cost. Disabled by default to preserve
+        # backward-compat with existing checkpoints. PD-correct for
+        # digital stdcells; leave off for analog.
+        strict_row_alignment: bool = False,
     ) -> None:
         super().__init__()
         self._drc = drc
@@ -289,6 +300,7 @@ class LayoutEnv(gym.Env):
         # for w=0.5 nmos) so adjacent gate-aligned devices in a real
         # bitcell are not falsely flagged.
         self._origin_separation_um: float = 0.20
+        self._strict_row_alignment: bool = bool(strict_row_alignment)
         self._route_step_count: int = 0
         self._routed_mask: np.ndarray = np.zeros(net_cap, dtype=bool)
         # Per-terminal global positions populated by PLACE actions:
@@ -518,6 +530,20 @@ class LayoutEnv(gym.Env):
         eps = self._origin_separation_um
         for (ox, oy) in self._placed_origins.values():
             if abs(nx - ox) < eps and abs(ny - oy) < eps:
+                return False
+
+        # Strict row-alignment guard: reject placements where the
+        # device's type disagrees with the row implied by y (NMOS in
+        # bottom half, PMOS in top half). Closes the factored-action-
+        # dim type/row coupling gap (RL_GUIDE §9.1 option D) at the
+        # cost of an invalid-action penalty. Opt-in via
+        # ``strict_row_alignment=True``; off by default to keep
+        # backward-compat with already-trained checkpoints.
+        if self._strict_row_alignment and self.cell_height_um > 0:
+            midline = self.cell_height_um / 2.0
+            wants_top = (device.device_type == "pmos")
+            in_top = ny >= midline
+            if wants_top != in_top:
                 return False
 
         try:

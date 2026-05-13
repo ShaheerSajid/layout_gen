@@ -234,5 +234,72 @@ def test_row_score_zero_height_returns_zero():
     assert s == 0.0
 
 
+# ── Strict row-alignment env guard ────────────────────────────────────────
+
+class _NoOpDRC:
+    def run(self, state): return []
+    def count(self, state): return 0
+    def stats(self): return {"hits": 0, "misses": 0, "size": 0, "capacity": 0}
+    def clear(self): pass
+
+
+def _strict_row_env(rules, cache, *, strict: bool) -> LayoutEnv:
+    g = graph_from_template(
+        load_template("inverter"),
+        cell_params={"_defaults": {"w_N": 0.5, "w_P": 0.5, "l": 0.15}},
+    )
+    return LayoutEnv(
+        drc=_NoOpDRC(),
+        poly_cap=64, viol_cap=8, target_cap=64, mag_bins=4,
+        max_steps=8,
+        enable_place=True,
+        topology_graph=g, transistor_cache=cache,
+        device_cap=8, x_bins=8, y_bins=8,
+        cell_width_um=4.0, cell_height_um=2.0,
+        max_place_steps=4,
+        strict_row_alignment=strict,
+    )
+
+
+def test_strict_row_rejects_nmos_placed_at_top(rules, cache):
+    """With strict_row_alignment=True, placing N (nmos) at a y_bin in
+    the top half is rejected — action_valid=False, no device added."""
+    env = _strict_row_env(rules, cache, strict=True)
+    env.reset()
+    # PLACE device 0 (N, nmos) at y_bin=6 (top half of cell_h=2.0).
+    action = np.zeros(env.action_space.nvec.shape, dtype=np.int64)
+    action[0] = len(REPAIR_KINDS)
+    action[6] = 0; action[7] = 4; action[8] = 6; action[9] = 0
+    _, _, _, _, info = env.step(action)
+    assert info["action"]["valid"] is False
+    assert info["n_devices_placed"] == 0
+    # Invalid penalty fires.
+    assert info["reward"]["invalid"] < 0
+
+
+def test_strict_row_accepts_nmos_at_bottom(rules, cache):
+    env = _strict_row_env(rules, cache, strict=True)
+    env.reset()
+    action = np.zeros(env.action_space.nvec.shape, dtype=np.int64)
+    action[0] = len(REPAIR_KINDS)
+    action[6] = 0; action[7] = 4; action[8] = 0; action[9] = 0
+    _, _, _, _, info = env.step(action)
+    assert info["action"]["valid"] is True
+    assert info["n_devices_placed"] == 1
+
+
+def test_strict_row_off_lets_misaligned_through(rules, cache):
+    """With strict_row_alignment=False (default), nmos at top still
+    counts as a valid placement — only the soft row_delta penalises it."""
+    env = _strict_row_env(rules, cache, strict=False)
+    env.reset()
+    action = np.zeros(env.action_space.nvec.shape, dtype=np.int64)
+    action[0] = len(REPAIR_KINDS)
+    action[6] = 0; action[7] = 4; action[8] = 6; action[9] = 0
+    _, _, _, _, info = env.step(action)
+    assert info["action"]["valid"] is True
+    assert info["n_devices_placed"] == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

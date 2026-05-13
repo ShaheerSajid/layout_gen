@@ -238,6 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--no-pitch-snap", action="store_true",
         help="Disable all pitch snapping.")
+    p.add_argument(
+        "--strict-row-alignment", action="store_true",
+        help="Reject PLACE actions where the device's type disagrees "
+             "with the y-row (NMOS bottom, PMOS top). Should match "
+             "the env used at training time.")
 
     # Topology encoder / policy sizing
     p.add_argument("--topology-dim", type=int, default=64)
@@ -331,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         poly_pitch_um=poly_pitch_um,
         metal_pitch_um_per_layer=metal_pitches,
         metal_direction_per_layer=metal_dirs,
+        strict_row_alignment=args.strict_row_alignment,
     )
 
     # ── Policy ───────────────────────────────────────────────────────────
