@@ -192,6 +192,22 @@ def _classify_cluster(members: list[Poly]) -> tuple[str, set[str], set[str]]:
     return kind, present, missing
 
 
+def _stacked_device_count(members: list[Poly]) -> int:
+    """Estimate how many distinct devices the cluster contains by counting
+    poly columns whose centroids are >0.05 µm apart in X. A correctly-
+    placed pair of devices has two poly columns at different X; a
+    "stack" (two devices at the same coords) has only one — flagged by
+    the caller."""
+    polys_x = sorted(round(p.cx, 3) for p in members if p.layer == "poly")
+    if not polys_x:
+        return 0
+    distinct = [polys_x[0]]
+    for x in polys_x[1:]:
+        if abs(x - distinct[-1]) > 0.05:
+            distinct.append(x)
+    return len(distinct)
+
+
 def print_device_summary(polys: list[Poly]) -> tuple[int, int, int]:
     """Returns (n_nmos, n_pmos, n_issues)."""
     clusters = _cluster_devices(polys)
@@ -205,6 +221,18 @@ def print_device_summary(polys: list[Poly]) -> tuple[int, int, int]:
         status = "OK"
         if missing:
             status = f"MISSING: {sorted(missing)}"
+            n_issues += 1
+        # Heuristic stacked-device check: more diffs in the cluster
+        # than poly columns ⇒ devices stacked at the same coords.
+        n_diffs = len(diffs)
+        n_poly_cols = _stacked_device_count(members)
+        if n_diffs > 1 and n_poly_cols < n_diffs:
+            status = (status + " | "
+                      if status != "OK" else "") + (
+                f"STACKED: {n_diffs} diffs but only {n_poly_cols} poly column(s)"
+            )
+            if "STACKED" in status and "OK" in status:
+                status = status.replace("OK", "").strip()
             n_issues += 1
         print(f"  device #{i}  {kind:7s}  centre=({cx:+.3f}, {cy:+.3f}) "
               f"layers={sorted(present)}  {status}")

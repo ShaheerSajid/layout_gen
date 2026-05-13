@@ -68,14 +68,37 @@ PRESETS: dict[str, list[Variant]] = {
         ),
     ],
 
-    # Reward-shaping ablation: the new HPWL / electrical / short / LVS terms
-    # vs disabling them one at a time.
+    # Pitch-snapping ablation: free positions vs poly-pitch-only (analog)
+    # vs full poly+metal track-aligned (std_cell). The DTCO 2025 paper
+    # reports big quality gains from poly-pitch alone; see if our env
+    # confirms it on stdcell-shaped templates.
+    "pitch": [
+        Variant(name="off", train_extra=["--routing-mode", "off"],
+                 description="No pitch snapping; bins land on the mfg grid only."),
+        Variant(name="analog", train_extra=["--routing-mode", "analog"],
+                 description="PLACE x snapped to poly pitch; routes free."),
+        Variant(name="std_cell", train_extra=["--routing-mode", "std_cell"],
+                 description="PLACE x to poly + ROUTE x/y to per-layer metal pitch."),
+    ],
+
+    # Reward-shaping ablation: full reward vs disabling individual terms.
+    # ``--reward-no-*`` flags are not yet wired in train_ppo; these
+    # variants are placeholders showing the intended shape. Add the
+    # CLI plumbing when the experiment is needed.
     "rewards": [
-        Variant(name="full",  description="All reward terms at default weights."),
-        Variant(
-            name="no_short", train_extra=[],   # placeholder
-            description="short_delta zero (no short-circuit penalty).",
-        ),
+        Variant(name="full",
+                 description="All reward terms at default weights."),
+    ],
+
+    # Multi-cell vs single-cell at equal step budget. Tests whether the
+    # topology GNN's conditioning generalises or hurts.
+    "multi_cell": [
+        Variant(name="single_inv",
+                 train_extra=["--topology", "inverter"],
+                 description="Single-cell training on inverter."),
+        Variant(name="multi_3",
+                 train_extra=["--topologies", "inverter,nand2,nor2"],
+                 description="Multi-cell training across 3 stdcell shapes."),
     ],
 }
 

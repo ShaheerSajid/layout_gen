@@ -185,6 +185,46 @@ gate-aligned layouts.
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
 
+**End-to-end multi-cell demo (inverter + nand2 + nor2, 6k PPO steps,
+BC + IBRL distillation, std_cell pitch snapping)**:
+
+```
+                    DRC  inspect  ep_rew  electrical  finding
+inverter   ✅       100%   100%    +9.95     2.00     gates aligned, all layers, both rows
+nand2      ⚠️ STACK 100%   100%*   +10.91    1.00     STACKED: 3 diffs but only 1 poly column
+nor2       ⚠️ STACK 100%   100%*   +10.28    1.00     STACKED: 3 diffs but only 1 poly column
+```
+
+The ``inspect=100%*`` for nand2/nor2 is the old inspector accepting a
+stacked-device layout because all expected layers are present
+(multiple devices at the same coords contribute to one cluster).
+The new inspector check (``_stacked_device_count``) flags this.
+
+**Reproduce**:
+
+```bash
+.venv/bin/python -m layout_gen.rl.scripts.extract_demos \
+    --templates inverter,nand2,nor2 --out demos/multi3/
+
+.venv/bin/python -m layout_gen.rl.scripts.train_bc \
+    --demos demos/multi3/ --epochs 50 --batch-size 8 --lr 1e-3 \
+    --enable-place --enable-route --use-topology --topology-dim 64 \
+    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --mag-bins 8 --poly-cap 128 --viol-cap 32 --target-cap 128 \
+    --out checkpoints/bc_multi3.pt
+
+.venv/bin/python -m layout_gen.rl.scripts.train_ppo \
+    --topologies inverter,nand2,nor2 \
+    --enable-place --enable-route --no-drc \
+    --bc-init      checkpoints/bc_multi3.pt \
+    --ibrl-bc-init checkpoints/bc_multi3.pt \
+    --ibrl-beta-start 0.5 --ibrl-beta-end 0.0 \
+    --total-timesteps 6000 --n-envs 3 --n-steps 256 \
+    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --mag-bins 8 --routing-mode std_cell \
+    --out checkpoints/ppo_multi3.zip
+```
+
 ---
 
 ## Where this sits vs the field (2025–2026 SOTA)
@@ -306,10 +346,31 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 3. Run real ablation experiments (~runtime, no new code)
+### 3. Stop the policy from stacking devices in multi-device cells (HIGH PRIORITY)
 
-The `ablation.py` harness is in. Now we need actual numbers. Pick a
-preset:
+The 6k-step multi-cell run revealed a real failure mode: the trained
+policy correctly places inverters (gates aligned) but **stacks both
+NMOSes at the same X bin** in nand2 / nor2. Inspector flags it as
+``STACKED: 3 diffs but only 1 poly column``. Two attack paths, in
+order of expected ROI:
+
+a) **Tighten the PLACE action mask**: when poly_pitch_um is set,
+   forbid x_bin values whose snapped X is within ε of a previously-
+   placed device's X. Implementation in
+   ``rl/env/action_space.py:action_mask_for`` — needs the env to
+   pass in the list of already-placed device X positions.
+
+b) **Add an overlap-penalty reward**: per-step, count pairs of
+   placed device diff rects that overlap; multiply by negative
+   weight in ``RewardConfig.diff_overlap_delta``. Cheap to compute,
+   gives PPO a direct gradient against stacking.
+
+(a) is structural (the policy *cannot* propose a stack) and should
+ship first. (b) is a softer regulariser as backup.
+
+### 4. Real ablation experiments (~runtime, no new code)
+
+The `ablation.py` harness is in. Pick a preset:
 
 ```bash
 .venv/bin/python -m layout_gen.rl.scripts.ablation \
@@ -319,10 +380,10 @@ preset:
     --out-dir runs/ibrl_v1 --out-csv runs/ibrl_v1.csv
 ```
 
-Add new presets to `PRESETS` in `ablation.py` for each design choice
-worth measuring (HPWL on/off, wiremask on/off, short_delta weight
-sweep, …). 1.5k-step pilot ran cleanly; a real ablation needs
-≥10k steps + multi-cell to see separation.
+Built-in presets: ``ibrl``, ``pitch``, ``rewards``, ``multi_cell``.
+A real ablation needs ≥10k steps + multi-cell to see separation;
+the 1.5k-step pilot tied (both variants reached the same canonical
+inverter).
 
 ### 4. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
