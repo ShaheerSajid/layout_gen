@@ -180,6 +180,8 @@ gate-aligned layouts.
 | 5.12: IBRL via BC distillation (β-decayed KL-to-BC in PPO loss; last SOTA gap) | ✅ | this session |
 | 5.13: ablation harness (`ablation.py` — train N variants → eval each → diff table + CSV) | ✅ | this session |
 | 5.14: env-side no-stacking guard in `_apply_place` (rejects PLACE within ε of an existing device origin) | ✅ | this session |
+| 5.15: full-template demo extraction (10 YAMLs vs 3) — bumps demo corpus 26 → 119 actions | ✅ | this session |
+| 5.16: sky130 SCL demo miner (`mine_scl_demos.py`) — reverse-engineers PLACE actions from real stdcells | ✅ | this session |
 
 **Test count:** 165 passing.
 
@@ -347,34 +349,46 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 3. Richer BC corpus (HIGH PRIORITY)
+### 3. Richer BC corpus (paths a + c done; b open)
 
-The no-stacking guard (5.14, this session) made device collisions
-impossible at the env layer. Re-training revealed the next gap:
-the BC corpus is too thin. With only inverter + nand2 + nor2 as
-demos (≈ 12 PLACE actions total), the device-pointer head can't
-generalise — the trained policy places NMOS reliably but often
-fails to place PMOS in nand2/nor2 because there aren't enough
-positive PMOS examples for it to learn.
+This session shipped two of the three paths from the previous plan:
 
-Options, in order of effort:
+  a) ✅ **Full-template demo extraction** (5.15) — `extract_demos`
+     now runs over inverter, nand2, nor2, nand3, nor3, aoi21,
+     oai21, buffer, bit_cell_6t, row_driver. 10 templates yielding
+     119 actions (vs 26 before). Two existing templates skipped
+     because of pre-existing synth bugs (`tap_cell` and `dido`).
 
-a) **Add more cell templates** to the demo corpus
-   (`bit_cell_6t`, `row_driver`, `dido`, `aoi21`, `oai21`,
-   `nand3`, `nor3`, `tap_cell`, `buffer`).
-   ``extract_demos --templates inv,nand2,nor2,nand3,nor3,bit_cell_6t,...``
-   produces 50+ PLACE actions; PPO can recover from that.
+  b) **D4 trajectory augmentation** — open. `repair/augment_trajectories.py`
+     already does this for repair primitives; extend to PLACE.
 
-b) **Trajectory augmentation**: for each demo, generate variants by
-   D4 rotations / mirrorings (the existing
-   `repair/augment_trajectories.py` already does this for repair
-   actions; extend to PLACE).
+  c) ✅ **SCL demo miner** (5.16, `rl/training/mine_scl_demos.py`) —
+     walks `$PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/gds/`,
+     classifies each cell against our primitive vocabulary, clusters
+     polygons via `inspect_gds._cluster_devices`, sorts by row
+     (NMOS first, left-to-right) then matches to topology device
+     order. Coordinates are rebased so the leftmost NMOS sits at
+     (0, 0) — matches the synth-derived demos' frame so BC sees
+     consistent labels across both sources.
 
-c) **Mine real SCL placements** (sky130_fd_sc_hd is on the user's
-   machine — `seeds.py` already discovers them). Reverse-engineer
-   PLACE actions from the rect clusters via the inspector's
-   classification logic. Most expensive but produces hundreds of
-   demos at once.
+     6 inverter variants + 1 nor cell mined; nand2/nand4 variants
+     rejected because the SCL packs 4 transistors as 2 multi-finger
+     devices (cluster count ≠ topology device count). To capture
+     those, the miner needs a finger-aware cluster splitter — known
+     follow-up.
+
+Combined corpus: 10 YAML + 6 SCL demos → **131 BC samples**
+(was 12). BC val accuracies on the new corpus:
+  device 100% (was 0%), x_bin 86%, y_bin 86%, orient 86%, net 83%.
+
+Re-trained PPO (BC + IBRL distillation, 6k steps, std_cell pitch,
+position_bins=16): inverter generates clean (gates aligned, all
+layers OK). nand2/nor2 still produce 2 NMOSes-but-no-PMOS — the
+device-pointer head picks the right device idx, but the position
+head puts the second device at the PMOS row Y while the policy
+still emits an NMOS for it. Either the position heads need more
+data per row, or device + (x_bin, y_bin) decisions need to be
+coupled (joint action distribution rather than independent dims).
 
 ### 4. PLACE coordinate discretisation: bump position_bins
 
