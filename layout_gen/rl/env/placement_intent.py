@@ -187,10 +187,14 @@ def compute_row_score(
     linearly-decaying partial credit when it sits in the wrong row.
     In a sky130-style digital standard cell:
 
-      * **NMOS** (``device.in_nwell == False``) → bottom half
+      * **NMOS** (``device.device_type == "nmos"``) → bottom half
         (``y < cell_height / 2``).
-      * **PMOS** (``device.in_nwell == True``)  → top half
+      * **PMOS** (``device.device_type == "pmos"``) → top half
         (``y ≥ cell_height / 2``).
+
+    The driving signal is ``device.device_type`` rather than
+    ``device.in_nwell`` because the YAML's ``in_nwell`` flag is
+    optional (most templates omit it) but ``type`` is always present.
 
     Per-device contribution::
 
@@ -226,7 +230,7 @@ def compute_row_score(
         if d_idx >= topology.n_devices:
             continue
         device = topology.devices[d_idx]
-        wants_top = bool(device.in_nwell)
+        wants_top = (device.device_type == "pmos")
         if wants_top:
             on_correct = float(y) >= midline
             distance_wrong = max(0.0, midline - float(y))
