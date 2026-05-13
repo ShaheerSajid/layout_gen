@@ -174,8 +174,9 @@ gate-aligned layouts.
 | 5.6: ROUTE demos from synth (BC pretrains route heads) | ✅ | this session |
 | 5.7: sky130 stdcell CPP (`poly.pitch_um: 0.46`) in PDK YAML | ✅ | this session |
 | 5.8: eval harness (DRC-clean / inspector / hpwl / electrical / ep_rew, multi-topology breakdown) | ✅ | this session |
+| 5.9: multi-cell training (`--topologies inv,nand2,nor2`, vec-env round-robin, max-cap policy) | ✅ | this session |
 
-**Test count:** 147 passing.
+**Test count:** 151 passing.
 
 **End-to-end demo:** inverter via demo → BC → PPO → generate produces a
 gate-aligned layout (NMOS at (0.615, 0.505), PMOS at (0.615, 1.755)).
@@ -297,21 +298,7 @@ are the next concrete things to ship.
 20k steps × ~0.5 s/step ≈ 3 hours. Run overnight, then `generate.py`
 + `inspect_gds.py --strict` for the verdict.
 
-### 2. Multi-cell training (~1 day)
-
-Right now `train_ppo --topology X` trains on one cell. Add
-`--topologies X,Y,Z` and a vec-env that rotates cells per episode.
-Tests the policy's generalisation; should also let the topology GNN's
-conditioning vector pull its weight (today the policy sees one
-topology so the GNN is effectively a constant).
-
-Files to touch:
-- `rl/scripts/train_ppo.py` — accept comma-separated list, build one
-  env factory per cell, alternate.
-- Maybe `rl/training/ppo_train.py` — the trainer is already vec-env
-  capable; just need to pass a list of factories.
-
-### 3. LVS reward via magic (~1 day)
+### 2. LVS reward via magic (~1 day)
 
 Replace the geometric heuristics in `connectivity.py` with calls to a
 real LVS extractor. We have `layout_gen/lvs/magic_runner.py` from the
@@ -321,16 +308,16 @@ Files to touch:
 - `rl/env/runner.py` — add `CachedLVS` analogous to `CachedDRC`.
 - `rl/env/reward.py` — new term `lvs_delta` weighted on (clean - dirty).
 
-### 4. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
+### 3. IBRL: keep BC policy alongside PPO (~3 hours) — SOTA gap
 
 See "Where SOTA does things we don't yet" #1.
 
-### 5. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
+### 4. MaskPlace-style wiremask observation channel (~half day) — SOTA gap
 
 See "Where SOTA does things we don't yet" #2. Speculative — try after
 the simpler items.
 
-### 6. Decommission rule-based `synth/placer.py` + `synth/router.py`
+### 5. Decommission rule-based `synth/placer.py` + `synth/router.py`
 
 Only after RL reaches parity on all template cells. Long-term goal.
 
@@ -361,6 +348,20 @@ Only after RL reaches parity on all template cells. Long-term goal.
     --mag-bins 8 \
     --out checkpoints/ppo.zip
 # Add --no-drc for fast iteration; default is real klayout/magic.
+
+# Multi-cell PPO — one vec-env worker per cell; n_envs auto-bumped to
+# match. Action-space caps (device_cap, net_cap) are the max needed
+# across cells. The topology GNN finally earns its keep here.
+.venv/bin/python -m layout_gen.rl.scripts.train_ppo \
+    --topologies inverter,nand2,nor2 \
+    --enable-place --enable-route \
+    --bc-init checkpoints/bc.pt \
+    --total-timesteps 30000 \
+    --n-envs 3 --n-steps 256 --batch-size 64 --n-epochs 4 \
+    --device-cap 8 --net-cap 8 --position-bins 8 --route-size-bins 4 \
+    --mag-bins 8 \
+    --out checkpoints/ppo_multi.zip
+# Then eval --topologies for the per-cell breakdown.
 
 # Generate from a checkpoint. Action-space caps MUST match training.
 .venv/bin/python -m layout_gen.rl.scripts.generate \

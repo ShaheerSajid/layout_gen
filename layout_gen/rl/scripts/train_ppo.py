@@ -42,6 +42,9 @@ from layout_gen.rl.env.action_space import (
 from layout_gen.rl.env.layout_env import LayoutEnv
 from layout_gen.rl.env.place_action import TransistorCache
 from layout_gen.rl.policy.network import LayoutPolicyConfig
+from layout_gen.rl.topology import (
+    TopologyEncoder, TopologyEncoderConfig, graph_from_template,
+)
 from layout_gen.rl.training.ppo_train import PPOConfig, PPOTrainer
 
 
@@ -211,7 +214,12 @@ def _resolve_pitches(args, rules):
 
 
 def _build_env_factory(args, env_seed: int):
-    """Pick the right factory based on CLI flags."""
+    """Pick the right factory (or list of factories) based on CLI flags.
+
+    Returns ``(factory_or_list, graphs)`` where ``graphs`` is None for
+    synthetic mode, a single graph for ``--topology``, or a list of
+    graphs (one per cell) for ``--topologies``.
+    """
     if args.synthetic:
         rng = random.Random(env_seed)
         drc = _DirectFakeDRC(threshold_um=0.20)
@@ -226,10 +234,128 @@ def _build_env_factory(args, env_seed: int):
                 default_state_factory=_synth_state_factory(rng),
             )
         return _make, None
-    elif args.topology:
+    if args.topologies:
+        return _build_multi_topology_factories(args, env_seed)
+    if args.topology:
         return _build_real_env_factory(args, env_seed)
+    raise SystemExit(
+        "error: pass --synthetic, --topology <name>, or --topologies "
+        "<name1,name2,...>"
+    )
+
+
+def _build_multi_topology_factories(args, env_seed: int):
+    """Build one env factory per cell in ``args.topologies``.
+
+    Each factory closes over its own (template, graph, topology_global,
+    cell_w, cell_h, transistor_cache). The returned list is consumed by
+    ``PPOTrainer`` which round-robins across vec-env workers.
+
+    The action-space caps in ``args`` (device_cap, net_cap) are bumped
+    upward to the max needed across all cells; the *original* values
+    are honoured as a floor only.
+    """
+    cell_names = [n.strip() for n in args.topologies.split(",") if n.strip()]
+    if not cell_names:
+        raise SystemExit("error: --topologies must list at least one name")
+
+    # Precompute everything per cell so we can size the policy + env once
+    # at the union of caps before any LayoutEnv is constructed.
+    rules = load_pdk()
+    cache = TransistorCache(rules)
+    poly_pitch_um, metal_pitches, metal_dirs = _resolve_pitches(args, rules)
+
+    if args.no_drc:
+        print("[warn] --no-drc set; using fake spacing-only DRC. PPO "
+              "will train against zero-violation lies for most steps.",
+              file=sys.stderr)
     else:
-        raise SystemExit("error: pass --synthetic or --topology <name>")
+        from layout_gen.drc import get_runner
+        runner = get_runner(rules)
+        if runner is None:
+            raise SystemExit(
+                "error: no DRC tool found. Install klayout or magic, or "
+                "set KLAYOUT_BIN / MAGIC_BIN. Pass --no-drc to bypass "
+                "(not recommended)."
+            )
+
+    cell_specs = []
+    for name in cell_names:
+        template = load_template(name)
+        cell_w = float(template.cell_dimensions.width  or 4.0)
+        cell_h = float(template.cell_dimensions.height or 2.0)
+        cell_params = {"_defaults": {"w_N": args.w_n, "w_P": args.w_p, "l": args.l}}
+        graph = graph_from_template(template, cell_params=cell_params)
+        cell_specs.append((name, template, graph, cell_w, cell_h))
+
+    max_devices = max((g.n_devices for _, _, g, _, _ in cell_specs),
+                      default=args.device_cap)
+    max_nets    = max((g.n_nets    for _, _, g, _, _ in cell_specs),
+                      default=args.net_cap)
+    args.device_cap = max(args.device_cap, max_devices)
+    args.net_cap    = max(args.net_cap,    max_nets)
+
+    # One topology encoder shared across all cells (params unused once
+    # we've extracted the constant per-cell embedding).
+    enc = TopologyEncoder(TopologyEncoderConfig(
+        d_token=args.topology_dim,
+        n_layers=2,
+        max_devices=args.device_cap,
+        max_nets=args.net_cap,
+    )).eval()
+
+    factories = []
+    graphs = []
+    for (name, template, graph, cell_w, cell_h) in cell_specs:
+        with torch.no_grad():
+            topo_global = enc.encode_graphs([graph]).global_embedding[0]
+        topo_global = topo_global.cpu().numpy().astype(np.float32)
+
+        if args.no_drc:
+            def _drc_factory(_n=name):
+                return _DirectFakeDRC(threshold_um=0.20)
+        else:
+            from layout_gen.rl.env.runner import CachedDRC
+            def _drc_factory(_n=name, _r=rules, _runner=runner):
+                return CachedDRC(_runner, _r, cell_name=_n)
+
+        # Bind the per-cell vars at definition time via default args so
+        # the factory closure isn't fooled by the loop iteration.
+        def _make(_g=graph, _t=template, _w=cell_w, _h=cell_h,
+                  _topo=topo_global, _drc=_drc_factory) -> LayoutEnv:
+            return LayoutEnv(
+                drc=_drc(),
+                poly_cap=args.poly_cap,
+                viol_cap=args.viol_cap,
+                target_cap=args.target_cap,
+                mag_bins=args.mag_bins,
+                max_steps=args.max_steps,
+                topology_global=_topo,
+                enable_place=args.enable_place,
+                topology_graph=(_g
+                                 if (args.enable_place or args.enable_route)
+                                 else None),
+                transistor_cache=(cache if args.enable_place else None),
+                device_cap=args.device_cap,
+                x_bins=args.position_bins, y_bins=args.position_bins,
+                cell_width_um=_w, cell_height_um=_h,
+                max_place_steps=args.max_place_steps,
+                enable_route=args.enable_route,
+                net_cap=args.net_cap,
+                route_x_bins=args.position_bins,
+                route_y_bins=args.position_bins,
+                route_w_bins=args.route_size_bins,
+                route_h_bins=args.route_size_bins,
+                max_route_steps=args.max_route_steps,
+                placement_directives=_t.placement_directives,
+                poly_pitch_um=poly_pitch_um,
+                metal_pitch_um_per_layer=metal_pitches,
+                metal_direction_per_layer=metal_dirs,
+            )
+        factories.append(_make)
+        graphs.append(graph)
+
+    return factories, graphs
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -243,6 +369,13 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--topology", default=None,
                       help="Cell template name (e.g. 'inverter') for "
                            "topology-aware training.")
+    mode.add_argument("--topologies", default=None,
+                      help="Comma-separated list of cell template names "
+                           "(e.g. 'inverter,nand2,nor2') for multi-cell "
+                           "training. Each cell gets its own vec-env "
+                           "worker; n_envs is bumped to len(topologies) "
+                           "if smaller. The topology GNN's conditioning "
+                           "vector finally pulls its weight here.")
 
     p.add_argument("--bc-init", type=Path, default=None,
                    help="Path to a BC checkpoint to warm-start the actor.")
@@ -306,15 +439,32 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     # Real DRC needs a real cell topology to run on.
-    if not args.synthetic and not args.topology:
-        raise SystemExit("error: pass --synthetic or --topology <name>")
+    if not args.synthetic and not args.topology and not args.topologies:
+        raise SystemExit(
+            "error: pass --synthetic, --topology <name>, or "
+            "--topologies <list>"
+        )
+    if args.topology and args.topologies:
+        raise SystemExit("error: pass either --topology or --topologies, not both")
+
+    # Build the env factory (or list) FIRST so we can read the
+    # auto-bumped device_cap / net_cap before sizing the policy.
+    env_factory, graphs = _build_env_factory(args, env_seed=args.seed)
+
+    # Multi-topology: bump n_envs to at least len(factories) so every
+    # cell sees at least one worker per rollout.
+    if isinstance(env_factory, list) and args.n_envs < len(env_factory):
+        if args.n_envs > 1:
+            print(f"[multi] bumping n_envs from {args.n_envs} to "
+                  f"{len(env_factory)} so every cell gets a worker")
+        args.n_envs = len(env_factory)
 
     layout_cfg = LayoutPolicyConfig(
         poly_cap=args.poly_cap,
         viol_cap=args.viol_cap,
         target_cap=args.target_cap,
         mag_bins=args.mag_bins,
-        use_topology=bool(args.topology),
+        use_topology=bool(args.topology or args.topologies),
         topology_dim=args.topology_dim,
         enable_place=args.enable_place,
         enable_route=args.enable_route,
@@ -324,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
         route_x_bins=args.position_bins, route_y_bins=args.position_bins,
         route_w_bins=args.route_size_bins, route_h_bins=args.route_size_bins,
     )
+    # Build the PPOConfig AFTER env construction so n_envs reflects
+    # the multi-cell bump above.
     ppo_cfg = PPOConfig(
         n_envs=args.n_envs,
         n_steps=args.n_steps,
@@ -336,11 +488,20 @@ def main(argv: list[str] | None = None) -> int:
         verbose=1,
     )
 
-    env_factory, graph = _build_env_factory(args, env_seed=args.seed)
-    if graph is not None:
-        print(f"[topology] cell={args.topology} devices={graph.n_devices} "
-              f"nets={graph.n_nets}  enable_place={args.enable_place} "
-              f"enable_route={args.enable_route}  drc={'fake' if args.no_drc else 'real'}")
+    if isinstance(graphs, list):
+        names = args.topologies.split(",")
+        for n, g in zip(names, graphs):
+            print(f"[topology] cell={n.strip()} devices={g.n_devices} "
+                  f"nets={g.n_nets}  enable_place={args.enable_place} "
+                  f"enable_route={args.enable_route}  "
+                  f"drc={'fake' if args.no_drc else 'real'}")
+        print(f"[multi] training across {len(graphs)} cells, "
+              f"n_envs={args.n_envs}")
+    elif graphs is not None:
+        print(f"[topology] cell={args.topology} devices={graphs.n_devices} "
+              f"nets={graphs.n_nets}  enable_place={args.enable_place} "
+              f"enable_route={args.enable_route}  "
+              f"drc={'fake' if args.no_drc else 'real'}")
 
     trainer = PPOTrainer(
         env_factory=env_factory,

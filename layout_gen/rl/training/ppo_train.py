@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
@@ -92,13 +92,21 @@ class PPOTrainer:
     Parameters
     ----------
     env_factory :
-        Callable returning a fresh :class:`LayoutEnv`. Each PPO env in
-        the vector env calls this once.
+        Either a single callable returning a fresh :class:`LayoutEnv`
+        (single-cell training) **or** a list of such callables —
+        one per cell — for multi-topology training. With a list, the
+        N PPO vec-env workers round-robin through the factories so
+        every cell gets at least one worker. ``n_envs`` should be
+        a multiple of ``len(factories)`` for clean per-cell
+        reporting; if smaller, some cells go unseen per rollout
+        (fine, just slower convergence on those).
     config :
         Hyper-parameters (:class:`PPOConfig`).
     layout_config :
         Override for the underlying :class:`LayoutPolicyConfig`. Must
-        match the env's poly_cap / viol_cap / target_cap / mag_bins.
+        match the env's poly_cap / viol_cap / target_cap / mag_bins
+        — when training across cells, use the **max** of each cap
+        across all cells so the action-space shape is uniform.
     bc_init :
         Optional path to a BC checkpoint (saved by :class:`BCTrainer`).
         Loaded into the actor before training begins.
@@ -109,7 +117,7 @@ class PPOTrainer:
 
     def __init__(
         self,
-        env_factory:  Callable[[], LayoutEnv],
+        env_factory:  Callable[[], LayoutEnv] | Sequence[Callable[[], LayoutEnv]],
         *,
         config:       PPOConfig | None = None,
         layout_config: LayoutPolicyConfig | None = None,
@@ -119,8 +127,15 @@ class PPOTrainer:
         self.cfg = config or PPOConfig()
         self.layout_config = layout_config or LayoutPolicyConfig()
 
-        masked_factory = make_masked_env(env_factory)
-        vec_env = DummyVecEnv([masked_factory for _ in range(self.cfg.n_envs)])
+        factories = (
+            list(env_factory) if not callable(env_factory) else [env_factory]
+        )
+        # Round-robin assignment: vec-env worker i gets factory i % len.
+        masked_factories = [
+            make_masked_env(factories[i % len(factories)])
+            for i in range(self.cfg.n_envs)
+        ]
+        vec_env = DummyVecEnv(masked_factories)
 
         self.model = MaskablePPO(
             policy=MaskableLayoutPolicy,
@@ -174,7 +189,7 @@ class PPOTrainer:
 
     @classmethod
     def load(cls, path: str | Path,
-             env_factory: Callable[[], LayoutEnv],
+             env_factory: Callable[[], LayoutEnv] | Sequence[Callable[[], LayoutEnv]],
              config: PPOConfig | None = None,
              layout_config: LayoutPolicyConfig | None = None,
              ) -> "PPOTrainer":
@@ -182,8 +197,14 @@ class PPOTrainer:
         trainer = cls.__new__(cls)
         trainer.cfg = config or PPOConfig()
         trainer.layout_config = layout_config or LayoutPolicyConfig()
-        masked_factory = make_masked_env(env_factory)
-        vec_env = DummyVecEnv([masked_factory for _ in range(trainer.cfg.n_envs)])
+        factories = (
+            list(env_factory) if not callable(env_factory) else [env_factory]
+        )
+        masked_factories = [
+            make_masked_env(factories[i % len(factories)])
+            for i in range(trainer.cfg.n_envs)
+        ]
+        vec_env = DummyVecEnv(masked_factories)
         trainer.model = MaskablePPO.load(
             str(path), env=vec_env, device=trainer.cfg.device,
             custom_objects={"policy_kwargs": {"layout_config": trainer.layout_config}},
