@@ -72,8 +72,8 @@ class KLayoutDRCRunner(DRCRunner):
     def _resolve_deck(self) -> Path | None:
         """Return the path to a real PDK DRC deck, or None to use auto-generated.
 
-        ``LAYOUT_GEN_KLAYOUT_DECK=<path>`` env var overrides the
-        rules-config path, e.g. to point at a feol-only subset.
+        ``LAYOUT_GEN_KLAYOUT_DECK=<path>`` overrides the rules-config
+        path, e.g. to point at a sky130 ``feol``-only subset deck.
         """
         override = os.environ.get("LAYOUT_GEN_KLAYOUT_DECK")
         if override and Path(override).is_file():
@@ -98,20 +98,23 @@ class KLayoutDRCRunner(DRCRunner):
 
             if deck is not None:
                 # Use the real PDK DRC deck (e.g. sky130A_mr.drc).
-                # Default knobs are tuned for the *training loop*: keep
-                # the structural geometry checks (feol = poly/diff/well/
-                # implant; beol = metals/vias) that the policy can
-                # actually fix, and turn off the post-route /
-                # full-chip categories that fire on every step but
-                # never gate placement decisions:
-                #   * antenna   — per-net charge ratio, post-route
-                #   * density   — full-chip metric fill checks
-                #   * latchup   — N+/P+ to nwell distance, full-chip
-                #   * connectivity — labels + nets, slow extraction
-                #   * seal / floating_met — top-level chip concerns
-                # These are still worth running once on the trained
-                # policy's output (set the env var below to re-enable).
-                # Each knob is overridable via LAYOUT_GEN_DRC_<KNOB>=...
+                # The sky130A_mr.drc deck only honours these six runtime
+                # knobs (verified by grepping for ``$<name>`` in the
+                # deck's source) plus ``thr`` for thread count. Every
+                # other "knob" sky130 docs mention is baked into the
+                # FEOL/BEOL groups with no granular toggle.
+                #   * feol          — poly/diff/well/implant rules
+                #   * beol          — metal/via rules
+                #   * offgrid       — manufacturing-grid checks
+                #   * seal          — seal-ring (top-level only)
+                #   * floating_met  — floating-metal detection (top-only)
+                #   * sram_exclude  — skip rules tagged sram-exempt
+                #   * thr           — KLayout worker thread count
+                # Defaults skip top-level-only checks (seal,
+                # floating_met) since training-loop cells aren't full
+                # chips. Each knob is overridable via
+                # LAYOUT_GEN_DRC_<KNOB>=...; LAYOUT_GEN_DRC_THR sets
+                # the worker count (KLayout deck default is 4).
                 script_path = deck
                 knobs = {
                     "feol":          "true",
@@ -119,10 +122,7 @@ class KLayoutDRCRunner(DRCRunner):
                     "offgrid":       "true",
                     "seal":          "false",
                     "floating_met":  "false",
-                    "antenna":       "false",
-                    "density":       "false",
-                    "latchup":       "false",
-                    "connectivity":  "false",
+                    "sram_exclude":  "false",
                 }
                 for k in list(knobs):
                     env_v = os.environ.get(f"LAYOUT_GEN_DRC_{k.upper()}")
@@ -136,6 +136,14 @@ class KLayoutDRCRunner(DRCRunner):
                 ]
                 for k, v in knobs.items():
                     cmd += ["-rd", f"{k}={v}"]
+                # Default to every CPU on the host instead of the
+                # deck's hardcoded 4 — KLayout DRC is embarrassingly
+                # parallel across rule passes, so more threads cut
+                # wall time roughly linearly up to the rule count.
+                thr = os.environ.get("LAYOUT_GEN_DRC_THR") or str(
+                    os.cpu_count() or 4
+                )
+                cmd += ["-rd", f"thr={thr}"]
                 if cell_name:
                     cmd += ["-rd", f"top_cell={cell_name}"]
             else:
