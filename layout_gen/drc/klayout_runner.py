@@ -20,6 +20,7 @@ Then register it in ``layout_gen/drc/registry.py``.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -69,7 +70,14 @@ class KLayoutDRCRunner(DRCRunner):
             return False
 
     def _resolve_deck(self) -> Path | None:
-        """Return the path to a real PDK DRC deck, or None to use auto-generated."""
+        """Return the path to a real PDK DRC deck, or None to use auto-generated.
+
+        ``LAYOUT_GEN_KLAYOUT_DECK=<path>`` env var overrides the
+        rules-config path, e.g. to point at a feol-only subset.
+        """
+        override = os.environ.get("LAYOUT_GEN_KLAYOUT_DECK")
+        if override and Path(override).is_file():
+            return Path(override)
         drc_cfg = getattr(self.rules, "drc", None) or {}
         deck_path = drc_cfg.get("klayout")
         if deck_path and Path(deck_path).is_file():
@@ -89,20 +97,45 @@ class KLayoutDRCRunner(DRCRunner):
             report_path = tmpdir / "violations.lyrdb"
 
             if deck is not None:
-                # Use the real PDK DRC deck (e.g. sky130A_mr.drc)
+                # Use the real PDK DRC deck (e.g. sky130A_mr.drc).
+                # Default knobs are tuned for the *training loop*: keep
+                # the structural geometry checks (feol = poly/diff/well/
+                # implant; beol = metals/vias) that the policy can
+                # actually fix, and turn off the post-route /
+                # full-chip categories that fire on every step but
+                # never gate placement decisions:
+                #   * antenna   — per-net charge ratio, post-route
+                #   * density   — full-chip metric fill checks
+                #   * latchup   — N+/P+ to nwell distance, full-chip
+                #   * connectivity — labels + nets, slow extraction
+                #   * seal / floating_met — top-level chip concerns
+                # These are still worth running once on the trained
+                # policy's output (set the env var below to re-enable).
+                # Each knob is overridable via LAYOUT_GEN_DRC_<KNOB>=...
                 script_path = deck
+                knobs = {
+                    "feol":          "true",
+                    "beol":          "true",
+                    "offgrid":       "true",
+                    "seal":          "false",
+                    "floating_met":  "false",
+                    "antenna":       "false",
+                    "density":       "false",
+                    "latchup":       "false",
+                    "connectivity":  "false",
+                }
+                for k in list(knobs):
+                    env_v = os.environ.get(f"LAYOUT_GEN_DRC_{k.upper()}")
+                    if env_v is not None:
+                        knobs[k] = env_v
                 cmd = [
                     self.klayout_exe, "-b",
                     "-r", str(script_path),
                     "-rd", f"input={gds_path}",
                     "-rd", f"report={report_path}",
-                    # Enable all relevant check groups
-                    "-rd", "feol=true",
-                    "-rd", "beol=true",
-                    "-rd", "offgrid=true",
-                    "-rd", "seal=false",
-                    "-rd", "floating_met=false",
                 ]
+                for k, v in knobs.items():
+                    cmd += ["-rd", f"{k}={v}"]
                 if cell_name:
                     cmd += ["-rd", f"top_cell={cell_name}"]
             else:
