@@ -18,7 +18,9 @@ Implementation notes
 """
 from __future__ import annotations
 
+import itertools
 import tempfile
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,20 @@ from typing import Any
 from layout_gen.drc.base import DRCRunner, DRCViolation
 from layout_gen.lvs.base import LVSResult, LVSRunner
 from layout_gen.synth.geo.state import LayoutState
+
+
+# Process-global, thread-safe counter for DRC/LVS cell-name suffixes.
+# gdsfactory's KCLayout cell registry is process-global, so per-instance
+# counters collide when multiple CachedDRC instances live in one process
+# (e.g. DummyVecEnv with n_envs>1). itertools.count is GIL-atomic in
+# CPython; the lock guards future-proofing against free-threading builds.
+_CELL_NAME_COUNTER = itertools.count(1)
+_CELL_NAME_LOCK = threading.Lock()
+
+
+def _next_cell_suffix() -> int:
+    with _CELL_NAME_LOCK:
+        return next(_CELL_NAME_COUNTER)
 
 
 # ── Geometry hashing ─────────────────────────────────────────────────────────
@@ -88,10 +104,6 @@ class CachedDRC:
         self._cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
         self._misses = 0
         self._hits   = 0
-        # gdsfactory's global Component namespace rejects duplicate
-        # cell names. Each DRC invocation creates a fresh Component, so
-        # we suffix a counter to keep names unique within the process.
-        self._invoke_count = 0
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -126,11 +138,12 @@ class CachedDRC:
     # ── Internals ────────────────────────────────────────────────────────────
 
     def _invoke_tool(self, state: LayoutState) -> list[DRCViolation]:
-        # Unique per-call name keeps gdsfactory's global cell namespace
-        # collision-free; the DRC tool only ever sees one cell per
-        # tempfile so the suffix is harmless to the violation report.
-        self._invoke_count += 1
-        unique_name = f"{self._cell_name}_drc{self._invoke_count}"
+        # Unique per-call name keeps gdsfactory's process-global cell
+        # registry collision-free across vectorised envs (DummyVecEnv
+        # with n_envs>1 puts multiple CachedDRC instances in the same
+        # process). The DRC tool only ever sees one cell per tempfile,
+        # so the suffix is harmless to the violation report.
+        unique_name = f"{self._cell_name}_drc{_next_cell_suffix()}"
         with tempfile.TemporaryDirectory(prefix="rl_drc_") as td:
             gds_path = Path(td) / f"{unique_name}.gds"
             comp = state.to_component(self._rules, name=unique_name)
@@ -185,7 +198,6 @@ class CachedLVS:
         self._cache: OrderedDict[tuple, _LVSCacheEntry] = OrderedDict()
         self._misses = 0
         self._hits   = 0
-        self._invoke_count = 0
 
     def run(self, state: LayoutState) -> LVSResult:
         key = geometry_key(state)
@@ -211,8 +223,7 @@ class CachedLVS:
         self._hits = self._misses = 0
 
     def _invoke_tool(self, state: LayoutState) -> LVSResult:
-        self._invoke_count += 1
-        unique_name = f"{self._cell_name}_lvs{self._invoke_count}"
+        unique_name = f"{self._cell_name}_lvs{_next_cell_suffix()}"
         with tempfile.TemporaryDirectory(prefix="rl_lvs_") as td:
             gds_path = Path(td) / f"{unique_name}.gds"
             comp = state.to_component(self._rules, name=unique_name)

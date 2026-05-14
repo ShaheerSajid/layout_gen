@@ -135,6 +135,54 @@ def test_cached_lvs_caches_identical_geometries():
     assert cache.stats()["hits"] == 1
 
 
+class _NameRecordingLVSRunner(_StubLVSRunner):
+    """Records every cell_name that flowed through ``run``."""
+    def __init__(self):
+        super().__init__()
+        self.names: list[str] = []
+
+    def run(self, gds_path, ref_netlist, cell_name):
+        self.names.append(cell_name)
+        return super().run(gds_path, ref_netlist, cell_name)
+
+
+def test_cached_lvs_unique_names_across_instances():
+    """Multiple Cached* instances in one process (the DummyVecEnv case
+    that bit us at training time) must not collide on cell names —
+    gdsfactory's KCLayout registry is process-global, so per-instance
+    counters were the source of the ``Cellname inverter_drc1 already
+    exists`` crash. The fix is a process-global suffix counter."""
+    import gdsfactory as gf
+    try:
+        gf.get_active_pdk()
+    except Exception:
+        from gdsfactory.gpdk import PDK as _G
+        _G.activate()
+    rules = load_pdk()
+
+    runner_a = _NameRecordingLVSRunner()
+    runner_b = _NameRecordingLVSRunner()
+    cache_a = CachedLVS(runner_a, rules, cell_name="inverter",
+                         ref_netlist=Path("/dev/null"))
+    cache_b = CachedLVS(runner_b, rules, cell_name="inverter",
+                         ref_netlist=Path("/dev/null"))
+
+    # Two distinct geometries → both caches actually invoke the runner.
+    s1 = LayoutState()
+    s1.add(layer="met1", x0=0.0, y0=0.0, x1=0.10, y1=0.10)
+    s2 = LayoutState()
+    s2.add(layer="met1", x0=1.0, y0=0.0, x1=1.10, y1=0.10)
+
+    cache_a.run(s1)
+    cache_b.run(s2)
+    cache_a.run(s2)   # forces a 3rd invocation across the two instances
+
+    all_names = runner_a.names + runner_b.names
+    assert len(all_names) == len(set(all_names)), (
+        f"cell-name collision across CachedLVS instances: {all_names}"
+    )
+
+
 # ── 4) Wiremask proximity channel ───────────────────────────────────────────
 
 def test_observation_space_includes_proximity_when_shape_passed():
