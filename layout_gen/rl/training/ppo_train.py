@@ -34,7 +34,7 @@ from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from layout_gen.rl.env.layout_env import LayoutEnv
 from layout_gen.rl.policy.network import LayoutPolicyConfig
@@ -62,6 +62,13 @@ class PPOConfig:
     seed:               int   = 0
     device:             str   = "cpu"
     verbose:            int   = 1
+    # When True, vec-env workers run in separate processes
+    # (SubprocVecEnv); each can fire its own klayout DRC call in
+    # parallel. Default False keeps the simpler single-process path
+    # — flip on when DRC dominates wall time and the host has
+    # spare cores. Pair with LAYOUT_GEN_DRC_THR=<cores/n_envs> to
+    # avoid CPU oversubscription.
+    subproc_envs:       bool  = False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -145,7 +152,8 @@ class PPOTrainer:
             make_masked_env(factories[i % len(factories)])
             for i in range(self.cfg.n_envs)
         ]
-        vec_env = DummyVecEnv(masked_factories)
+        vec_env_cls = SubprocVecEnv if self.cfg.subproc_envs else DummyVecEnv
+        vec_env = vec_env_cls(masked_factories)
 
         ppo_kwargs = dict(
             policy=MaskableLayoutPolicy,
@@ -227,7 +235,8 @@ class PPOTrainer:
             make_masked_env(factories[i % len(factories)])
             for i in range(trainer.cfg.n_envs)
         ]
-        vec_env = DummyVecEnv(masked_factories)
+        vec_env_cls = SubprocVecEnv if trainer.cfg.subproc_envs else DummyVecEnv
+        vec_env = vec_env_cls(masked_factories)
         trainer.model = MaskablePPO.load(
             str(path), env=vec_env, device=trainer.cfg.device,
             custom_objects={"policy_kwargs": {"layout_config": trainer.layout_config}},

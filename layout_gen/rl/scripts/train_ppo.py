@@ -465,6 +465,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="Final KL-to-BC weight at training end.")
     p.add_argument("--total-timesteps", type=int, default=20000)
     p.add_argument("--n-envs", type=int, default=1)
+    p.add_argument("--subproc-envs", action="store_true",
+                   help="Run vec-env workers in separate processes "
+                        "(SubprocVecEnv) so klayout DRC fires in "
+                        "parallel across envs. Pair with "
+                        "LAYOUT_GEN_DRC_THR=<cores/n_envs> so the "
+                        "total OS thread count doesn't oversubscribe "
+                        "the CPU. Default off (DummyVecEnv, single "
+                        "process, sequential DRC calls).")
     p.add_argument("--n-steps", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--n-epochs", type=int, default=4)
@@ -597,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         device=args.device,
         verbose=1,
+        subproc_envs=args.subproc_envs,
     )
 
     if isinstance(graphs, list):
