@@ -93,6 +93,17 @@ class LayoutPolicyConfig:
     x_bins:        int  = DEFAULT_POSITION_BINS
     y_bins:        int  = DEFAULT_POSITION_BINS
 
+    # ── Auto-regressive PLACE coupling (RL_GUIDE §9.1 option C) ────────
+    # When True, the x_bin / y_bin / orient heads consume
+    # ``ctx ⊕ device_one_hot`` instead of ``ctx`` alone, so the chosen
+    # device determines the position distribution. Closes the
+    # "factored-action coupling" failure mode where the policy emits
+    # the same (x, y) for two different devices in the same step.
+    # Independent of ``enable_place`` — flag is only consulted when
+    # PLACE heads exist. Default False keeps the original (factored)
+    # behaviour and existing checkpoints loadable.
+    couple_device_position: bool = False
+
     # ── ROUTE action heads (Phase 4 part 2c) ───────────────────────────
     # When True, the policy emits six additional heads
     # (net / route_layer / route_x_bin / route_y_bin / route_w_bin /
@@ -224,12 +235,22 @@ class LayoutPolicy(nn.Module):
         self.mag_head    = nn.Linear(self.cfg.d_trunk, self.cfg.mag_bins)
 
         # PLACE heads — only instantiated when enabled, so Phase 1–3
-        # checkpoints stay shape-compatible.
+        # checkpoints stay shape-compatible. When ``couple_device_position``
+        # is set, the position heads switch to a device-conditioned input
+        # (``ctx ⊕ one_hot(device)``) — those are kept under distinct names
+        # (``*_cond_head``) so the two regimes don't fight over a parameter
+        # dict at load time.
         if self.cfg.enable_place:
             self.device_head = nn.Linear(self.cfg.d_trunk, self.cfg.device_cap)
-            self.x_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.x_bins)
-            self.y_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.y_bins)
-            self.orient_head = nn.Linear(self.cfg.d_trunk, N_ORIENTATIONS)
+            if self.cfg.couple_device_position:
+                cond_dim = self.cfg.d_trunk + self.cfg.device_cap
+                self.x_bin_cond_head  = nn.Linear(cond_dim, self.cfg.x_bins)
+                self.y_bin_cond_head  = nn.Linear(cond_dim, self.cfg.y_bins)
+                self.orient_cond_head = nn.Linear(cond_dim, N_ORIENTATIONS)
+            else:
+                self.x_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.x_bins)
+                self.y_bin_head  = nn.Linear(self.cfg.d_trunk, self.cfg.y_bins)
+                self.orient_head = nn.Linear(self.cfg.d_trunk, N_ORIENTATIONS)
 
         # ROUTE heads — same gating story.
         if self.cfg.enable_route:
@@ -293,8 +314,21 @@ class LayoutPolicy(nn.Module):
         self, ctx: torch.Tensor,
         poly_emb: torch.Tensor,
         poly_pad: torch.Tensor,
+        device_idx: torch.Tensor | None = None,
     ) -> ActionLogits:
-        """Apply the per-dim action heads to a precomputed encoder state."""
+        """Apply the per-dim action heads to a precomputed encoder state.
+
+        Parameters
+        ----------
+        device_idx :
+            Long tensor of shape (B,). Only consulted when
+            ``cfg.couple_device_position`` is True; supplies the device
+            that the position heads condition on. When the flag is on
+            and this argument is None, the device head's argmax stands
+            in — useful for one-shot eval where the caller doesn't want
+            to do its own device sampling. The unconditional path
+            (default config) ignores it entirely.
+        """
         q = self.target_query(ctx).unsqueeze(1)            # (B, 1, d)
         target_logits = (poly_emb * q).sum(dim=-1)         # (B, P)
         target_logits = target_logits.masked_fill(poly_pad, float("-inf"))
@@ -303,9 +337,24 @@ class LayoutPolicy(nn.Module):
         empty = ctx.new_zeros((ctx.shape[0], 0))
         if self.cfg.enable_place:
             device_logits = self.device_head(ctx)
-            x_bin_logits  = self.x_bin_head(ctx)
-            y_bin_logits  = self.y_bin_head(ctx)
-            orient_logits = self.orient_head(ctx)
+            if self.cfg.couple_device_position:
+                if device_idx is None:
+                    # No device given: fall back to argmax(device_head).
+                    # This keeps single-pass callers (e.g. quick eval that
+                    # only wants forward(obs)) functional, even though
+                    # the canonical autoregressive path samples the device
+                    # *first* and re-enters with the sampled value.
+                    device_idx = device_logits.argmax(dim=-1)
+                di = device_idx.long().clamp(min=0, max=self.cfg.device_cap - 1)
+                device_oh = F.one_hot(di, num_classes=self.cfg.device_cap).to(ctx.dtype)
+                cond_ctx  = torch.cat([ctx, device_oh], dim=-1)
+                x_bin_logits  = self.x_bin_cond_head(cond_ctx)
+                y_bin_logits  = self.y_bin_cond_head(cond_ctx)
+                orient_logits = self.orient_cond_head(cond_ctx)
+            else:
+                x_bin_logits  = self.x_bin_head(ctx)
+                y_bin_logits  = self.y_bin_head(ctx)
+                orient_logits = self.orient_head(ctx)
         else:
             device_logits = empty
             x_bin_logits  = empty
@@ -343,9 +392,20 @@ class LayoutPolicy(nn.Module):
             route_h_bin  = route_h_logits,
         )
 
-    def forward(self, obs: dict[str, torch.Tensor]) -> ActionLogits:
+    def forward(
+        self,
+        obs: dict[str, torch.Tensor],
+        device_idx: torch.Tensor | None = None,
+    ) -> ActionLogits:
+        """Encode + apply heads.
+
+        ``device_idx`` is forwarded to :meth:`heads` so that a BC trainer
+        with ``couple_device_position=True`` can supply the ground-truth
+        device when computing per-dim cross-entropy. The default
+        (un-coupled) regime ignores it.
+        """
         ctx, poly_emb, poly_pad = self.encode_state(obs)
-        return self.heads(ctx, poly_emb, poly_pad)
+        return self.heads(ctx, poly_emb, poly_pad, device_idx=device_idx)
 
 
 # ── Loss ─────────────────────────────────────────────────────────────────────

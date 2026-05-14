@@ -494,6 +494,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="Turn on the PLACE phase.")
     p.add_argument("--enable-route", action="store_true",
                    help="Turn on the ROUTE phase.")
+    p.add_argument("--couple-device-position", action="store_true",
+                   help="Auto-regressive PLACE coupling (RL_GUIDE §9.1 "
+                        "option C): condition the x_bin / y_bin / orient "
+                        "heads on the chosen device. Required to fix the "
+                        "factored-action failure mode where two devices "
+                        "in the same rollout get the same (x, y). The BC "
+                        "checkpoint passed via --bc-init / --ibrl-bc-init "
+                        "must have been trained with the same flag.")
     p.add_argument("--topology-dim", type=int, default=64)
     p.add_argument("--device-cap",   type=int, default=16)
     p.add_argument("--net-cap",      type=int, default=16)
@@ -569,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
         use_topology=bool(args.topology or args.topologies),
         topology_dim=args.topology_dim,
         enable_place=args.enable_place,
+        couple_device_position=args.couple_device_position,
         enable_route=args.enable_route,
         device_cap=args.device_cap,
         x_bins=args.position_bins, y_bins=args.position_bins,

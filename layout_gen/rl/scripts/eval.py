@@ -178,6 +178,7 @@ def evaluate(
         use_topology=True,
         topology_dim=args.topology_dim,
         enable_place=True,
+        couple_device_position=args.couple_device_position,
         enable_route=not args.no_route,
         device_cap=args.device_cap,
         x_bins=args.position_bins, y_bins=args.position_bins,
@@ -453,6 +454,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--strict-row-alignment", action="store_true",
                    help="Reject PLACE actions whose device type disagrees "
                         "with the row implied by y. Should match training.")
+    p.add_argument("--couple-device-position", action="store_true",
+                   help="Build the eval policy with autoregressive PLACE "
+                        "coupling (RL_GUIDE §9.1 option C). MUST match the "
+                        "flag the loaded checkpoint was trained with.")
     p.add_argument("--deterministic", choices=("auto", "yes", "no"),
                    default="auto")
     p.add_argument("--device", default="cpu")

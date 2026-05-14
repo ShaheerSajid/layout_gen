@@ -78,6 +78,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--enable-place",    action="store_true",
                    help="When training with --demos, build the policy "
                         "with enable_place=True so the PLACE heads exist.")
+    p.add_argument("--couple-device-position", action="store_true",
+                   help="Auto-regressive PLACE coupling (RL_GUIDE §9.1 "
+                        "option C): condition the x_bin / y_bin / orient "
+                        "heads on the chosen device via a one-hot concat. "
+                        "Closes the factored-action failure mode where "
+                        "the policy emits the same (x, y) for two "
+                        "different devices in the same step. Requires "
+                        "--enable-place; PPO checkpoint must use the "
+                        "same flag for shape compatibility.")
     p.add_argument("--enable-route",    action="store_true",
                    help="Build the policy with enable_route=True so the "
                         "ROUTE heads (and their flat-logit slots) exist; "
@@ -130,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             use_topology=args.use_topology,
             topology_dim=args.topology_dim,
             enable_place=args.enable_place,
+            couple_device_position=args.couple_device_position,
             device_cap=args.device_cap,
             x_bins=args.position_bins, y_bins=args.position_bins,
             enable_route=args.enable_route,

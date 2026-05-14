@@ -133,7 +133,7 @@ class BCTrainer:
             actions  = self._to_device(batch["action"])
             validity = self._to_device(batch["validity"])
 
-            logits = self.policy(obs)
+            logits = self.policy(obs, device_idx=self._target_device(actions))
             loss, breakdown = masked_cross_entropy(
                 logits, actions, validity,
                 weights=self.policy.cfg.loss_weights,
@@ -168,7 +168,7 @@ class BCTrainer:
             actions  = self._to_device(batch["action"])
             validity = self._to_device(batch["validity"])
 
-            logits = self.policy(obs)
+            logits = self.policy(obs, device_idx=self._target_device(actions))
             loss, _ = masked_cross_entropy(
                 logits, actions, validity,
                 weights=self.policy.cfg.loss_weights,
@@ -194,6 +194,24 @@ class BCTrainer:
 
     def _to_device(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {k: v.to(self.device) for k, v in d.items()}
+
+    def _target_device(
+        self, actions: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Return the per-sample ground-truth device for conditioning the
+        position heads, or None when the policy isn't in coupled mode.
+
+        BC samples that lack a device label (REPAIR-only trajectories,
+        zero-padded device dim) get a 0 here — those samples will have
+        ``validity['x_bin'] == False`` so the conditioned logits never
+        contribute to the loss. The dummy device just keeps the
+        one-hot-concat math well-formed across the batch.
+        """
+        if not self.policy.cfg.couple_device_position:
+            return None
+        if "device" not in actions:
+            return None
+        return actions["device"].long()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

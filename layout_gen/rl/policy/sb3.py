@@ -111,12 +111,120 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
 
     def _logits_and_value(
         self, obs: dict[str, torch.Tensor],
+        device_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode + flatten heads into a single (B, sum(nvec)) logit tensor.
+
+        ``device_idx`` is a passthrough to :meth:`LayoutPolicy.heads` for
+        the device-conditioned PLACE regime; ignored when
+        ``couple_device_position`` is False. Callers that need the
+        autoregressive PLACE sample should use :meth:`_sample_device`
+        first and feed the result back here.
+        """
         ctx, poly_emb, poly_pad = self.layout_policy.encode_state(obs)
-        logits = self.layout_policy.heads(ctx, poly_emb, poly_pad)
+        logits = self.layout_policy.heads(
+            ctx, poly_emb, poly_pad, device_idx=device_idx,
+        )
         flat   = self._flatten_logits(logits)
         value  = self.value_head(ctx).squeeze(-1)
         return flat, value
+
+    # ── Autoregressive PLACE coupling ────────────────────────────────────────
+
+    @property
+    def _couples_device_position(self) -> bool:
+        return bool(
+            self.layout_config.enable_place
+            and self.layout_config.couple_device_position
+        )
+
+    def _device_dim_index(self) -> int:
+        """Index of the ``device`` slot in the MultiDiscrete action vector.
+
+        REPAIR base block (kind/target/edge/sx/sy/mag) is always 6 dims;
+        the device slot is the first PLACE-only dim.
+        """
+        return 6  # kind, target, edge, sign_x, sign_y, mag
+
+    def _device_logit_slice(self) -> tuple[int, int]:
+        """[start, stop) into the flat-logit / action-mask vector for the
+        device dim. Used to pull just the device-portion of the mask
+        when sampling the device in pass 1 of the autoregressive forward."""
+        nvec = list(self.action_dist.action_dims)
+        device_dim = self._device_dim_index()
+        start = sum(nvec[:device_dim])
+        stop  = start + nvec[device_dim]
+        return start, stop
+
+    def _sample_device(
+        self,
+        obs:           dict[str, torch.Tensor],
+        action_masks:  torch.Tensor | None,
+        deterministic: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the encoder + device head to autoregressively sample the
+        device dim.
+
+        Returns
+        -------
+        device_idx : (B,) long
+            The sampled (or argmaxed) device index, masked by the
+            device-portion of ``action_masks``.
+        ctx, poly_emb, poly_pad :
+            The encoded state — handed back so the caller doesn't pay
+            for a second encode_state pass.
+        """
+        ctx, poly_emb, poly_pad = self.layout_policy.encode_state(obs)
+        device_logits = self.layout_policy.device_head(ctx)   # (B, device_cap)
+
+        if action_masks is not None:
+            d_lo, d_hi = self._device_logit_slice()
+            dev_mask = action_masks[:, d_lo:d_hi].bool()
+            # Replace masked-off slots with a very negative value rather
+            # than -inf so the categorical never sees an all-(-inf) row
+            # (which would NaN the log-softmax).
+            neg_inf = torch.full_like(device_logits, -1e9)
+            device_logits = torch.where(dev_mask, device_logits, neg_inf)
+
+        if deterministic:
+            device_idx = device_logits.argmax(dim=-1)
+        else:
+            device_idx = torch.distributions.Categorical(
+                logits=device_logits,
+            ).sample()
+        return device_idx, ctx, poly_emb, poly_pad
+
+    def _coupled_logits_and_value(
+        self,
+        obs:           dict[str, torch.Tensor],
+        action_masks:  torch.Tensor | None,
+        deterministic: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Two-pass forward: sample device first, then build flat logits
+        with position heads conditioned on the sampled device.
+
+        Returns
+        -------
+        flat_logits : (B, sum(nvec))
+            Flat logits whose position slots are conditioned on
+            ``device_idx``. Other slots (kind / target / etc.) are
+            identical to the un-coupled forward.
+        value : (B,)
+            Trunk value estimate.
+        device_idx : (B,) long
+            The device sampled in pass 1; the caller must overwrite the
+            device dim of the final action with this value to keep the
+            autoregressive contract (``p(x|d)`` uses the actual ``d``).
+        """
+        device_idx, ctx, poly_emb, poly_pad = self._sample_device(
+            obs, action_masks, deterministic,
+        )
+        logits = self.layout_policy.heads(
+            ctx, poly_emb, poly_pad, device_idx=device_idx,
+        )
+        flat  = self._flatten_logits(logits)
+        value = self.value_head(ctx).squeeze(-1)
+        return flat, value, device_idx
 
     # ── MaskableActorCriticPolicy overrides ──────────────────────────────────
 
@@ -126,11 +234,21 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
         deterministic: bool = False,
         action_masks:  torch.Tensor | None = None,
     ):
-        flat_logits, value = self._logits_and_value(obs)
+        if self._couples_device_position:
+            flat_logits, value, device_idx = self._coupled_logits_and_value(
+                obs, action_masks, deterministic,
+            )
+        else:
+            flat_logits, value = self._logits_and_value(obs)
+            device_idx = None
         distribution = self.action_dist.proba_distribution(action_logits=flat_logits)
         if action_masks is not None:
             distribution.apply_masking(action_masks)
-        actions   = distribution.get_actions(deterministic=deterministic)
+        actions = distribution.get_actions(deterministic=deterministic)
+        if device_idx is not None:
+            # The position dims were drawn from a distribution conditioned
+            # on this device, so the action's device dim must agree.
+            actions[:, self._device_dim_index()] = device_idx
         log_probs = distribution.log_prob(actions)
         return actions, value, log_probs
 
@@ -140,7 +258,14 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
         actions: torch.Tensor,
         action_masks: torch.Tensor | None = None,
     ):
-        flat_logits, value = self._logits_and_value(obs)
+        if self._couples_device_position:
+            # Condition position heads on the device that was actually
+            # taken in this transition (PPO is on-policy w.r.t. its own
+            # rollouts, so this matches the sampling-time conditioning).
+            device_idx = actions[:, self._device_dim_index()].long()
+            flat_logits, value = self._logits_and_value(obs, device_idx=device_idx)
+        else:
+            flat_logits, value = self._logits_and_value(obs)
         distribution = self.action_dist.proba_distribution(action_logits=flat_logits)
         if action_masks is not None:
             distribution.apply_masking(action_masks)
@@ -160,11 +285,20 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
         deterministic: bool = False,
         action_masks: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        flat_logits, _ = self._logits_and_value(observation)
+        if self._couples_device_position:
+            flat_logits, _, device_idx = self._coupled_logits_and_value(
+                observation, action_masks, deterministic,
+            )
+        else:
+            flat_logits, _ = self._logits_and_value(observation)
+            device_idx = None
         distribution = self.action_dist.proba_distribution(action_logits=flat_logits)
         if action_masks is not None:
             distribution.apply_masking(action_masks)
-        return distribution.get_actions(deterministic=deterministic)
+        actions = distribution.get_actions(deterministic=deterministic)
+        if device_idx is not None:
+            actions[:, self._device_dim_index()] = device_idx
+        return actions
 
 
 # ── BC warm-start ────────────────────────────────────────────────────────────

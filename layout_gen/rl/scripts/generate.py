@@ -243,6 +243,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Reject PLACE actions where the device's type disagrees "
              "with the y-row (NMOS bottom, PMOS top). Should match "
              "the env used at training time.")
+    p.add_argument(
+        "--couple-device-position", action="store_true",
+        help="Build the policy with autoregressive PLACE coupling so "
+             "the x_bin / y_bin / orient heads consume the chosen "
+             "device. MUST match the flag used at BC + PPO training "
+             "time, otherwise MaskablePPO.load will fail with a "
+             "shape mismatch on the position heads.")
 
     # Topology encoder / policy sizing
     p.add_argument("--topology-dim", type=int, default=64)
@@ -347,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         n_layers=2, n_heads=4, dim_ff=128,
         use_topology=True, topology_dim=args.topology_dim,
         enable_place=True, device_cap=args.device_cap,
+        couple_device_position=args.couple_device_position,
         x_bins=args.position_bins, y_bins=args.position_bins,
         enable_route=enable_route,
         net_cap=max(args.net_cap, graph.n_nets),

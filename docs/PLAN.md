@@ -373,25 +373,48 @@ In rough decreasing order of impact. Pick one per session. All
 remaining SOTA-gap items are batched at the bottom; the items below
 are the next concrete things to ship.
 
-### 1. Couple position to device (RL_GUIDE §9.1 option C, ~half day)
+### 1. ✅ Couple position to device (RL_GUIDE §9.1 option C — landed)
 
-**Highest-leverage item.** The diagnostic in "Real-DRC + GPU
-iteration" above shows the factored-action policy can pick the
-right device on step 2 but emits the same (x, y) bins as step 1 —
-no learned coupling. Strict-row-alignment (5.19) is a partial fix
-(forces y-on-device) but doesn't help x.
+The factored-action regime (independent (device, x_bin, y_bin)
+heads) had the policy picking the right device on step 2 but
+emitting the same (x, y) bins as step 1 — no learned coupling.
+Strict-row-alignment (5.19) was a partial fix on the y-axis only.
 
-Path: implement an auto-regressive action distribution. Sample
-``device_idx`` from the device head, then condition the (x_bin,
-y_bin, orient) heads on the sampled device via a one-hot
-concat. Same total parameter count; bigger structural fix.
+**Implemented:** auto-regressive action distribution via a new
+`couple_device_position` flag on `LayoutPolicyConfig`. When on:
 
-Alternative (RL_GUIDE §9.1 option E): a joint
-``(device, x_bin, y_bin) → logit`` MLP. Larger head but no PPO
-distribution surgery.
+  * `LayoutPolicy` swaps the unconditioned `x_bin_head` /
+    `y_bin_head` / `orient_head` for `*_cond_head` Linears that
+    consume `ctx ⊕ one_hot(device)`. Distinct module names so
+    the two regimes never silently overlap on a checkpoint dict.
+  * `MaskableLayoutPolicy.forward` runs a two-pass autoregressive
+    sample: pass 1 evaluates the device head (with the device-
+    portion of the action mask) to draw `device_idx`; pass 2
+    builds flat logits whose position slots are conditioned on
+    that device, then samples the rest. The returned action's
+    device dim is overwritten with the pass-1 sample so the
+    log-prob factorisation is consistent.
+  * `evaluate_actions` conditions on `actions[device_dim]` —
+    matches the on-policy sample-time conditioning.
+  * `BCTrainer` feeds the GT device label into `policy.forward`
+    via a new `device_idx` arg, so cross-entropy on the position
+    dims uses the same conditional logits the policy will face
+    at PPO time.
+  * CLI flag `--couple-device-position` plumbed through
+    `train_bc`, `train_ppo`, `eval`, and `generate`. The flag
+    must match across BC → PPO → eval → generate; checkpoint
+    load will fail loudly on shape mismatch otherwise.
 
-Files to touch: `rl/policy/network.py` (heads),
-`rl/policy/sb3.py` (custom distribution).
+Tests: `layout_gen/rl/tests/test_coupled_place.py` (7 cases)
+covers the structural separation (different device → different
+position logits), the SB3 two-pass forward shape + log-prob
+self-consistency, and BC roundtrip with the flag on.
+
+Status: 180/180 tests pass. Smoke BC training on the existing
+33 demo files runs end-to-end. Full PPO run with
+`--couple-device-position` (and matching `--bc-init` from a
+coupled BC checkpoint) is the next thing to launch on the
+RunPod GPU box.
 
 ### 2. Richer BC corpus (paths a + c done; b open)
 
