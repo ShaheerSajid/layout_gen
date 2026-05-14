@@ -179,7 +179,14 @@ class MaskableLayoutPolicy(MaskableActorCriticPolicy):
 
         if action_masks is not None:
             d_lo, d_hi = self._device_logit_slice()
-            dev_mask = action_masks[:, d_lo:d_hi].bool()
+            # action_masks arrives as np.ndarray during PPO rollout
+            # collection and as torch.Tensor at evaluate-actions time;
+            # normalise to a bool tensor on the policy's device so the
+            # downstream torch.where is happy under both call paths.
+            dev_mask = torch.as_tensor(
+                action_masks[:, d_lo:d_hi],
+                device=device_logits.device,
+            ).bool()
             # Replace masked-off slots with a very negative value rather
             # than -inf so the categorical never sees an all-(-inf) row
             # (which would NaN the log-softmax).

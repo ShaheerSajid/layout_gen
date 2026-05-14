@@ -221,6 +221,25 @@ def test_sb3_forward_device_matches_conditioning():
     assert torch.equal(actions_a[:, device_dim], expected_dev)
 
 
+def test_sb3_forward_accepts_numpy_action_masks():
+    """sb3-contrib MaskablePPO passes ``action_masks`` as ``np.ndarray``
+    during rollout collection (only ``evaluate_actions`` sees a torch
+    tensor). The autoregressive coupling path used to call ``.bool()``
+    directly on the input — fine for tensors, AttributeError for numpy.
+    This regression test asserts both forms work."""
+    cfg = _coupled_cfg()
+    policy = _build_sb3_policy(cfg)
+    obs = _make_obs(cfg, batch=2)
+    mask_t = _make_place_mask(cfg, n_devices=cfg.device_cap, batch=2)
+    mask_np = mask_t.numpy()
+
+    a_t, _, _ = policy.forward(obs, action_masks=mask_t, deterministic=True)
+    a_np, _, _ = policy.forward(obs, action_masks=mask_np, deterministic=True)
+    # Same input mask in two dtypes should yield the same deterministic
+    # action — proves the np→tensor coercion didn't change semantics.
+    assert torch.equal(a_t, a_np)
+
+
 def test_sb3_evaluate_actions_consistent_with_forward():
     """Forward(deterministic) and evaluate_actions on the resulting
     action must yield the same log-prob — this catches inconsistent
