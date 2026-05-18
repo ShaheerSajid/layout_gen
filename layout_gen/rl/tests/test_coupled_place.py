@@ -336,6 +336,59 @@ def test_place_progress_reward_scales_per_cell_size():
     assert rb_invalid.place_progress == 0.0
 
 
+def test_row_mask_prunes_y_bins_when_unplaced_is_type_unanimous():
+    """Audit fix B: under strict_row_alignment, when the unplaced
+    device set is unanimous on type (all-NMOS or all-PMOS), the
+    y_bin mask must restrict to the half-row the env's strict guard
+    would accept. Mixed-type sets leave y_bins fully open."""
+    from layout_gen.rl.env.action_space import action_mask_for
+    from layout_gen.rl.env.observation import build_observation
+
+    s = LayoutState()
+    obs = build_observation(s, [], poly_cap=32, viol_cap=8)
+    common = dict(
+        target_cap=32, mag_bins=8,
+        enable_place=True, phase="place",
+        device_cap=4, n_devices=4,
+        x_bins=16, y_bins=16,
+        strict_row_alignment=True,
+    )
+    # nvec for the (kind, target, edge, sx, sy, mag, device, x, y, orient) layout.
+    y_start = (len(REPAIR_KINDS) + len(PLACE_KINDS)) + 32 + 4 + 2 + 2 + 8 + 4 + 16
+    y_stop  = y_start + 16
+
+    # All unplaced are NMOS → bottom half of y allowed.
+    m_nmos = action_mask_for(
+        s, obs.rid_to_idx,
+        unplaced_device_types=["nmos", "nmos"], **common,
+    )
+    assert m_nmos[y_start:y_start + 8].all()
+    assert not m_nmos[y_start + 8:y_stop].any()
+
+    # All unplaced are PMOS → top half allowed.
+    m_pmos = action_mask_for(
+        s, obs.rid_to_idx,
+        unplaced_device_types=["pmos", "pmos"], **common,
+    )
+    assert not m_pmos[y_start:y_start + 8].any()
+    assert m_pmos[y_start + 8:y_stop].all()
+
+    # Mixed types → both halves open (pre-fix behaviour preserved).
+    m_mixed = action_mask_for(
+        s, obs.rid_to_idx,
+        unplaced_device_types=["nmos", "pmos"], **common,
+    )
+    assert m_mixed[y_start:y_stop].all()
+
+    # strict_row_alignment off → no pruning regardless of unanimity.
+    m_loose = action_mask_for(
+        s, obs.rid_to_idx,
+        unplaced_device_types=["nmos"], **{**common,
+                                            "strict_row_alignment": False},
+    )
+    assert m_loose[y_start:y_stop].all()
+
+
 def test_bc_training_with_coupling(tmp_path: Path):
     """End-to-end: BC-train a coupled policy on synthetic trajectories
     and verify the saved checkpoint roundtrips. The synthetic corpus

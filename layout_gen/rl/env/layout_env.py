@@ -783,6 +783,20 @@ class LayoutEnv(gym.Env):
             self._topology_graph.n_nets
             if self._topology_graph is not None else 0
         )
+        # Type list of the *unplaced* devices. Used by action_mask_for
+        # to restrict y_bins when only one type remains (audit fix B).
+        unplaced_types: list[str] | None = None
+        if (
+            self._strict_row_alignment
+            and self._topology_graph is not None
+            and self._phase == "place"
+        ):
+            placed = np.asarray(self._placed_mask, dtype=bool)
+            unplaced_types = [
+                d.device_type
+                for i, d in enumerate(self._topology_graph.devices)
+                if i < len(placed) and not placed[i]
+            ]
         return action_mask_for(
             self._state, self._last_rid_map,
             target_cap=self.target_cap,
@@ -795,6 +809,8 @@ class LayoutEnv(gym.Env):
             placed_mask=self._placed_mask,
             x_bins=self.x_bins,
             y_bins=self.y_bins,
+            unplaced_device_types=unplaced_types,
+            strict_row_alignment=self._strict_row_alignment,
             enable_route=self.enable_route,
             net_cap=self.net_cap,
             n_nets=n_nets,

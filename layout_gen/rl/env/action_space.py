@@ -437,6 +437,15 @@ def action_mask_for(
     placed_mask:  np.ndarray | None = None,
     x_bins:       int = DEFAULT_POSITION_BINS,
     y_bins:       int = DEFAULT_POSITION_BINS,
+    # ── Row-aware y_bin masking (audit fix B) ─────────────────────────
+    # When ``strict_row_alignment`` is True and the *unplaced* device
+    # set is unanimous on a single type (all-nmos or all-pmos), restrict
+    # y_bins to that type's half-row so the policy can't waste an
+    # attempt on a y the env will reject. We do not mask when types
+    # are mixed because the mask is per-dim — we'd need to know which
+    # device the policy will pick first.
+    unplaced_device_types: list[str] | None = None,
+    strict_row_alignment:  bool = False,
     # ── ROUTE-phase ────────────────────────────────────────────────────
     enable_route: bool = False,
     net_cap:      int = DEFAULT_NET_CAP,
@@ -528,7 +537,24 @@ def action_mask_for(
             dev_m[0] = True
         parts.append(dev_m)
         parts.append(np.ones(x_bins, dtype=bool))
-        parts.append(np.ones(y_bins, dtype=bool))
+
+        # y_bin row mask under strict_row_alignment when the unplaced
+        # set is type-unanimous. Bottom half = NMOS, top half = PMOS
+        # (matches LayoutEnv._apply_place's strict-row guard).
+        y_m = np.ones(y_bins, dtype=bool)
+        if (
+            strict_row_alignment
+            and phase == "place"
+            and unplaced_device_types
+        ):
+            types = {t.lower() for t in unplaced_device_types}
+            if types == {"nmos"}:
+                y_m[y_bins // 2:] = False    # NMOS only → bottom half
+            elif types == {"pmos"}:
+                y_m[: y_bins // 2] = False   # PMOS only → top half
+            if not y_m.any():
+                y_m[0] = True                # never emit all-False
+        parts.append(y_m)
         parts.append(np.ones(N_ORIENTATIONS, dtype=bool))
 
     if enable_route:
