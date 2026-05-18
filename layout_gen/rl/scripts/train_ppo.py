@@ -459,8 +459,14 @@ def main(argv: list[str] | None = None) -> int:
                         "adds β·KL(π_PPO || π_BC) with β decaying linearly "
                         "from --ibrl-beta-start to --ibrl-beta-end. Pairs "
                         "naturally with --bc-init (use the same path).")
-    p.add_argument("--ibrl-beta-start", type=float, default=1.0,
-                   help="Initial KL-to-BC weight at training start.")
+    p.add_argument("--ibrl-beta-start", type=float, default=0.3,
+                   help="Initial KL-to-BC weight at training start. "
+                        "Default lowered from 1.0 to 0.3 — the linear "
+                        "decay leaves β≈0.15 at 50%% of training, which "
+                        "was strong enough to pin the policy to the "
+                        "inverter-mode device distribution under the "
+                        "previous default. Override to 1.0 for legacy "
+                        "behaviour.")
     p.add_argument("--ibrl-beta-end",   type=float, default=0.0,
                    help="Final KL-to-BC weight at training end.")
     p.add_argument("--total-timesteps", type=int, default=20000)
@@ -520,7 +526,12 @@ def main(argv: list[str] | None = None) -> int:
                         "pitch (0.46 µm). 8 collides nand2/nor2's two "
                         "in-row devices.")
     p.add_argument("--route-size-bins", type=int, default=4)
-    p.add_argument("--max-place-steps", type=int, default=4)
+    p.add_argument("--max-place-steps", type=int, default=8,
+                   help="PLACE-phase step budget. Default raised from "
+                        "4 to 8 — with 4-device cells (nand2/nor2/aoi21) "
+                        "the prior default left zero headroom for any "
+                        "invalid attempt, training the policy to give "
+                        "up after the n-th rejected placement.")
     p.add_argument("--max-route-steps", type=int, default=4)
     p.add_argument("--w-n", type=float, default=0.5)
     p.add_argument("--w-p", type=float, default=0.5)

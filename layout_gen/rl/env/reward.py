@@ -128,7 +128,14 @@ class RewardConfig:
     # ── Common terms ──────────────────────────────────────────────────
     step:       float = 0.05
     terminal:   float = 5.0     # only fires in REPAIR phase
-    invalid:    float = 0.5
+    # Per-invalid-action penalty. Bumped from 0.5 to 2.0 after the
+    # autoregressive PLACE coupling exposed a failure mode where the
+    # policy spammed invalid PLACE attempts (no-stacking guard
+    # rejections) because each attempt only cost 0.5 — cheap vs. the
+    # 1.0 bonus for a successful placement that happens to add a
+    # violation. 2.0 keeps invalids strictly worse than any
+    # commitment.
+    invalid:    float = 2.0
     no_change:  float = 0.2
 
     # ── Lookup helpers ────────────────────────────────────────────────

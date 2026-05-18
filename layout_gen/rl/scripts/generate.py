@@ -208,7 +208,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--poly-cap",   type=int, default=128)
     p.add_argument("--viol-cap",   type=int, default=32)
     p.add_argument("--target-cap", type=int, default=128)
-    p.add_argument("--max-place-steps", type=int, default=8)
+    p.add_argument("--max-place-steps", type=int, default=0,
+                   help="PLACE-phase step budget. 0 (default) auto-sets to "
+                        "n_devices + 2 once the topology is loaded — gives "
+                        "the policy slack for a handful of invalid attempts "
+                        "without letting it spin forever. Set explicitly to "
+                        "override; small values exercise the policy's "
+                        "first-shot accuracy.")
     p.add_argument("--max-steps", type=int, default=32)
 
     # Routing
@@ -299,6 +305,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print(f"[topology] cell={template.name} devices={graph.n_devices} "
               f"nets={graph.n_nets} bbox={cell_w}x{cell_h}um")
+
+    # Auto-derive max_place_steps from device count when unset (0). Gives
+    # the policy a small fixed-budget tolerance for invalid attempts (the
+    # no-stacking guard, off-grid snaps, etc.) without letting it spin
+    # forever — saw a 4-device cell loop on valid=False steps for 12+
+    # steps when this budget was uncapped.
+    if args.max_place_steps == 0:
+        args.max_place_steps = graph.n_devices + 2
+        if not args.quiet:
+            print(f"[generate] max_place_steps auto-set to "
+                  f"{args.max_place_steps} (n_devices+2)")
 
     # ── Topology encoder ─────────────────────────────────────────────────
     enc_cfg = TopologyEncoderConfig(
