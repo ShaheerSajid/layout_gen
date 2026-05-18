@@ -416,6 +416,51 @@ Status: 180/180 tests pass. Smoke BC training on the existing
 coupled BC checkpoint) is the next thing to launch on the
 RunPod GPU box.
 
+### 1.5. ✅ Post-coupling audit + 6 structural fixes (landed)
+
+The first coupled-PPO run on RunPod (BC + IBRL, 50k steps, 3 cells)
+exposed a new failure mode: **the policy places 2 of 4 devices on
+nand2/nor2, then loops on `valid=False` PLACE attempts** — eval was
+0% DRC-clean across all three cells, ep_reward +11 to +20 (positive
+but not converging). Inverter (2 devices) worked. The coupling fix
+*did* eliminate stacking — every placed device sat at a distinct
+(x, y) — but exposed deeper sizing problems the prior factored
+regime had been hiding.
+
+Audit identified six structural issues. All shipped over commits
+`6f43fc3` (A+E+F config), `055aa94` (C+D observation+reward),
+`a81f1a3` (B row mask):
+
+  * **A** `generate.py --max-place-steps` now defaults to 0 (sentinel)
+    and auto-sets to `n_devices + 2`. The fixed default of 8 left
+    multi-device cells with marginal headroom.
+  * **B** `action_mask_for` now restricts y_bins to the matching
+    half-row when the unplaced device set is type-unanimous and
+    `strict_row_alignment=True`. Prevents wasted PLACE attempts at
+    the end of nand2/nor2 episodes.
+  * **C** Observation `N_GLOBAL` bumped 4 → 8 to expose
+    `n_placed / n_devices_total` + (place / route / repair) one-hot.
+    Closes the "policy can't tell when to stop placing" gap. Breaks
+    old checkpoint compatibility; retraining required.
+  * **D** New `RewardConfig.place_progress = 4.0` per-step bonus
+    scaled by `(n_placed_after - n_placed_before) / n_devices_total`.
+    Per-episode total stays at `place_progress` regardless of cell
+    size so the gradient scale doesn't change between inverter and
+    nand2/nor2.
+  * **E** `--ibrl-beta-start` default lowered from 1.0 → 0.3.
+    Under the old default β=0.5 at 25k/50k pinned the policy to BC's
+    inverter-mode device distribution for the first half of training.
+  * **F** `--max-place-steps` training default raised 4 → 8 and
+    `RewardConfig.invalid` raised 0.5 → 2.0. The prior pair trained
+    the policy to "give up after 4" because invalid attempts cost
+    less than committing to a placement that added DRC violations.
+
+Tests: `test_coupled_place.py` grew from 7 → 10 cases (185 total).
+
+Status: ready for the next training run. Old checkpoints
+(`bc_coupled.pt`, `ppo_coupled.zip`) are no longer loadable because
+of the C change — retraining required to validate the fixes.
+
 ### 2. Richer BC corpus (paths a + c done; b open)
 
 This session shipped two of the three paths from the previous plan:
