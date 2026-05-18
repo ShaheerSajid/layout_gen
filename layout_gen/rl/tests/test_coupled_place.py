@@ -260,6 +260,82 @@ def test_sb3_evaluate_actions_consistent_with_forward():
     assert torch.isfinite(entropy).all()
 
 
+def test_global_feats_carry_progress_and_phase():
+    """N_GLOBAL was bumped from 4 to 8 to expose ``n_placed/n_devices``
+    and a (place/route/repair) one-hot, addressing the audit's
+    finding #5 (the policy had no observation signal for "how many
+    more devices to place" or "which phase am I in")."""
+    from layout_gen.rl.env.observation import N_GLOBAL, build_observation
+    assert N_GLOBAL == 8
+
+    s = LayoutState()
+    s.add(layer="met1", x0=0.0, y0=0.0, x1=0.10, y1=0.10)
+
+    obs_place = build_observation(
+        s, [], n_placed=2, n_devices_total=4, phase="place",
+    )
+    obs_route = build_observation(
+        s, [], n_placed=4, n_devices_total=4, phase="route",
+    )
+    obs_repair = build_observation(
+        s, [], n_placed=4, n_devices_total=4, phase="repair",
+    )
+
+    # n_placed_norm
+    assert obs_place.global_feats[4] == pytest.approx(0.5)
+    assert obs_route.global_feats[4] == pytest.approx(1.0)
+    # phase one-hot exclusivity
+    assert tuple(obs_place.global_feats[5:8].tolist())  == (1.0, 0.0, 0.0)
+    assert tuple(obs_route.global_feats[5:8].tolist())  == (0.0, 1.0, 0.0)
+    assert tuple(obs_repair.global_feats[5:8].tolist()) == (0.0, 0.0, 1.0)
+
+    # REPAIR-only env (no topology, no phase) → no progress, no one-hot.
+    obs_legacy = build_observation(s, [])
+    assert tuple(obs_legacy.global_feats[4:8].tolist()) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_place_progress_reward_scales_per_cell_size():
+    """Completion-fraction reward: per-device contribution is
+    ``cfg.place_progress / n_devices_total``, so the per-episode total
+    of place_progress stays equal across cells of different sizes.
+    Closes the audit's finding #3 (no long-horizon completion signal)."""
+    from layout_gen.rl.env.reward import RewardConfig, compute_reward
+
+    cfg = RewardConfig()  # uses new default place_progress=4.0
+
+    # Place the 1st of 2 devices.
+    rb_inv = compute_reward(
+        violations_before=[], violations_after=[],
+        state_changed=True, action_valid=True, phase="place",
+        config=cfg,
+        n_placed_before=0, n_placed_after=1, n_devices_total=2,
+    )
+    # Place the 1st of 4 devices.
+    rb_nand = compute_reward(
+        violations_before=[], violations_after=[],
+        state_changed=True, action_valid=True, phase="place",
+        config=cfg,
+        n_placed_before=0, n_placed_after=1, n_devices_total=4,
+    )
+    # Per-device contribution scales with 1/n_devices_total.
+    assert rb_inv.place_progress  == pytest.approx(cfg.place_progress / 2)
+    assert rb_nand.place_progress == pytest.approx(cfg.place_progress / 4)
+
+    # Per-episode total is invariant: 2 × (place_progress/2) == 4 × (place_progress/4).
+    inv_total  = 2 * rb_inv.place_progress
+    nand_total = 4 * rb_nand.place_progress
+    assert inv_total == pytest.approx(nand_total)
+
+    # Invalid placement: no progress reward.
+    rb_invalid = compute_reward(
+        violations_before=[], violations_after=[],
+        state_changed=False, action_valid=False, phase="place",
+        config=cfg,
+        n_placed_before=1, n_placed_after=1, n_devices_total=4,
+    )
+    assert rb_invalid.place_progress == 0.0
+
+
 def test_bc_training_with_coupling(tmp_path: Path):
     """End-to-end: BC-train a coupled policy on synthetic trajectories
     and verify the saved checkpoint roundtrips. The synthetic corpus

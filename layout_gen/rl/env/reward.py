@@ -138,6 +138,17 @@ class RewardConfig:
     invalid:    float = 2.0
     no_change:  float = 0.2
 
+    # ── Completion-progress shaping ────────────────────────────────────
+    # Per-PLACE-step bonus proportional to (n_placed_after / n_devices).
+    # Stacks on top of ``place_success`` (which is flat) so multi-device
+    # cells get a long-horizon signal that the LAST placement matters
+    # too. With ``place_progress = 4.0`` and a 4-device cell, each
+    # device contributes +1.0; with a 2-device cell, each contributes
+    # +2.0 — the per-cell total stays at 4.0 so the gradient scale
+    # doesn't change across cells. Addresses the audit's finding #3
+    # (no completion incentive) head-on.
+    place_progress: float = 4.0
+
     # ── Lookup helpers ────────────────────────────────────────────────
     def drc_delta_weight(self, phase: str) -> float:
         return float(self.drc_delta_per_phase.get(phase, 1.0))
@@ -156,6 +167,7 @@ class RewardBreakdown:
     invalid:            float = 0.0
     no_change:          float = 0.0
     place_success:      float = 0.0
+    place_progress:     float = 0.0
     route_success:      float = 0.0
     connectivity_delta: float = 0.0
     alignment_delta:    float = 0.0
@@ -170,7 +182,8 @@ class RewardBreakdown:
     def total(self) -> float:
         return (self.drc_delta + self.value_delta + self.step
                 + self.terminal + self.invalid + self.no_change
-                + self.place_success + self.route_success
+                + self.place_success + self.place_progress
+                + self.route_success
                 + self.connectivity_delta + self.alignment_delta
                 + self.electrical_delta + self.hpwl_delta
                 + self.row_delta
@@ -186,6 +199,7 @@ class RewardBreakdown:
             "invalid":            self.invalid,
             "no_change":          self.no_change,
             "place_success":      self.place_success,
+            "place_progress":     self.place_progress,
             "route_success":      self.route_success,
             "connectivity_delta": self.connectivity_delta,
             "alignment_delta":    self.alignment_delta,
@@ -229,6 +243,9 @@ def compute_reward(
     short_after:          int   = 0,
     lvs_mismatches_before: int | None = None,
     lvs_mismatches_after:  int | None = None,
+    n_placed_before:       int = 0,
+    n_placed_after:        int = 0,
+    n_devices_total:       int = 0,
 ) -> RewardBreakdown:
     """Compute reward from before/after violation lists, action flags,
     and the active episode phase.
@@ -270,6 +287,18 @@ def compute_reward(
     if action_valid and state_changed:
         if phase == "place":
             rb.place_success = cfg.place_success
+            # Completion-fraction shaping: rewards the policy for
+            # advancing toward "all devices placed", not just the
+            # flat per-step bonus. Per-device contribution is
+            # ``cfg.place_progress / n_devices_total`` so the per-
+            # episode total of this term is cfg.place_progress
+            # regardless of cell size. Skipped on REPAIR-only envs
+            # where n_devices_total == 0.
+            if n_devices_total > 0 and n_placed_after > n_placed_before:
+                gained = n_placed_after - n_placed_before
+                rb.place_progress = (
+                    cfg.place_progress * gained / n_devices_total
+                )
         elif phase == "route":
             rb.route_success = cfg.route_success
 

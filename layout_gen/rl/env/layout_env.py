@@ -388,6 +388,7 @@ class LayoutEnv(gym.Env):
         row_before          = self._row_score()
         short_before        = compute_short_count(self._state)
         lvs_before = self._lvs_mismatch_count()
+        n_placed_before = int(self._placed_mask.sum())
 
         env_action = self._action_helper.decode(action, self._last_rid_map)
 
@@ -457,6 +458,12 @@ class LayoutEnv(gym.Env):
             short_after=short_after,
             lvs_mismatches_before=lvs_before,
             lvs_mismatches_after=lvs_after,
+            n_placed_before=n_placed_before,
+            n_placed_after=int(self._placed_mask.sum()),
+            n_devices_total=(
+                self._topology_graph.n_devices
+                if self._topology_graph is not None else 0
+            ),
         )
 
         # Phase transitions: PLACE → ROUTE (or → REPAIR if route disabled),
@@ -704,12 +711,19 @@ class LayoutEnv(gym.Env):
             terminal_points = [(x, y) for (x, y, _layer)
                                in self._terminals.values()]
             cell_dims = (self.cell_width_um, self.cell_height_um)
+        n_dev_total = (
+            self._topology_graph.n_devices
+            if self._topology_graph is not None else 0
+        )
         obs_struct = build_observation(
             self._state, self._violations,
             poly_cap=self.poly_cap,
             viol_cap=self.viol_cap,
             cell_bbox=self._cell_bbox,
             step_progress=progress,
+            n_placed=int(self._placed_mask.sum()),
+            n_devices_total=n_dev_total,
+            phase=self._phase,
             topology_global=self._topology_global,
             proximity_shape=self._proximity_shape,
             terminal_positions=terminal_points,

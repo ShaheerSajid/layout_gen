@@ -53,12 +53,18 @@ DEFAULT_VIOL_CAP = 64
 #   N_LAYER_ROLES : one-hot of the violation's primary layer role (or zero)
 V_FEAT_DIM = 2 + N_RULE_CATEGORIES + 1 + N_LAYER_ROLES
 
-# Global features:
-#   n_violations_norm : len(violations) / DEFAULT_VIOL_CAP, clipped to [0, 1]
-#   n_polygons_norm   : len(state)      / DEFAULT_POLY_CAP, clipped to [0, 1]
-#   mean_value_norm   : mean of normalised violation values
-#   step_progress     : current_step / max_steps, supplied by the env
-N_GLOBAL = 4
+# Global features (long-horizon scalars the policy needs to plan with):
+#   [0] n_violations_norm : len(violations) / DEFAULT_VIOL_CAP, [0, 1]
+#   [1] n_polygons_norm   : len(state)      / DEFAULT_POLY_CAP, [0, 1]
+#   [2] mean_value_norm   : mean of normalised violation values
+#   [3] step_progress     : current_step / max_steps
+#   [4] n_placed_norm     : n_placed_devices / n_devices_total, [0, 1].
+#                           0 when n_devices_total == 0 (REPAIR-only env).
+#                           Closes the "policy can't tell when to stop
+#                           placing" failure mode seen post-coupling.
+#   [5..7] phase one-hot  : (place, route, repair). All zeros for a
+#                           REPAIR-only env (no phase machine).
+N_GLOBAL = 8
 
 # Cap for normalising the violation's "value" (measured µm). Values
 # above this are saturated; this is just for feature scaling and does
@@ -151,7 +157,10 @@ def build_observation(
     poly_cap:    int = DEFAULT_POLY_CAP,
     viol_cap:    int = DEFAULT_VIOL_CAP,
     cell_bbox:   tuple[float, float, float, float] | None = None,
-    step_progress: float = 0.0,
+    step_progress:    float = 0.0,
+    n_placed:         int = 0,
+    n_devices_total:  int = 0,
+    phase:            str = "",
     topology_global: np.ndarray | None = None,
     proximity_shape: tuple[int, int] | None = None,
     terminal_positions: list[tuple[float, float]] | None = None,
@@ -206,6 +215,14 @@ def build_observation(
     global_feats[1] = min(len(state)      / max(poly_cap, 1), 1.0)
     global_feats[2] = (sum_value_norm / n_viol_active) if n_viol_active else 0.0
     global_feats[3] = float(np.clip(step_progress, 0.0, 1.0))
+    if n_devices_total > 0:
+        global_feats[4] = float(np.clip(n_placed / n_devices_total, 0.0, 1.0))
+    if phase == "place":
+        global_feats[5] = 1.0
+    elif phase == "route":
+        global_feats[6] = 1.0
+    elif phase == "repair":
+        global_feats[7] = 1.0
 
     topology_arr: np.ndarray | None = None
     if topology_global is not None:
